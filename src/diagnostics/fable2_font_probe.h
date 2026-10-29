@@ -16,6 +16,10 @@
 
 #pragma once
 
+#ifndef _WIN32
+#include "../platform/win32_compat.h"  // Win32 stand-ins for macOS/Linux
+#endif
+
 #include <atomic>
 #include <cstdarg>
 #include <cstdint>

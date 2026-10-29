@@ -17,6 +17,10 @@
 // Guest arena (big-endian): host = base + guest_addr (base = 0x100000000).
 #pragma once
 
+#ifndef _WIN32
+#include "../platform/win32_compat.h"  // Win32 stand-ins for macOS/Linux
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <cstdarg>

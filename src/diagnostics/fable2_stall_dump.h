@@ -16,6 +16,9 @@
 #ifndef FABLE2_STALL_DUMP_H
 #define FABLE2_STALL_DUMP_H
 
+// _WIN32-only: samples threads with Toolhelp32 and GetThreadContext.
+#ifdef _WIN32
+
 #include <windows.h>
 #include <tlhelp32.h>
 #include <atomic>
@@ -202,5 +205,7 @@ struct Registrar {
 static Registrar g_stall_dump_registrar;
 
 }  // namespace fable2_stall_dump
+
+#endif  // _WIN32
 
 #endif  // FABLE2_STALL_DUMP_H

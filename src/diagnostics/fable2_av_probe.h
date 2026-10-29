@@ -36,6 +36,9 @@
 #ifndef FABLE2_AV_PROBE_H
 #define FABLE2_AV_PROBE_H
 
+// _WIN32-only: a Windows x64 vectored exception handler (reads CONTEXT::Rip).
+#ifdef _WIN32
+
 #include <Windows.h>
 #include <cstdarg>
 #include <cstdint>
@@ -305,5 +308,7 @@ struct Registrar {
 static Registrar g_av_probe_registrar;
 
 }  // namespace fable2_av_probe
+
+#endif  // _WIN32
 
 #endif  // FABLE2_AV_PROBE_H

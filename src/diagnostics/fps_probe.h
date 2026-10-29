@@ -17,7 +17,11 @@
 #include <rex/logging.h>
 #include <rex/ppc/func.h>
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "../platform/win32_compat.h"  // Win32 stand-ins for macOS/Linux
+#endif
 
 namespace fable2::fpsprobe {
 
