@@ -144,6 +144,12 @@ bool WindowSDL::OpenImpl() {
   int initial_width = int(SizeToPhysical(GetDesiredLogicalWidth()));
   int initial_height = int(SizeToPhysical(GetDesiredLogicalHeight()));
 #endif
+#if REX_PLATFORM_MAC
+  // Fullscreen without a separate Space. Native Spaces fullscreen animates the
+  // window through intermediate sizes and the presenter never shows a frame
+  // afterwards (black screen); borderless desktop fullscreen presents normally.
+  SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0");
+#endif
   sdl_window_ = SDL_CreateWindow(GetTitle().c_str(), initial_width, initial_height, flags);
   if (!sdl_window_) {
     REXLOG_ERROR("SDL_CreateWindow failed: {}", SDL_GetError());
@@ -422,10 +428,17 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
   return nullptr;
 }
 
+static std::atomic<uint64_t> g_paint_requests{0}, g_paint_coalesced{0}, g_paint_handled{0};
+
 void WindowSDL::RequestPaintImpl() {
+  if (++g_paint_requests % 300 == 0) {
+    REXLOG_INFO("SDL paint: {} requested, {} coalesced, {} handled", g_paint_requests.load(),
+                g_paint_coalesced.load(), g_paint_handled.load());
+  }
   // Coalesce: at most one queued paint event at a time. Callable from non-UI
   // threads; SDL_PushEvent is thread-safe.
   if (paint_pending_.exchange(true, std::memory_order_acq_rel)) {
+    ++g_paint_coalesced;
     return;
   }
   SDL_Event event{};
@@ -435,6 +448,7 @@ void WindowSDL::RequestPaintImpl() {
 }
 
 void WindowSDL::HandlePaintEvent() {
+  ++g_paint_handled;
   paint_pending_.store(false, std::memory_order_release);
   OnPaint();
 }

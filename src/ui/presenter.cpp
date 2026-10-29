@@ -996,6 +996,21 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
   // extreme values.
   int32_t output_right = flow.output_x + int32_t(output_width);
   int32_t output_bottom = flow.output_y + int32_t(output_height);
+  {
+    // Debug: log the presentation geometry whenever it changes.
+    static uint64_t last_key = 0;
+    const uint64_t key = (uint64_t(surface_width_in_paint_connection_) << 48) ^
+                         (uint64_t(surface_height_in_paint_connection_) << 32) ^
+                         (uint64_t(host_rt_width) << 16) ^ host_rt_height ^
+                         (uint64_t(uint32_t(flow.output_x)) << 8) ^ output_width;
+    if (key != last_key) {
+      last_key = key;
+      REXLOG_INFO("Presenter geometry: surface {}x{}, render target {}x{}, output {}x{} at {},{}, aspect {}:{}",
+                  surface_width_in_paint_connection_, surface_height_in_paint_connection_, host_rt_width,
+                  host_rt_height, output_width, output_height, flow.output_x, flow.output_y,
+                  properties.display_aspect_ratio_x, properties.display_aspect_ratio_y);
+    }
+  }
   // In rare cases (for example, when surface and render-target coordinate
   // spaces diverge unexpectedly), the computed output may become anchored at
   // the top-left and smaller than the host render target. This results in only
@@ -1300,6 +1315,11 @@ void Presenter::SetPaintModeFromUIThread(PaintMode new_mode) {
     std::lock_guard<std::mutex> lock(paint_mode_mutex_);
     paint_mode_ = new_mode;
   }
+  REXLOG_INFO("Presenter paint mode -> {} (implicit vsync {}, UI drawers {})",
+              new_mode == PaintMode::kNone ? "none"
+              : new_mode == PaintMode::kUIThreadOnRequest ? "UI thread on request"
+                                                          : "guest output thread",
+              surface_paint_connection_has_implicit_vsync_, ui_drawers_.size());
   UpdateUITicksNeededFromUIThread();
 }
 
