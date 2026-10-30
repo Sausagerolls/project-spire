@@ -169,6 +169,15 @@ class CommandProcessor {
   virtual void PrepareForWait();
   virtual void ReturnFromWait();
 
+  // Writes a 32-bit value (already in guest byte order) to guest physical
+  // memory on behalf of the command stream (fences, scratch registers). A
+  // backend whose GPU accesses guest memory directly may delay the write until
+  // the GPU has completed the preceding work, so the guest doesn't reuse memory
+  // that the GPU is still reading.
+  virtual void WriteMemoryFromCommandStream(uint32_t address, uint32_t value);
+  // Called before WAIT_REG_MEM waits for a value that doesn't match yet.
+  virtual void OnWaitRegMemNotMatched() {}
+
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
   virtual void OnPrimaryBufferEnd() {}
   void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);

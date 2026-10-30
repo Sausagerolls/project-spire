@@ -370,7 +370,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       // Enabled - write to address.
       uint32_t scratch_addr = regs.values[XE_GPU_REG_SCRATCH_ADDR];
       uint32_t mem_addr = scratch_addr + (scratch_reg * 4);
-      memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(mem_addr), value);
+      WriteMemoryFromCommandStream(mem_addr, rex::byte_swap(value));
     }
   } else {
     switch (index) {
@@ -1037,6 +1037,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         break;
     }
     if (!matched) {
+      OnWaitRegMemNotMatched();
       // Wait.
       if (wait >= 0x100) {
         PrepareForWait();
@@ -1101,9 +1102,13 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
   auto endianness = static_cast<xenos::Endian>(mem_addr & 0x3);
   mem_addr &= ~0x3;
   reg_val = GpuSwap(reg_val, endianness);
-  memory::store(memory_->TranslatePhysical(mem_addr), reg_val);
+  WriteMemoryFromCommandStream(mem_addr, reg_val);
 
   return true;
+}
+
+void CommandProcessor::WriteMemoryFromCommandStream(uint32_t address, uint32_t value) {
+  memory::store(memory_->TranslatePhysical(address), value);
 }
 
 bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, uint32_t packet,
@@ -1115,7 +1120,7 @@ bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, 
     auto endianness = static_cast<xenos::Endian>(write_addr & 0x3);
     auto addr = write_addr & ~0x3;
     write_data = GpuSwap(write_data, endianness);
-    memory::store(memory_->TranslatePhysical(addr), write_data);
+    WriteMemoryFromCommandStream(addr, write_data);
     write_addr += 4;
   }
 
@@ -1176,7 +1181,7 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
       auto endianness = static_cast<xenos::Endian>(write_reg_addr & 0x3);
       write_reg_addr &= ~0x3;
       write_data = GpuSwap(write_data, endianness);
-      memory::store(memory_->TranslatePhysical(write_reg_addr), write_data);
+      WriteMemoryFromCommandStream(write_reg_addr, write_data);
     } else {
       // Register.
       WriteRegister(write_reg_addr, write_data);
@@ -1221,7 +1226,14 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
-  memory::store(memory_->TranslatePhysical(address), data_value);
+  if ((initiator >> 31) & 0x1) {
+    // The vblank counter is used for frame pacing rather than as a fence for
+    // reusing memory - write it immediately, like the real counter which
+    // doesn't wait for the GPU's work.
+    memory::store(memory_->TranslatePhysical(address), data_value);
+  } else {
+    WriteMemoryFromCommandStream(address, data_value);
+  }
   return true;
 }
 

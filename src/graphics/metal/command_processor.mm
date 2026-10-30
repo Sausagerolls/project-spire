@@ -40,6 +40,18 @@ REXCVAR_DEFINE_BOOL(metal_log_frame_rate, false, "GPU/Metal",
                     "Log the guest frame rate (swaps per second) and draws per frame about every "
                     "5 seconds")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(metal_defer_fence_writes, false, "GPU/Metal",
+                    "Delay command stream memory writes (fences) until the GPU has completed the "
+                    "preceding work, so the guest doesn't reuse memory the GPU still reads (slower, as "
+                    "the guest then waits for the GPU)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(metal_commit_on_fence, true, "GPU/Metal",
+                    "Submit the GPU work when the command stream writes a fence, so the fence "
+                    "is signaled as early as possible (with metal_defer_fence_writes)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(metal_sync_submissions, false, "GPU/Metal",
+                    "Wait for the GPU after every submission (debugging CPU / GPU memory hazards)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(metal_log_stats, false, "GPU/Metal",
                     "Log Metal backend draw and resolve statistics about every 5 seconds")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -302,6 +314,47 @@ void MetalCommandProcessor::OnPrimaryBufferEnd() {
   }
 }
 
+void MetalCommandProcessor::WriteMemoryFromCommandStream(uint32_t address, uint32_t value) {
+  // The write must become visible to the guest only after the GPU work
+  // encoded so far: the current command buffer if there is one, otherwise the
+  // last committed one.
+  bool defer = REXCVAR_GET(metal_defer_fence_writes);
+  bool commit = defer && command_buffer_ && REXCVAR_GET(metal_commit_on_fence);
+  uint64_t after_submission = submission_current_ - (command_buffer_ ? 0 : 1);
+  {
+    std::lock_guard<std::mutex> lock(deferred_memory_writes_mutex_);
+    uint64_t completed_submission = GetCompletedSubmission();
+    if (!defer || completed_submission >= after_submission) {
+      // Earlier deferred writes follow earlier submissions, so they're due too.
+      ApplyDeferredMemoryWrites(UINT64_MAX);
+      CommandProcessor::WriteMemoryFromCommandStream(address, value);
+      return;
+    }
+    deferred_memory_writes_.push_back({after_submission, address, value});
+    ++stats_.deferred_memory_writes;
+  }
+  if (commit) {
+    // The guest is likely to wait for the fence - start the GPU work now.
+    EndSubmission(false);
+  }
+}
+
+void MetalCommandProcessor::ApplyDeferredMemoryWrites(uint64_t completed_submission) {
+  while (!deferred_memory_writes_.empty() &&
+         deferred_memory_writes_.front().submission <= completed_submission) {
+    const DeferredMemoryWrite& write = deferred_memory_writes_.front();
+    CommandProcessor::WriteMemoryFromCommandStream(write.address, write.value);
+    deferred_memory_writes_.pop_front();
+  }
+}
+
+void MetalCommandProcessor::OnWaitRegMemNotMatched() {
+  // The awaited value may be written when the current submission completes.
+  if (command_buffer_) {
+    EndSubmission(false);
+  }
+}
+
 // Submissions and frames.
 
 id<MTLCommandBuffer> MetalCommandProcessor::GetCommandBuffer() {
@@ -310,14 +363,15 @@ id<MTLCommandBuffer> MetalCommandProcessor::GetCommandBuffer() {
     command_buffer_ = [queue_ commandBuffer];
     command_buffer_.label = @"guest";
     uint64_t submission = submission_current_;
-    std::atomic<uint64_t>* completed = &submission_completed_;
     [command_buffer_ addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
       if (buffer.status == MTLCommandBufferStatusError) {
         REXGPU_ERROR("Metal command buffer {} failed: {}", submission,
                      buffer.error ? [buffer.error.localizedDescription UTF8String] : "unknown");
       }
       // The queue completes command buffers in order.
-      completed->store(submission, std::memory_order_release);
+      std::lock_guard<std::mutex> lock(deferred_memory_writes_mutex_);
+      submission_completed_.store(submission, std::memory_order_release);
+      ApplyDeferredMemoryWrites(submission);
     }];
   }
   return command_buffer_;
@@ -369,6 +423,10 @@ void MetalCommandProcessor::EndSubmission(bool is_swap) {
   if (command_buffer_) {
     EndEncoding();
     [command_buffer_ commit];
+    ++stats_.submissions;
+    if (REXCVAR_GET(metal_sync_submissions)) {
+      [command_buffer_ waitUntilCompleted];
+    }
     command_buffer_ = nil;
     ++submission_current_;
   }
@@ -710,7 +768,8 @@ bool MetalCommandProcessor::IssueDrawImpl() {
     [encoder setDepthStencilState:depth_stencil_state];
     encoder_depth_stencil_state_ = depth_stencil_state;
   }
-  if (!UpdateDynamicState(encoder, viewport_info, primitive_polygonal, normalized_depth_control)) {
+  if (!UpdateDynamicState(encoder, viewport_info, primitive_polygonal, normalized_depth_control,
+                          !is_rasterization_done)) {
     // Nothing to draw (empty scissor or everything culled).
     return true;
   }
@@ -807,6 +866,13 @@ bool MetalCommandProcessor::IssueDrawImpl() {
     for (const draw_util::MemExportRange& range : memexport_ranges_) {
       shared_memory_->RangeWrittenByGpu(range.base_address_dwords << 2, range.size_bytes);
     }
+    // Hazard tracking doesn't order draws within one render encoder - make the
+    // exported data visible to the following draws (as vertices, for example).
+    [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers
+                        afterStages:memexport_used_pixel ? MTLRenderStageFragment
+                                                         : MTLRenderStageVertex
+                       beforeStages:MTLRenderStageVertex | MTLRenderStageFragment];
+    ++stats_.memexport_draws;
   }
   return true;
 }
@@ -814,7 +880,8 @@ bool MetalCommandProcessor::IssueDrawImpl() {
 bool MetalCommandProcessor::UpdateDynamicState(id<MTLRenderCommandEncoder> encoder,
                                                const draw_util::ViewportInfo& viewport_info,
                                                bool primitive_polygonal,
-                                               reg::RB_DEPTHCONTROL normalized_depth_control) {
+                                               reg::RB_DEPTHCONTROL normalized_depth_control,
+                                               bool memexport_only) {
   const RegisterFile& regs = *register_file_;
 
   MTLViewport viewport;
@@ -843,14 +910,25 @@ bool MetalCommandProcessor::UpdateDynamicState(id<MTLRenderCommandEncoder> encod
   uint32_t scissor_right = std::min(scissor.offset[0] + scissor.extent[0], rt_width);
   uint32_t scissor_bottom = std::min(scissor.offset[1] + scissor.extent[1], rt_height);
   if (scissor_right <= scissor_left || scissor_bottom <= scissor_top) {
-    return false;
+    if (!memexport_only) {
+      return false;
+    }
+    // The vertex shader must still run for memexport, and nothing is written
+    // to the render targets.
+    scissor_left = 0;
+    scissor_top = 0;
+    scissor_right = 1;
+    scissor_bottom = 1;
   }
   MTLScissorRect scissor_rect = {scissor_left, scissor_top, scissor_right - scissor_left,
                                  scissor_bottom - scissor_top};
   [encoder setScissorRect:scissor_rect];
 
   auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
-  if (primitive_polygonal) {
+  if (primitive_polygonal && memexport_only) {
+    [encoder setCullMode:MTLCullModeNone];
+    [encoder setTriangleFillMode:MTLTriangleFillModeFill];
+  } else if (primitive_polygonal) {
     if (pa_su_sc_mode_cntl.cull_front && pa_su_sc_mode_cntl.cull_back) {
       return false;
     }
@@ -1098,9 +1176,12 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     if (now - stats_.last_log >= std::chrono::seconds(5)) {
       REXGPU_INFO(
           "Metal stats: {} swaps, {} draws requested, {} encoded, {} failed, {} resolves "
-          "({} written), {} transfers in total",
+          "({} written), {} memexport draws, {} submissions, {} deferred memory writes, {} "
+          "transfers in total",
           stats_.swaps, stats_.draws_requested, stats_.draws_encoded, stats_.draws_failed,
-          stats_.resolves, stats_.resolves_written, render_target_cache_->transfer_count());
+          stats_.resolves, stats_.resolves_written, stats_.memexport_draws, stats_.submissions,
+          stats_.deferred_memory_writes,
+          render_target_cache_->transfer_count());
       Stats empty;
       empty.last_log = now;
       stats_ = empty;

@@ -39,6 +39,17 @@ itself (so the resource binding layout is ours, with no descriptor emulation).
   with `newBufferWithBytesNoCopy`, so no uploads and no CPU-side page validity
   tracking are needed for GPU reads. GPU writes (resolves, memexport) land in guest
   memory directly. Watches that invalidate textures on CPU writes are still needed.
+  Because the GPU reads guest memory when it executes, not when the command stream
+  is parsed, the guest could reuse memory after seeing a fence value while the GPU
+  still reads it. `metal_defer_fence_writes` delays command stream memory writes
+  (EVENT_WRITE_SHD values, MEM_WRITE, COND_WRITE, REG_TO_MEM, scratch registers)
+  until the preceding submission completes. It's off by default: Fable II's frame
+  limiter waits on such fences, which costs about 25% of the frame rate, and no
+  visible difference was measured. The vblank counter variant of EVENT_WRITE_SHD is
+  always written immediately.
+- Memexport-only draws (no rasterization) are never skipped for an empty scissor or
+  full culling, and a memory barrier follows every memexport draw, since hazard
+  tracking doesn't order draws within one render encoder.
 - Shaders: guest shaders and the SPIR-V utility shaders already in the tree
   (resolves, texture loads, guest output, immediate drawing) are converted with
   SPIRV-Cross to MSL and compiled with `newLibraryWithSource`, cached by hash.

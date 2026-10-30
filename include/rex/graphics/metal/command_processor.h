@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #import <Metal/Metal.h>
@@ -95,6 +96,9 @@ class MetalCommandProcessor : public CommandProcessor {
 
   void OnPrimaryBufferEnd() override;
 
+  void WriteMemoryFromCommandStream(uint32_t address, uint32_t value) override;
+  void OnWaitRegMemNotMatched() override;
+
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
 
@@ -124,7 +128,7 @@ class MetalCommandProcessor : public CommandProcessor {
   // Returns false if nothing will be drawn (empty scissor or all culled).
   bool UpdateDynamicState(id<MTLRenderCommandEncoder> encoder,
                           const draw_util::ViewportInfo& viewport_info, bool primitive_polygonal,
-                          reg::RB_DEPTHCONTROL normalized_depth_control);
+                          reg::RB_DEPTHCONTROL normalized_depth_control, bool memexport_only);
 
   id<MTLDevice> device_ = nil;
   id<MTLCommandQueue> queue_ = nil;
@@ -147,6 +151,20 @@ class MetalCommandProcessor : public CommandProcessor {
   uint64_t frame_current_ = 1;
   uint64_t frame_completed_ = 0;
   uint64_t closed_frame_submissions_[kMaxFramesInFlight] = {};
+
+  // Command stream memory writes (fences) waiting for the GPU to complete the
+  // submission they follow, because the GPU reads guest memory directly and
+  // the guest may reuse it as soon as it sees the fence value.
+  struct DeferredMemoryWrite {
+    uint64_t submission;
+    uint32_t address;
+    uint32_t value;
+  };
+  std::mutex deferred_memory_writes_mutex_;
+  std::deque<DeferredMemoryWrite> deferred_memory_writes_;
+  // Applies the deferred writes up to the completed submission (with the
+  // mutex locked).
+  void ApplyDeferredMemoryWrites(uint64_t completed_submission);
 
   // Encoders (one at a time).
   id<MTLRenderCommandEncoder> render_encoder_ = nil;
@@ -194,6 +212,9 @@ class MetalCommandProcessor : public CommandProcessor {
     uint64_t draws_failed = 0;
     uint64_t resolves = 0;
     uint64_t resolves_written = 0;
+    uint64_t memexport_draws = 0;
+    uint64_t submissions = 0;
+    uint64_t deferred_memory_writes = 0;
     std::chrono::steady_clock::time_point last_log{};
   };
   Stats stats_;
