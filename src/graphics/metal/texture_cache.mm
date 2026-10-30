@@ -558,12 +558,16 @@ bool MetalTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
   // into a buffer, then copy the buffer to the texture.
   auto& metal_texture = static_cast<MetalTexture&>(texture);
   TextureKey texture_key = metal_texture.key();
-  if (texture_key.scaled_resolve) {
-    return false;
-  }
   HostFormat host_format = GetHostFormat(texture_key);
   LoadShaderIndex load_shader = host_format.load_shader;
-  if (load_shader == kLoadShaderIndexUnknown || !load_pipelines_[load_shader]) {
+  if (texture_key.scaled_resolve || load_shader == kLoadShaderIndexUnknown ||
+      !load_pipelines_[load_shader]) {
+    static std::array<bool, 64> logged = {};
+    if (!logged[uint32_t(texture_key.format) & 63]) {
+      logged[uint32_t(texture_key.format) & 63] = true;
+      REXGPU_WARN("MetalTextureCache: Can't load {} texture data (load shader {})",
+                  FormatInfo::Get(texture_key.format)->name, uint32_t(load_shader));
+    }
     return false;
   }
   id<MTLComputePipelineState> pipeline = load_pipelines_[load_shader];
@@ -650,8 +654,7 @@ bool MetalTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
   }
   id<MTLBuffer> scratch_buffer =
       [command_processor_.device() newBufferWithLength:host_buffer_size
-                                               options:MTLResourceStorageModePrivate |
-                                                       MTLResourceHazardTrackingModeUntracked];
+                                               options:MTLResourceStorageModePrivate];
   if (!scratch_buffer) {
     return false;
   }

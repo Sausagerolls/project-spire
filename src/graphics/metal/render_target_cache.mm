@@ -109,8 +109,7 @@ bool MetalRenderTargetCache::Initialize() {
   id<MTLDevice> device = command_processor_.device();
   // EDRAM: 10 MB at 1x resolution scale.
   edram_buffer_ = [device newBufferWithLength:xenos::kEdramSizeBytes
-                                      options:MTLResourceStorageModePrivate |
-                                              MTLResourceHazardTrackingModeUntracked];
+                                      options:MTLResourceStorageModePrivate];
   if (!edram_buffer_) {
     REXGPU_ERROR("MetalRenderTargetCache: Failed to create the EDRAM buffer");
     return false;

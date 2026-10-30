@@ -31,8 +31,9 @@ bool MetalSharedMemory::Initialize() {
   }
   buffer_ = [device_ newBufferWithBytesNoCopy:physical_membase
                                        length:kBufferSize
-                                      options:MTLResourceStorageModeShared |
-                                              MTLResourceHazardTrackingModeUntracked
+                                      // Tracked: Metal orders GPU writes
+                                      // (resolves, memexport) before reads.
+                                      options:MTLResourceStorageModeShared
                                   deallocator:nil];
   if (!buffer_) {
     REXGPU_ERROR("MetalSharedMemory: Failed to wrap the guest physical memory in a Metal buffer");

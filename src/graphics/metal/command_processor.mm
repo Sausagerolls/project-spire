@@ -55,6 +55,7 @@ struct SwapConstants {
   uint format;
   uint width;
   uint height;
+  uint swizzle;
 };
 int tiled_offset_2d(int x, int y, uint pitch, uint bpb_log2) {
   pitch = (pitch + 31u) & ~31u;
@@ -92,19 +93,21 @@ kernel void swap_cs(device const uint* memory [[buffer(0)]],
                     ? uint(tiled_offset_2d(int(xy.x), int(xy.y), constants.pitch, 2u))
                     : (xy.y * constants.pitch + xy.x) * 4u;
   uint value = swap_endian(memory[(constants.base + offset) >> 2u], constants.endian);
-  float4 color;
+  float4 source;
   if (constants.format == 0u) {
-    color = float4(float(value & 0xFFu), float((value >> 8u) & 0xFFu),
-                   float((value >> 16u) & 0xFFu), 255.0) / 255.0;
-  } else if (constants.format == 1u) {
-    color = float4(float(value & 0x3FFu) / 1023.0, float((value >> 10u) & 0x3FFu) / 1023.0,
-                   float((value >> 20u) & 0x3FFu) / 1023.0, 1.0);
+    source = float4(float(value & 0xFFu), float((value >> 8u) & 0xFFu),
+                    float((value >> 16u) & 0xFFu), float(value >> 24u)) / 255.0;
   } else {
-    color = float4(saturate(f7e3_to_f32(value & 0x3FFu)),
-                   saturate(f7e3_to_f32((value >> 10u) & 0x3FFu)),
-                   saturate(f7e3_to_f32((value >> 20u) & 0x3FFu)), 1.0);
+    source = float4(float(value & 0x3FFu) / 1023.0, float((value >> 10u) & 0x3FFu) / 1023.0,
+                    float((value >> 20u) & 0x3FFu) / 1023.0, float(value >> 30u) / 3.0);
   }
-  output.write(color, xy);
+  // The fetch constant swizzle (3 bits per component: XYZW, 0, 1).
+  float4 color;
+  for (uint i = 0u; i < 4u; ++i) {
+    uint component = (constants.swizzle >> (3u * i)) & 7u;
+    color[i] = component < 4u ? source[component] : (component == 4u ? 0.0 : 1.0);
+  }
+  output.write(float4(color.rgb, 1.0), xy);
 }
 )";
 
@@ -1076,6 +1079,7 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     uint32_t format;
     uint32_t width;
     uint32_t height;
+    uint32_t swizzle;
   } constants;
   constants.base = fetch.base_address << 12;
   constants.pitch = fetch.pitch << 5;
@@ -1092,6 +1096,7 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   }
   constants.width = frontbuffer_width;
   constants.height = frontbuffer_height;
+  constants.swizzle = fetch.swizzle;
   (void)frontbuffer_ptr;
 
   system::X_VIDEO_MODE video_mode;
