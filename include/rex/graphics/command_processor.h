@@ -175,8 +175,10 @@ class CommandProcessor {
   // the GPU has completed the preceding work, so the guest doesn't reuse memory
   // that the GPU is still reading.
   virtual void WriteMemoryFromCommandStream(uint32_t address, uint32_t value);
-  // Called before WAIT_REG_MEM waits for a value that doesn't match yet.
-  virtual void OnWaitRegMemNotMatched() {}
+  // Called when WAIT_REG_MEM polls a value that doesn't match yet. Returns
+  // true if it waited for delayed command stream memory writes (so the value
+  // should be polled again right away), false to wait as usual.
+  virtual bool AwaitCommandStreamMemoryWrites() { return false; }
 
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
   virtual void OnPrimaryBufferEnd() {}

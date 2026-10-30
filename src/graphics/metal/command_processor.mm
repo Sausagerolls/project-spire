@@ -40,14 +40,18 @@ REXCVAR_DEFINE_BOOL(metal_log_frame_rate, false, "GPU/Metal",
                     "Log the guest frame rate (swaps per second) and draws per frame about every "
                     "5 seconds")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_BOOL(metal_defer_fence_writes, false, "GPU/Metal",
+REXCVAR_DEFINE_BOOL(metal_defer_fence_writes, true, "GPU/Metal",
                     "Delay command stream memory writes (fences) until the GPU has completed the "
-                    "preceding work, so the guest doesn't reuse memory the GPU still reads (slower, as "
-                    "the guest then waits for the GPU)")
+                    "preceding work, so the guest doesn't reuse memory the GPU still reads or writes "
+                    "(required: resolves landing in freed memory corrupt the guest heap)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(metal_commit_on_fence, true, "GPU/Metal",
                     "Submit the GPU work when the command stream writes a fence, so the fence "
                     "is signaled as early as possible (with metal_defer_fence_writes)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(metal_reorder_texture_loads, true, "GPU/Metal",
+                    "Load textures that don't depend on GPU work of the current submission in a "
+                    "command buffer submitted before it, so loads don't split render passes")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(metal_sync_submissions, false, "GPU/Metal",
                     "Wait for the GPU after every submission (debugging CPU / GPU memory hazards)")
@@ -348,11 +352,25 @@ void MetalCommandProcessor::ApplyDeferredMemoryWrites(uint64_t completed_submiss
   }
 }
 
-void MetalCommandProcessor::OnWaitRegMemNotMatched() {
-  // The awaited value may be written when the current submission completes.
+bool MetalCommandProcessor::AwaitCommandStreamMemoryWrites() {
+  // The awaited value may be written by the GPU work encoded so far (resolves,
+  // memexport) or by a delayed write following it - submit it in any case.
   if (command_buffer_) {
     EndSubmission(false);
   }
+  uint64_t await_submission;
+  {
+    std::lock_guard<std::mutex> lock(deferred_memory_writes_mutex_);
+    if (deferred_memory_writes_.empty()) {
+      return false;
+    }
+    await_submission = deferred_memory_writes_.front().submission;
+  }
+  std::unique_lock<std::mutex> lock(deferred_memory_writes_mutex_);
+  submission_completed_cv_.wait_for(lock, std::chrono::milliseconds(4), [&] {
+    return GetCompletedSubmission() >= await_submission;
+  });
+  return true;
 }
 
 // Submissions and frames.
@@ -372,6 +390,7 @@ id<MTLCommandBuffer> MetalCommandProcessor::GetCommandBuffer() {
       std::lock_guard<std::mutex> lock(deferred_memory_writes_mutex_);
       submission_completed_.store(submission, std::memory_order_release);
       ApplyDeferredMemoryWrites(submission);
+      submission_completed_cv_.notify_all();
     }];
   }
   return command_buffer_;
@@ -421,7 +440,21 @@ void MetalCommandProcessor::EndSubmission(bool is_swap) {
     render_target_cache_->FlushPendingTransfers();
   }
   if (command_buffer_) {
+    CountRenderPassBreak(is_swap ? "swap" : "submission");
     EndEncoding();
+    if (upload_command_buffer_) {
+      if (upload_compute_encoder_) {
+        [upload_compute_encoder_ endEncoding];
+        upload_compute_encoder_ = nil;
+      }
+      if (upload_blit_encoder_) {
+        [upload_blit_encoder_ endEncoding];
+        upload_blit_encoder_ = nil;
+      }
+      [upload_command_buffer_ commit];
+      upload_command_buffer_ = nil;
+    }
+    submission_gpu_written_ranges_.clear();
     [command_buffer_ commit];
     ++stats_.submissions;
     if (REXCVAR_GET(metal_sync_submissions)) {
@@ -467,20 +500,85 @@ void MetalCommandProcessor::EndEncoding() {
   }
 }
 
-id<MTLComputeCommandEncoder> MetalCommandProcessor::GetComputeEncoder() {
+id<MTLComputeCommandEncoder> MetalCommandProcessor::GetUploadComputeEncoder() {
+  if (upload_compute_encoder_) {
+    return upload_compute_encoder_;
+  }
+  // The upload command buffer is committed with a main one.
+  GetCommandBuffer();
+  if (!upload_command_buffer_) {
+    upload_command_buffer_ = [queue_ commandBuffer];
+    upload_command_buffer_.label = @"upload";
+  }
+  if (upload_blit_encoder_) {
+    [upload_blit_encoder_ endEncoding];
+    upload_blit_encoder_ = nil;
+  }
+  upload_compute_encoder_ = [upload_command_buffer_ computeCommandEncoder];
+  upload_compute_encoder_.label = @"upload compute";
+  ++stats_.texture_loads_reordered;
+  return upload_compute_encoder_;
+}
+
+id<MTLBlitCommandEncoder> MetalCommandProcessor::GetUploadBlitEncoder() {
+  if (upload_blit_encoder_) {
+    return upload_blit_encoder_;
+  }
+  GetCommandBuffer();
+  if (!upload_command_buffer_) {
+    upload_command_buffer_ = [queue_ commandBuffer];
+    upload_command_buffer_.label = @"upload";
+  }
+  if (upload_compute_encoder_) {
+    [upload_compute_encoder_ endEncoding];
+    upload_compute_encoder_ = nil;
+  }
+  upload_blit_encoder_ = [upload_command_buffer_ blitCommandEncoder];
+  upload_blit_encoder_.label = @"upload blit";
+  return upload_blit_encoder_;
+}
+
+void MetalCommandProcessor::MarkGpuWrittenInSubmission(uint32_t start, uint32_t length) {
+  if (length) {
+    submission_gpu_written_ranges_.emplace_back(start, start + length);
+  }
+}
+
+bool MetalCommandProcessor::IsGpuWrittenInSubmission(uint32_t start, uint32_t length) const {
+  if (!length) {
+    return false;
+  }
+  uint32_t end = start + length;
+  for (const auto& range : submission_gpu_written_ranges_) {
+    if (start < range.second && end > range.first) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void MetalCommandProcessor::CountRenderPassBreak(const char* reason) {
+  if (render_encoder_ && !render_encoder_is_utility_ && REXCVAR_GET(metal_log_stats)) {
+    ++stats_.render_pass_breaks[reason];
+  }
+}
+
+id<MTLComputeCommandEncoder> MetalCommandProcessor::GetComputeEncoder(const char* reason) {
   if (compute_encoder_) {
     return compute_encoder_;
   }
+  CountRenderPassBreak(reason);
   EndEncoding();
   compute_encoder_ = [GetCommandBuffer() computeCommandEncoder];
   compute_encoder_.label = @"compute";
   return compute_encoder_;
 }
 
-id<MTLBlitCommandEncoder> MetalCommandProcessor::GetBlitEncoder() {
+id<MTLBlitCommandEncoder> MetalCommandProcessor::GetBlitEncoder(const char* reason) {
   if (blit_encoder_) {
     return blit_encoder_;
   }
+  CountRenderPassBreak(reason);
   EndEncoding();
   blit_encoder_ = [GetCommandBuffer() blitCommandEncoder];
   blit_encoder_.label = @"blit";
@@ -488,7 +586,11 @@ id<MTLBlitCommandEncoder> MetalCommandProcessor::GetBlitEncoder() {
 }
 
 id<MTLRenderCommandEncoder> MetalCommandProcessor::BeginUtilityRenderPass(
-    MTLRenderPassDescriptor* descriptor) {
+    MTLRenderPassDescriptor* descriptor, const char* reason) {
+  CountRenderPassBreak(reason);
+  if (REXCVAR_GET(metal_log_stats)) {
+    ++stats_.utility_passes[reason];
+  }
   EndEncoding();
   render_encoder_ = [GetCommandBuffer() renderCommandEncoderWithDescriptor:descriptor];
   render_encoder_is_utility_ = true;
@@ -501,7 +603,9 @@ id<MTLRenderCommandEncoder> MetalCommandProcessor::GetRenderEncoderForCurrentRen
   if (render_encoder_ && !render_encoder_is_utility_ && render_encoder_attachments_ == attachments) {
     return render_encoder_;
   }
+  CountRenderPassBreak("render target change");
   EndEncoding();
+  ++stats_.guest_render_passes;
   MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
   for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
     if (!attachments.color[i]) {
@@ -865,6 +969,7 @@ bool MetalCommandProcessor::IssueDrawImpl() {
     }
     for (const draw_util::MemExportRange& range : memexport_ranges_) {
       shared_memory_->RangeWrittenByGpu(range.base_address_dwords << 2, range.size_bytes);
+      MarkGpuWrittenInSubmission(range.base_address_dwords << 2, range.size_bytes);
     }
     // Hazard tracking doesn't order draws within one render encoder - make the
     // exported data visible to the following draws (as vertices, for example).
@@ -1182,6 +1287,25 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           stats_.resolves, stats_.resolves_written, stats_.memexport_draws, stats_.submissions,
           stats_.deferred_memory_writes,
           render_target_cache_->transfer_count());
+      std::string breaks;
+      for (const auto& reason : stats_.render_pass_breaks) {
+        breaks += fmt::format(" {}: {:.1f},", reason.first,
+                              double(reason.second) / std::max(stats_.swaps, uint64_t(1)));
+      }
+      breaks += " utility passes:";
+      for (const auto& reason : stats_.utility_passes) {
+        breaks += fmt::format(" {}: {:.1f},", reason.first,
+                              double(reason.second) / std::max(stats_.swaps, uint64_t(1)));
+      }
+      REXGPU_INFO("Metal memory: {} MB allocated by the device, {} transient pages used, {} "
+                  "free, {} deferred memory writes queued",
+                  [device_ currentAllocatedSize] >> 20, transient_pages_used_.size(),
+                  transient_pages_free_.size(), deferred_memory_writes_.size());
+      REXGPU_INFO("Metal per frame: {:.1f} guest render passes, {:.1f} reordered texture loads, "
+                  "ends:{}",
+                  double(stats_.guest_render_passes) / std::max(stats_.swaps, uint64_t(1)),
+                  double(stats_.texture_loads_reordered) / std::max(stats_.swaps, uint64_t(1)),
+                  breaks);
       Stats empty;
       empty.last_log = now;
       stats_ = empty;

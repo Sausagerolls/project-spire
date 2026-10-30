@@ -1036,8 +1036,12 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         matched = true;
         break;
     }
-    if (!matched) {
-      OnWaitRegMemNotMatched();
+    if (!matched && AwaitCommandStreamMemoryWrites()) {
+      // The value may have been written by the completed GPU work.
+      if (!worker_running_) {
+        return false;
+      }
+    } else if (!matched) {
       // Wait.
       if (wait >= 0x100) {
         PrepareForWait();

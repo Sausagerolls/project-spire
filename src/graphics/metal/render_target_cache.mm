@@ -729,7 +729,7 @@ void MetalRenderTargetCache::PerformTransfers(uint32_t render_target_count,
           pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
           pass.colorAttachments[0].storeAction = MTLStoreActionStore;
         }
-        encoder = command_processor_.BeginUtilityRenderPass(pass);
+        encoder = command_processor_.BeginUtilityRenderPass(pass, "transfer");
         encoder.label = @"transfer";
         if (dest_key.is_depth) {
           [encoder setDepthStencilState:transfer_depth_stencil_state_];
@@ -1047,7 +1047,7 @@ void MetalRenderTargetCache::ClearRenderTarget(RenderTarget* render_target, uint
     pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
     pass.colorAttachments[0].storeAction = MTLStoreActionStore;
   }
-  id<MTLRenderCommandEncoder> encoder = command_processor_.BeginUtilityRenderPass(pass);
+  id<MTLRenderCommandEncoder> encoder = command_processor_.BeginUtilityRenderPass(pass, "clear");
   if (!encoder) {
     return;
   }
@@ -1120,7 +1120,7 @@ bool MetalRenderTargetCache::Resolve(const memory::Memory& memory,
       }
       if (shared_memory.RequestRange(resolve_info.copy_dest_extent_start,
                                      resolve_info.copy_dest_extent_length)) {
-        id<MTLComputeCommandEncoder> encoder = command_processor_.GetComputeEncoder();
+        id<MTLComputeCommandEncoder> encoder = command_processor_.GetComputeEncoder("resolve");
         [encoder setComputePipelineState:resolve_copy_pipelines_[size_t(copy_shader)]];
         [encoder setBuffer:edram_buffer_ offset:0 atIndex:UtilityBuffer(0, 0)];
         // Bind the destination at its base, like the Vulkan backend, so the
@@ -1135,6 +1135,8 @@ bool MetalRenderTargetCache::Resolve(const memory::Memory& memory,
                 threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
         texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
                                           resolve_info.copy_dest_extent_length);
+        command_processor_.MarkGpuWrittenInSubmission(resolve_info.copy_dest_extent_start,
+                                                      resolve_info.copy_dest_extent_length);
         written_address_out = resolve_info.copy_dest_extent_start;
         written_length_out = resolve_info.copy_dest_extent_length;
         copied = true;
@@ -1197,7 +1199,7 @@ bool MetalRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump
   }
   std::sort(dump_invocations_.begin(), dump_invocations_.end());
 
-  id<MTLComputeCommandEncoder> encoder = command_processor_.GetComputeEncoder();
+  id<MTLComputeCommandEncoder> encoder = command_processor_.GetComputeEncoder("dump");
   [encoder setBuffer:edram_buffer_ offset:0 atIndex:UtilityBuffer(kDumpDescriptorSetEdram, 0)];
   bool all_pipelines_available = true;
   for (const DumpInvocation& invocation : dump_invocations_) {

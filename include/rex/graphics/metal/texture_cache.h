@@ -86,6 +86,8 @@ class MetalTextureCache final : public TextureCache {
     id<MTLTexture> texture() const { return texture_; }
     // A view with the host swizzle (12 bits, 3 per component) and signedness.
     id<MTLTexture> GetView(bool is_signed, uint32_t host_swizzle);
+    // The last submission that bound the texture for drawing.
+    uint64_t last_bound_submission = 0;
 
    private:
     id<MTLTexture> texture_;

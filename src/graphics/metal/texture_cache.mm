@@ -18,6 +18,8 @@
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/logging.h>
 
+REXCVAR_DECLARE(bool, metal_reorder_texture_loads);
+
 namespace rex::graphics::metal {
 
 namespace shaders {
@@ -175,6 +177,7 @@ id<MTLTexture> MetalTextureCache::GetActiveTextureOrNull(uint32_t fetch_constant
         break;
     }
     if (type_matches) {
+      texture->last_bound_submission = command_processor_.GetCurrentSubmission();
       id<MTLTexture> view = texture->GetView(is_signed, binding->host_swizzle);
       if (view) {
         return view;
@@ -660,7 +663,25 @@ bool MetalTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
   }
 
   auto& metal_shared_memory = static_cast<MetalSharedMemory&>(shared_memory());
-  id<MTLComputeCommandEncoder> encoder = command_processor_.GetComputeEncoder();
+  // Loading in the upload command buffer (before the current submission) keeps
+  // the guest render pass, if the load depends on no GPU work of the current
+  // submission and no draw of the current submission used the old data.
+  bool reorder = REXCVAR_GET(metal_reorder_texture_loads) &&
+                 command_processor_.IsGuestRenderPassOpen() &&
+                 metal_texture.last_bound_submission != command_processor_.GetCurrentSubmission();
+  if (reorder && load_base &&
+      command_processor_.IsGpuWrittenInSubmission(texture_key.base_page << 12,
+                                                   metal_texture.GetGuestBaseSize())) {
+    reorder = false;
+  }
+  if (reorder && load_mips && texture_key.mip_max_level &&
+      command_processor_.IsGpuWrittenInSubmission(texture_key.mip_page << 12,
+                                                   metal_texture.GetGuestMipsSize())) {
+    reorder = false;
+  }
+  id<MTLComputeCommandEncoder> encoder = reorder
+                                             ? command_processor_.GetUploadComputeEncoder()
+                                             : command_processor_.GetComputeEncoder("texture load");
   [encoder setComputePipelineState:pipeline];
   [encoder setBuffer:scratch_buffer offset:0 atIndex:kLoadBufferDestination];
 
@@ -725,7 +746,8 @@ bool MetalTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
   }
 
   // Copy to the texture.
-  id<MTLBlitCommandEncoder> blit = command_processor_.GetBlitEncoder();
+  id<MTLBlitCommandEncoder> blit = reorder ? command_processor_.GetUploadBlitEncoder()
+                                           : command_processor_.GetBlitEncoder("texture copy");
   id<MTLTexture> destination = metal_texture.texture();
   for (uint32_t level = level_first; level <= level_last; ++level) {
     const HostLayout& level_host_layout =

@@ -12,9 +12,12 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <memory>
+#include <string>
 #include <mutex>
 #include <vector>
 
@@ -65,15 +68,31 @@ class MetalCommandProcessor : public CommandProcessor {
   id<MTLCommandBuffer> GetCommandBuffer();
   // Ends the current render, compute or blit encoder.
   void EndEncoding();
+  // Counts why the current guest render pass is ended (for metal_log_stats).
+  void CountRenderPassBreak(const char* reason);
   // Return the compute or blit encoder, ending any other encoder.
-  id<MTLComputeCommandEncoder> GetComputeEncoder();
-  id<MTLBlitCommandEncoder> GetBlitEncoder();
+  // The reason names the work for render pass break statistics.
+  id<MTLComputeCommandEncoder> GetComputeEncoder(const char* reason = "compute");
+  id<MTLBlitCommandEncoder> GetBlitEncoder(const char* reason = "blit");
   // The render encoder for the render targets from the last render target
   // cache update, beginning a new render pass if needed.
   id<MTLRenderCommandEncoder> GetRenderEncoderForCurrentRenderTargets();
   // Begins a render pass with the given descriptor for utility drawing (the
   // caller ends it implicitly via EndEncoding).
-  id<MTLRenderCommandEncoder> BeginUtilityRenderPass(MTLRenderPassDescriptor* descriptor);
+  id<MTLRenderCommandEncoder> BeginUtilityRenderPass(MTLRenderPassDescriptor* descriptor,
+                                                     const char* reason = "utility pass");
+
+  // A command buffer committed right before the current submission, for work
+  // that must not split guest render passes (texture loads). Only for work
+  // that doesn't depend on GPU work in the current submission.
+  id<MTLComputeCommandEncoder> GetUploadComputeEncoder();
+  id<MTLBlitCommandEncoder> GetUploadBlitEncoder();
+  // Guest memory written by the GPU (resolves, memexport) in the current
+  // submission - reading it needs ordering after that work.
+  void MarkGpuWrittenInSubmission(uint32_t start, uint32_t length);
+  bool IsGpuWrittenInSubmission(uint32_t start, uint32_t length) const;
+  // Whether a render pass for guest drawing is open.
+  bool IsGuestRenderPassOpen() const { return render_encoder_ && !render_encoder_is_utility_; }
 
   // Per-frame transient GPU memory (constants and other small data), valid
   // until the frame completes on the GPU.
@@ -97,7 +116,7 @@ class MetalCommandProcessor : public CommandProcessor {
   void OnPrimaryBufferEnd() override;
 
   void WriteMemoryFromCommandStream(uint32_t address, uint32_t value) override;
-  void OnWaitRegMemNotMatched() override;
+  bool AwaitCommandStreamMemoryWrites() override;
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
@@ -161,10 +180,18 @@ class MetalCommandProcessor : public CommandProcessor {
     uint32_t value;
   };
   std::mutex deferred_memory_writes_mutex_;
+  // Notified when a submission completes.
+  std::condition_variable submission_completed_cv_;
   std::deque<DeferredMemoryWrite> deferred_memory_writes_;
   // Applies the deferred writes up to the completed submission (with the
   // mutex locked).
   void ApplyDeferredMemoryWrites(uint64_t completed_submission);
+
+  // Upload command buffer (committed before command_buffer_).
+  id<MTLCommandBuffer> upload_command_buffer_ = nil;
+  id<MTLComputeCommandEncoder> upload_compute_encoder_ = nil;
+  id<MTLBlitCommandEncoder> upload_blit_encoder_ = nil;
+  std::vector<std::pair<uint32_t, uint32_t>> submission_gpu_written_ranges_;
 
   // Encoders (one at a time).
   id<MTLRenderCommandEncoder> render_encoder_ = nil;
@@ -215,6 +242,10 @@ class MetalCommandProcessor : public CommandProcessor {
     uint64_t memexport_draws = 0;
     uint64_t submissions = 0;
     uint64_t deferred_memory_writes = 0;
+    uint64_t guest_render_passes = 0;
+    uint64_t texture_loads_reordered = 0;
+    std::map<std::string, uint64_t> render_pass_breaks;
+    std::map<std::string, uint64_t> utility_passes;
     std::chrono::steady_clock::time_point last_log{};
   };
   Stats stats_;
