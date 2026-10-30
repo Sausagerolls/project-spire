@@ -8,9 +8,15 @@
 
 #include <rex/ui/metal/metal_provider.h>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/ui/metal/metal_immediate_drawer.h>
 #include <rex/ui/metal/metal_presenter.h>
+
+REXCVAR_DEFINE_STRING(metal_math_mode, "safe", "GPU/Metal",
+                      "Metal shader math mode: 'safe' (IEEE), 'relaxed' (reassociation, keeps NaN "
+                      "and infinity handling) or 'fast'")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex {
 namespace ui {
@@ -49,10 +55,13 @@ std::unique_ptr<ImmediateDrawer> MetalProvider::CreateImmediateDrawer() {
 id<MTLLibrary> MetalProvider::CompileLibrary(NSString* source, const char* debug_name) const {
   MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
   // Guest shaders rely on IEEE behavior (NaN and infinity handling).
+  std::string math_mode = REXCVAR_GET(metal_math_mode);
   if (@available(macOS 15.0, *)) {
-    options.mathMode = MTLMathModeSafe;
+    options.mathMode = math_mode == "fast"      ? MTLMathModeFast
+                       : math_mode == "relaxed" ? MTLMathModeRelaxed
+                                                : MTLMathModeSafe;
   } else {
-    options.fastMathEnabled = NO;
+    options.fastMathEnabled = math_mode == "fast";
   }
   NSError* error = nil;
   id<MTLLibrary> library = [device_ newLibraryWithSource:source options:options error:&error];
