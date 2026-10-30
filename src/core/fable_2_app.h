@@ -350,7 +350,13 @@ class Fable2App : public rex::ReXApp {
     // config knobs - always on with ControlServer::Config defaults: 127.0.0.1:
     // 8791, no auth). Debug builds only (FABLE2_REMOTE_CONTROL); Release
     // builds never open the port.
-    if (!remote_server_.Start({})) {
+    // FABLE2_REMOTE_PORT selects another port, so several instances can run
+    // side by side (for example a long soak test next to a development run).
+    fable2::remote::ControlServer::Config remote_config;
+    if (const char* remote_port = std::getenv("FABLE2_REMOTE_PORT")) {
+      remote_config.port = std::atoi(remote_port);
+    }
+    if (!remote_server_.Start(remote_config)) {
       REXSYS_WARN(
           "[fable2-config] remote control server could not start; remote "
           "input disabled (see logs/)");
