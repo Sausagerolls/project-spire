@@ -4185,9 +4185,15 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                 regs, primitive_processing_result.host_vertex_shader_type)
           : 0;
   if (tessellation_grid_factor) {
-    // The vertex shader loads the patch indices itself if needed.
-    deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count *
-                                           tessellation_grid_factor * tessellation_grid_factor * 6,
+    // The vertex shader loads the patch indices itself if needed. With
+    // adaptive tessellation, the index buffer holds 4 edge factors per patch
+    // instead, and the patch index is the primitive index.
+    uint32_t tessellation_grid_patch_count =
+        primitive_processing_result.tessellation_mode == xenos::TessellationMode::kAdaptive
+            ? primitive_processing_result.host_draw_vertex_count / 4
+            : primitive_processing_result.host_draw_vertex_count;
+    deferred_command_buffer_.CmdVkDraw(tessellation_grid_patch_count * tessellation_grid_factor *
+                                           tessellation_grid_factor * 6,
                                        1, 0, 0);
   } else if (primitive_processing_result.index_buffer_type ==
                  PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
@@ -6025,12 +6031,20 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   if (shader_32bit_index_dma) {
     flags |= SpirvShaderTranslator::kSysFlag_VertexIndexLoad;
   }
-  if (primitive_processing_result.index_buffer_type ==
-          PrimitiveProcessor::ProcessedIndexBufferType::kHostBuiltinForDMA ||
-      primitive_processing_result.index_buffer_type ==
-          PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA ||
-      primitive_processing_result.index_buffer_type ==
-          PrimitiveProcessor::ProcessedIndexBufferType::kHostConverted) {
+  // Adaptive tessellation drawn as a grid uses the patch index directly - the
+  // index buffer contains edge factors.
+  bool adaptive_tessellation_grid =
+      primitive_processing_result.IsTessellated() &&
+      primitive_processing_result.tessellation_mode == xenos::TessellationMode::kAdaptive &&
+      VulkanPipelineCache::GetTessellationGridFactor(
+          regs, primitive_processing_result.host_vertex_shader_type) != 0;
+  if (!adaptive_tessellation_grid &&
+      (primitive_processing_result.index_buffer_type ==
+           PrimitiveProcessor::ProcessedIndexBufferType::kHostBuiltinForDMA ||
+       primitive_processing_result.index_buffer_type ==
+           PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA ||
+       primitive_processing_result.index_buffer_type ==
+           PrimitiveProcessor::ProcessedIndexBufferType::kHostConverted)) {
     flags |= SpirvShaderTranslator::kSysFlag_ComputeOrPrimitiveVertexIndexLoad;
     if (vgt_draw_initiator.index_size == xenos::IndexFormat::kInt32) {
       flags |= SpirvShaderTranslator ::kSysFlag_ComputeOrPrimitiveVertexIndexLoad32Bit;

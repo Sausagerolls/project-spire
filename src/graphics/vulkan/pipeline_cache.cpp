@@ -65,6 +65,13 @@ REXCVAR_DEFINE_BOOL(vulkan_tessellation_grid, REX_VULKAN_TESSELLATION_GRID_DEFAU
                     "Draw quad patch tessellation with a constant integer factor as a triangle "
                     "grid with the domain shader running as the vertex shader instead of using "
                     "host tessellation, which MoltenVK emulates slowly.");
+REXCVAR_DEFINE_BOOL(vulkan_tessellation_grid_adaptive, REX_VULKAN_TESSELLATION_GRID_DEFAULT,
+                    "GPU/Vulkan",
+                    "With vulkan_tessellation_grid, also draw adaptive quad patch tessellation "
+                    "as a triangle grid, with every patch at the maximum factor of the draw "
+                    "instead of its per-edge factors. Finer than the guest asks for, but crack-free "
+                    "(shared edges get the same factor), and it avoids MoltenVK restarting the "
+                    "render pass for the compute stages of every tessellated draw.");
 REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
                     "Render tessellation as wireframe")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -926,19 +933,22 @@ uint32_t VulkanPipelineCache::GetTessellationGridFactor(
     return 0;
   }
   xenos::TessellationMode tessellation_mode = regs.Get<reg::VGT_HOS_CNTL>().tess_mode;
-  if (tessellation_mode == xenos::TessellationMode::kAdaptive) {
+  if (tessellation_mode == xenos::TessellationMode::kAdaptive &&
+      !REXCVAR_GET(vulkan_tessellation_grid_adaptive)) {
     return 0;
   }
-  // Same factor as the tessellation control shader uses. The grid is only
+  // Same factor as the tessellation control shader uses (for adaptive
+  // tessellation, the upper bound of the per-edge factors). The grid is only
   // equivalent to the host tessellator output for integer factors, and, with
-  // fractional_even spacing in the continuous mode, for even ones.
+  // fractional_even spacing in the continuous and adaptive modes, for even
+  // ones.
   float factor = regs.Get<float>(XE_GPU_REG_VGT_HOS_MAX_TESS_LEVEL) + 1.0f;
   if (!(factor >= 1.0f && factor <= 64.0f)) {
     return 0;
   }
   uint32_t factor_integer = uint32_t(factor);
   if (float(factor_integer) != factor ||
-      (tessellation_mode == xenos::TessellationMode::kContinuous && (factor_integer & 1))) {
+      (tessellation_mode != xenos::TessellationMode::kDiscrete && (factor_integer & 1))) {
     return 0;
   }
   return factor_integer;
