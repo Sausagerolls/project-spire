@@ -16,6 +16,7 @@
 #include <vector>
 
 #include <SPIRV/GLSL.std.450.h>
+#include <xxhash.h>
 
 #include <rex/assert.h>
 #include <rex/graphics/metal/command_processor.h>
@@ -99,6 +100,320 @@ fragment DepthOut clear_depth_ps(constant float4& value [[buffer(0)]]) {
 }
 )";
 
+NSString* const kTransferShaderSource = @R"(
+#include <metal_stdlib>
+using namespace metal;
+// Specialization: destination and source render targets.
+constant uint kDestFormat [[function_constant(0)]];
+constant bool kDestIsDepth [[function_constant(1)]];
+constant uint kDestMsaaLog2 [[function_constant(2)]];
+constant bool kDestIs64bpp [[function_constant(3)]];
+constant uint kSourceFormat [[function_constant(4)]];
+constant bool kSourceIsDepth [[function_constant(5)]];
+constant uint kSourceMsaaLog2 [[function_constant(6)]];
+constant bool kSourceIs64bpp [[function_constant(7)]];
+constant bool kSourceColor1x = !kSourceIsDepth && kSourceMsaaLog2 == 0u;
+constant bool kSourceColorMs = !kSourceIsDepth && kSourceMsaaLog2 != 0u;
+constant bool kSourceDepth1x = kSourceIsDepth && kSourceMsaaLog2 == 0u;
+constant bool kSourceDepthMs = kSourceIsDepth && kSourceMsaaLog2 != 0u;
+struct Params {
+  uint dest_base_tiles;
+  uint dest_pitch_tiles;
+  uint source_base_tiles;
+  uint source_pitch_tiles;
+};
+struct VertexOut {
+  float4 position [[position]];
+};
+vertex VertexOut transfer_vs(uint vertex_id [[vertex_id]]) {
+  VertexOut out;
+  float2 position = float2(float((vertex_id << 1u) & 2u), float(vertex_id & 2u));
+  out.position = float4(position * 2.0 - 1.0, 0.0, 1.0);
+  return out;
+}
+uint2 pixel_to_samples(uint2 pixel, uint sample, uint msaa_log2) {
+  if (msaa_log2 >= 2u) {
+    return uint2(pixel.x * 2u + (sample & 1u), pixel.y * 2u + (sample >> 1u));
+  }
+  if (msaa_log2 == 1u) {
+    // Host sample 1 is the top guest sample, 0 the bottom one.
+    return uint2(pixel.x, pixel.y * 2u + (sample == 0u ? 1u : 0u));
+  }
+  return pixel;
+}
+void samples_to_pixel(uint2 samples, uint msaa_log2, thread uint2& pixel, thread uint& sample) {
+  if (msaa_log2 >= 2u) {
+    pixel = samples >> 1u;
+    sample = (samples.x & 1u) | ((samples.y & 1u) << 1u);
+  } else if (msaa_log2 == 1u) {
+    pixel = uint2(samples.x, samples.y >> 1u);
+    sample = (samples.y & 1u) != 0u ? 0u : 1u;
+  } else {
+    pixel = samples;
+    sample = 0u;
+  }
+}
+// 7e3 and 20e4 conversions as in the Xenos backends.
+uint f32_to_7e3(float f) {
+  f = clamp(f, 0.0, 31.875);
+  uint u = as_type<uint>(f);
+  uint biased = u < 0x3E800000u ? ((u & 0x7FFFFFu) | 0x800000u) >> min(125u - (u >> 23u), 24u)
+                                : u - (124u << 23u);
+  return ((biased + 0x7FFFu + ((biased >> 16u) & 1u)) >> 16u) & 0x3FFu;
+}
+float f7e3_to_f32(uint f10) {
+  uint mantissa = f10 & 0x7Fu;
+  uint exponent = (f10 >> 7u) & 7u;
+  if (exponent == 0u) {
+    return float(mantissa) * exp2(-13.0);
+  }
+  return (1.0 + float(mantissa) / 128.0) * exp2(float(exponent) - 3.0);
+}
+uint f32_to_20e4(float f) {
+  if (!(f > 0.0)) {
+    return 0u;
+  }
+  uint u = as_type<uint>(f);
+  if (u >= 0x3FFFFFF8u) {
+    return 0xFFFFFFu;
+  }
+  if (u < 0x38800000u) {
+    u = (0x800000u | (u & 0x7FFFFFu)) >> min(113u - (u >> 23u), 24u);
+  } else {
+    u += 0xC8000000u;
+  }
+  return (u >> 3u) & 0xFFFFFFu;
+}
+float f20e4_to_f32(uint f24) {
+  f24 &= 0xFFFFFFu;
+  if (f24 == 0u) {
+    return 0.0;
+  }
+  uint mantissa = f24 & 0xFFFFFu;
+  uint exponent = f24 >> 20u;
+  if (exponent == 0u) {
+    uint shift = clz(mantissa) - (32u - 21u);
+    exponent = uint(1 - int(shift));
+    mantissa = (mantissa << shift) & 0xFFFFFu;
+  }
+  return as_type<float>(((exponent + 112u) << 23u) | (mantissa << 3u));
+}
+uint pack16(float value, bool is_float) {
+  if (is_float) {
+    return uint(as_type<ushort>(half(value)));
+  }
+  return uint(int(rint(clamp(value, -1.0, 1.0) * 32767.0))) & 0xFFFFu;
+}
+float unpack16(uint value, bool is_float) {
+  return is_float ? float(as_type<half>(ushort(value)))
+                  : max(float(int(value << 16u) >> 16) / 32767.0, -1.0);
+}
+// Packs a source color to its EDRAM representation.
+uint2 pack_color(float4 c, uint format) {
+  switch (format) {
+    case 0u:
+    case 1u:
+      return uint2(uint(c.r * 255.0 + 0.5) | (uint(c.g * 255.0 + 0.5) << 8u) |
+                       (uint(c.b * 255.0 + 0.5) << 16u) | (uint(c.a * 255.0 + 0.5) << 24u),
+                   0u);
+    case 2u:
+    case 10u:
+      return uint2(uint(c.r * 1023.0 + 0.5) | (uint(c.g * 1023.0 + 0.5) << 10u) |
+                       (uint(c.b * 1023.0 + 0.5) << 20u) | (uint(saturate(c.a) * 3.0 + 0.5) << 30u),
+                   0u);
+    case 3u:
+    case 12u:
+      return uint2(f32_to_7e3(c.r) | (f32_to_7e3(c.g) << 10u) | (f32_to_7e3(c.b) << 20u) |
+                       (uint(saturate(c.a) * 3.0 + 0.5) << 30u),
+                   0u);
+    case 4u:
+    case 6u:
+      return uint2(pack16(c.r, format == 6u) | (pack16(c.g, format == 6u) << 16u), 0u);
+    case 5u:
+    case 7u:
+      return uint2(pack16(c.r, format == 7u) | (pack16(c.g, format == 7u) << 16u),
+                   pack16(c.b, format == 7u) | (pack16(c.a, format == 7u) << 16u));
+    case 14u:
+      return uint2(as_type<uint>(c.r), 0u);
+    case 15u:
+      return uint2(as_type<uint>(c.r), as_type<uint>(c.g));
+    default:
+      return uint2(0u);
+  }
+}
+float4 unpack_color(uint2 v, uint format) {
+  uint value = v.x;
+  switch (format) {
+    case 0u:
+    case 1u:
+      return float4(float(value & 0xFFu), float((value >> 8u) & 0xFFu),
+                    float((value >> 16u) & 0xFFu), float(value >> 24u)) / 255.0;
+    case 2u:
+    case 10u:
+      return float4(float(value & 0x3FFu) / 1023.0, float((value >> 10u) & 0x3FFu) / 1023.0,
+                    float((value >> 20u) & 0x3FFu) / 1023.0, float(value >> 30u) / 3.0);
+    case 3u:
+    case 12u:
+      return float4(f7e3_to_f32(value & 0x3FFu), f7e3_to_f32((value >> 10u) & 0x3FFu),
+                    f7e3_to_f32((value >> 20u) & 0x3FFu), float(value >> 30u) / 3.0);
+    case 4u:
+    case 6u:
+      return float4(unpack16(value & 0xFFFFu, format == 6u), unpack16(value >> 16u, format == 6u),
+                    0.0, 0.0);
+    case 5u:
+    case 7u:
+      return float4(unpack16(v.x & 0xFFFFu, format == 7u), unpack16(v.x >> 16u, format == 7u),
+                    unpack16(v.y & 0xFFFFu, format == 7u), unpack16(v.y >> 16u, format == 7u));
+    case 14u:
+      return float4(as_type<float>(v.x), 0.0, 0.0, 0.0);
+    case 15u:
+      return float4(as_type<float>(v.x), as_type<float>(v.y), 0.0, 0.0);
+    default:
+      return float4(0.0);
+  }
+}
+struct Sources {
+  texture2d<float> color_1x;
+  texture2d_ms<float> color_ms;
+  depth2d<float> depth_1x;
+  depth2d_ms<float> depth_ms;
+  texture2d<uint> stencil_1x;
+  texture2d_ms<uint> stencil_ms;
+};
+// Reads one source EDRAM element (packed) at the source samples.
+uint2 read_source(uint2 samples, thread const Sources& sources) {
+  uint2 pixel;
+  uint sample;
+  samples_to_pixel(samples, kSourceMsaaLog2, pixel, sample);
+  if (kSourceIsDepth) {
+    float depth;
+    uint stencil;
+    if (kSourceDepthMs) {
+      depth = sources.depth_ms.read(pixel, sample);
+      stencil = sources.stencil_ms.read(pixel, sample).x;
+    } else {
+      depth = sources.depth_1x.read(pixel);
+      stencil = sources.stencil_1x.read(pixel).x;
+    }
+    uint depth24 = kSourceFormat == 1u ? f32_to_20e4(depth * 2.0)
+                                       : uint(rint(depth * 16777215.0));
+    return uint2((depth24 << 8u) | (stencil & 0xFFu), 0u);
+  }
+  float4 color = kSourceColorMs ? sources.color_ms.read(pixel, sample)
+                                : sources.color_1x.read(pixel);
+  return pack_color(color, kSourceFormat);
+}
+// The destination sample's data in the EDRAM layout of the source.
+uint2 fetch_edram(uint2 dest_pixel, uint dest_sample, constant Params& params,
+                  thread const Sources& sources) {
+  uint2 dest_samples = pixel_to_samples(dest_pixel, dest_sample, kDestMsaaLog2);
+  uint dest_tile_width = kDestIs64bpp ? 40u : 80u;
+  uint tile_x = dest_samples.x / dest_tile_width;
+  uint tile_y = dest_samples.y / 16u;
+  uint tx = dest_samples.x % dest_tile_width;
+  uint ty = dest_samples.y % 16u;
+  if (kDestIsDepth) {
+    tx = tx < dest_tile_width / 2u ? tx + dest_tile_width / 2u : tx - dest_tile_width / 2u;
+  }
+  uint tile = params.dest_base_tiles + tile_y * params.dest_pitch_tiles + tile_x;
+  uint byte_in_tile = (ty * dest_tile_width + tx) * (kDestIs64bpp ? 8u : 4u);
+  // In the source.
+  uint source_tile_width = kSourceIs64bpp ? 40u : 80u;
+  uint source_element_size = kSourceIs64bpp ? 8u : 4u;
+  uint source_relative_tile = (tile - params.source_base_tiles) & 2047u;
+  uint source_tile_y = source_relative_tile / params.source_pitch_tiles;
+  uint source_tile_x = source_relative_tile % params.source_pitch_tiles;
+  uint dwords_needed = kDestIs64bpp ? 2u : 1u;
+  uint dwords[2] = {0u, 0u};
+  for (uint i = 0u; i < dwords_needed; ++i) {
+    uint byte = byte_in_tile + i * 4u;
+    uint element = byte / source_element_size;
+    uint dword_in_element = (byte % source_element_size) / 4u;
+    uint stx = element % source_tile_width;
+    uint sty = element / source_tile_width;
+    if (kSourceIsDepth) {
+      stx = stx < source_tile_width / 2u ? stx + source_tile_width / 2u
+                                         : stx - source_tile_width / 2u;
+    }
+    uint2 source_samples = uint2(source_tile_x * source_tile_width + stx,
+                                 source_tile_y * 16u + sty);
+    uint2 packed = read_source(source_samples, sources);
+    dwords[i] = dword_in_element ? packed.y : packed.x;
+  }
+  return uint2(dwords[0], dwords[1]);
+}
+fragment float4 transfer_color_ps(
+    VertexOut in [[stage_in]], uint sample [[sample_id]], constant Params& params [[buffer(30)]],
+    texture2d<float> color_1x [[texture(30), function_constant(kSourceColor1x)]],
+    texture2d_ms<float> color_ms [[texture(30), function_constant(kSourceColorMs)]],
+    depth2d<float> depth_1x [[texture(30), function_constant(kSourceDepth1x)]],
+    depth2d_ms<float> depth_ms [[texture(30), function_constant(kSourceDepthMs)]],
+    texture2d<uint> stencil_1x [[texture(31), function_constant(kSourceDepth1x)]],
+    texture2d_ms<uint> stencil_ms [[texture(31), function_constant(kSourceDepthMs)]]) {
+  Sources sources;
+  if (kSourceColor1x) sources.color_1x = color_1x;
+  if (kSourceColorMs) sources.color_ms = color_ms;
+  if (kSourceDepth1x) { sources.depth_1x = depth_1x; sources.stencil_1x = stencil_1x; }
+  if (kSourceDepthMs) { sources.depth_ms = depth_ms; sources.stencil_ms = stencil_ms; }
+  return unpack_color(fetch_edram(uint2(in.position.xy), sample, params, sources), kDestFormat);
+}
+// For transfers inside a guest render pass with multiple attachments - the
+// pipeline's write masks select the destination.
+struct ColorOut4 {
+  float4 color0 [[color(0)]];
+  float4 color1 [[color(1)]];
+  float4 color2 [[color(2)]];
+  float4 color3 [[color(3)]];
+};
+fragment ColorOut4 transfer_color_mrt_ps(
+    VertexOut in [[stage_in]], uint sample [[sample_id]], constant Params& params [[buffer(30)]],
+    texture2d<float> color_1x [[texture(30), function_constant(kSourceColor1x)]],
+    texture2d_ms<float> color_ms [[texture(30), function_constant(kSourceColorMs)]],
+    depth2d<float> depth_1x [[texture(30), function_constant(kSourceDepth1x)]],
+    depth2d_ms<float> depth_ms [[texture(30), function_constant(kSourceDepthMs)]],
+    texture2d<uint> stencil_1x [[texture(31), function_constant(kSourceDepth1x)]],
+    texture2d_ms<uint> stencil_ms [[texture(31), function_constant(kSourceDepthMs)]]) {
+  Sources sources;
+  if (kSourceColor1x) sources.color_1x = color_1x;
+  if (kSourceColorMs) sources.color_ms = color_ms;
+  if (kSourceDepth1x) { sources.depth_1x = depth_1x; sources.stencil_1x = stencil_1x; }
+  if (kSourceDepthMs) { sources.depth_ms = depth_ms; sources.stencil_ms = stencil_ms; }
+  float4 color =
+      unpack_color(fetch_edram(uint2(in.position.xy), sample, params, sources), kDestFormat);
+  ColorOut4 out;
+  out.color0 = color;
+  out.color1 = color;
+  out.color2 = color;
+  out.color3 = color;
+  return out;
+}
+struct DepthOut {
+  float depth [[depth(any)]];
+  uint stencil [[stencil]];
+};
+fragment DepthOut transfer_depth_ps(
+    VertexOut in [[stage_in]], uint sample [[sample_id]], constant Params& params [[buffer(30)]],
+    texture2d<float> color_1x [[texture(30), function_constant(kSourceColor1x)]],
+    texture2d_ms<float> color_ms [[texture(30), function_constant(kSourceColorMs)]],
+    depth2d<float> depth_1x [[texture(30), function_constant(kSourceDepth1x)]],
+    depth2d_ms<float> depth_ms [[texture(30), function_constant(kSourceDepthMs)]],
+    texture2d<uint> stencil_1x [[texture(31), function_constant(kSourceDepth1x)]],
+    texture2d_ms<uint> stencil_ms [[texture(31), function_constant(kSourceDepthMs)]]) {
+  Sources sources;
+  if (kSourceColor1x) sources.color_1x = color_1x;
+  if (kSourceColorMs) sources.color_ms = color_ms;
+  if (kSourceDepth1x) { sources.depth_1x = depth_1x; sources.stencil_1x = stencil_1x; }
+  if (kSourceDepthMs) { sources.depth_ms = depth_ms; sources.stencil_ms = stencil_ms; }
+  uint value = fetch_edram(uint2(in.position.xy), sample, params, sources).x;
+  DepthOut out;
+  // 0 - D24S8, 1 - D24FS8 (stored as [0, 0.5) on the host).
+  out.depth = kDestFormat == 1u ? f20e4_to_f32(value >> 8u) * 0.5
+                                : float(value >> 8u) / 16777215.0;
+  out.stencil = value & 0xFFu;
+  return out;
+}
+)";
+
 }  // namespace
 
 MetalRenderTargetCache::~MetalRenderTargetCache() {
@@ -140,6 +455,24 @@ bool MetalRenderTargetCache::Initialize() {
   clear_color_ps_ = [clear_library newFunctionWithName:@"clear_color_ps"];
   clear_depth_ps_ = [clear_library newFunctionWithName:@"clear_depth_ps"];
 
+  transfer_library_ = command_processor_.GetMetalProvider().CompileLibrary(
+      kTransferShaderSource, "render target transfer");
+  if (!transfer_library_) {
+    return false;
+  }
+  transfer_vs_ = [transfer_library_ newFunctionWithName:@"transfer_vs"];
+  MTLDepthStencilDescriptor* load_depth_stencil = [[MTLDepthStencilDescriptor alloc] init];
+  load_depth_stencil.depthCompareFunction = MTLCompareFunctionAlways;
+  load_depth_stencil.depthWriteEnabled = YES;
+  MTLStencilDescriptor* load_stencil = [[MTLStencilDescriptor alloc] init];
+  load_stencil.stencilCompareFunction = MTLCompareFunctionAlways;
+  load_stencil.depthStencilPassOperation = MTLStencilOperationReplace;
+  load_stencil.writeMask = 0xFF;
+  load_depth_stencil.frontFaceStencil = load_stencil;
+  load_depth_stencil.backFaceStencil = load_stencil;
+  transfer_depth_stencil_state_ =
+      [command_processor_.device() newDepthStencilStateWithDescriptor:load_depth_stencil];
+
   InitializeCommon();
   return true;
 }
@@ -150,6 +483,7 @@ void MetalRenderTargetCache::Shutdown(bool from_destructor) {
   }
   dump_pipelines_.clear();
   clear_pipelines_.clear();
+  transfer_pipelines_.clear();
   clear_depth_stencil_state_ = nil;
   for (auto& pipeline : resolve_copy_pipelines_) {
     pipeline = nil;
@@ -241,7 +575,34 @@ bool MetalRenderTargetCache::Update(bool is_rasterization_done,
     return false;
   }
   RenderTarget* const* render_targets = last_update_accumulated_render_targets();
-  PerformTransfers(1 + xenos::kMaxColorRenderTargets, render_targets, last_update_transfers());
+  // Transfers to the render targets of this draw are performed in its render
+  // pass (PerformPendingTransfersInRenderPass) - unless a source is bound
+  // too, in which case it can't be read in the pass.
+  FlushPendingTransfers();
+  const std::vector<Transfer>* transfers = last_update_transfers();
+  bool source_bound = false;
+  bool any_transfers = false;
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    for (const Transfer& transfer : transfers[i]) {
+      any_transfers = true;
+      for (uint32_t j = 0; j < 1 + xenos::kMaxColorRenderTargets; ++j) {
+        if (transfer.source && transfer.source == render_targets[j]) {
+          source_bound = true;
+        }
+      }
+    }
+  }
+  if (any_transfers) {
+    if (source_bound) {
+      PerformTransfers(1 + xenos::kMaxColorRenderTargets, render_targets, transfers);
+    } else {
+      for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+        pending_transfer_render_targets_[i] = render_targets[i];
+        pending_transfers_[i] = transfers[i];
+      }
+      has_pending_transfers_ = true;
+    }
+  }
 
   auto rb_surface_info = register_file().Get<reg::RB_SURFACE_INFO>();
   RenderPassAttachments attachments;
@@ -274,15 +635,253 @@ bool MetalRenderTargetCache::Update(bool is_rasterization_done,
 
 void MetalRenderTargetCache::PerformTransfers(uint32_t render_target_count,
                                               RenderTarget* const* render_targets,
-                                              const std::vector<Transfer>* render_target_transfers) {
-  // TODO(metal): Ownership transfers between render targets aliasing the same
-  // EDRAM range (copying the data with format conversion).
-  static bool logged = false;
+                                              const std::vector<Transfer>* render_target_transfers,
+                                              const Transfer::Rectangle* cutout) {
+  // One render pass per destination, drawing the rectangles of each transfer
+  // with a shader reading the source render target at the same EDRAM
+  // addresses and converting the format through the guest EDRAM
+  // representation. Host depth precision is not preserved (depth goes
+  // through the 24-bit guest representation).
   for (uint32_t i = 0; i < render_target_count; ++i) {
-    if (render_targets[i] && !render_target_transfers[i].empty() && !logged) {
-      logged = true;
-      REXGPU_WARN("MetalRenderTargetCache: EDRAM ownership transfers are not implemented yet");
+    RenderTarget* dest_rt = render_targets[i];
+    if (!dest_rt || render_target_transfers[i].empty()) {
+      continue;
     }
+    auto& dest = *static_cast<MetalRenderTarget*>(dest_rt);
+    RenderTargetKey dest_key = dest.key();
+    id<MTLTexture> texture = dest.texture();
+    id<MTLRenderCommandEncoder> encoder = nil;
+    for (const Transfer& transfer : render_target_transfers[i]) {
+      if (!transfer.source || transfer.source == dest_rt) {
+        continue;
+      }
+      auto& source = *static_cast<MetalRenderTarget*>(transfer.source);
+      RenderTargetKey source_key = source.key();
+      Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithCutout];
+      uint32_t rectangle_count =
+          transfer.GetRectangles(dest_key.base_tiles, dest_key.GetPitchTiles(),
+                                 dest_key.msaa_samples, dest_key.Is64bpp(), rectangles, cutout);
+      if (!rectangle_count) {
+        continue;
+      }
+      id<MTLRenderPipelineState> pipeline = GetTransferPipeline(source_key, dest_key, texture);
+      if (!pipeline) {
+        continue;
+      }
+      ++transfer_count_;
+      if (!encoder) {
+        MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        if (dest_key.is_depth) {
+          pass.depthAttachment.texture = texture;
+          pass.depthAttachment.loadAction = MTLLoadActionLoad;
+          pass.depthAttachment.storeAction = MTLStoreActionStore;
+          pass.stencilAttachment.texture = texture;
+          pass.stencilAttachment.loadAction = MTLLoadActionLoad;
+          pass.stencilAttachment.storeAction = MTLStoreActionStore;
+        } else {
+          pass.colorAttachments[0].texture = texture;
+          pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+          pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        }
+        encoder = command_processor_.BeginUtilityRenderPass(pass);
+        if (dest_key.is_depth) {
+          [encoder setDepthStencilState:transfer_depth_stencil_state_];
+        }
+      }
+      [encoder setRenderPipelineState:pipeline];
+      [encoder setFragmentTexture:source.texture() atIndex:30];
+      if (source_key.is_depth) {
+        [encoder setFragmentTexture:source.stencil_view() atIndex:31];
+      }
+      uint32_t params[4] = {dest_key.base_tiles, dest_key.GetPitchTiles(), source_key.base_tiles,
+                            std::max(source_key.GetPitchTiles(), uint32_t(1))};
+      [encoder setFragmentBytes:params length:sizeof(params) atIndex:30];
+      for (uint32_t j = 0; j < rectangle_count; ++j) {
+        const Transfer::Rectangle& rectangle = rectangles[j];
+        MTLScissorRect scissor;
+        scissor.x = std::min(NSUInteger(rectangle.x_pixels), texture.width);
+        scissor.y = std::min(NSUInteger(rectangle.y_pixels), texture.height);
+        scissor.width = std::min(NSUInteger(rectangle.width_pixels), texture.width - scissor.x);
+        scissor.height = std::min(NSUInteger(rectangle.height_pixels), texture.height - scissor.y);
+        if (!scissor.width || !scissor.height) {
+          continue;
+        }
+        [encoder setScissorRect:scissor];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+      }
+    }
+    if (encoder) {
+      command_processor_.EndEncoding();
+    }
+  }
+}
+
+id<MTLRenderPipelineState> MetalRenderTargetCache::GetTransferPipeline(
+    RenderTargetKey source_key, RenderTargetKey dest_key, id<MTLTexture> texture,
+    const RenderPassFormats* pass_formats, uint32_t pass_color_index) {
+  struct {
+    uint32_t key;
+    uint32_t pass_color_index;
+    RenderPassFormats formats;
+  } full_key;
+  std::memset(&full_key, 0, sizeof(full_key));
+  full_key.key = uint32_t(dest_key.resource_format) | (uint32_t(dest_key.is_depth) << 4) |
+                 (uint32_t(dest_key.msaa_samples) << 5) |
+                 (uint32_t(source_key.resource_format) << 8) |
+                 (uint32_t(source_key.is_depth) << 12) | (uint32_t(source_key.msaa_samples) << 13);
+  if (pass_formats) {
+    full_key.pass_color_index = pass_color_index;
+    full_key.formats = *pass_formats;
+  }
+  uint64_t pipeline_key = XXH3_64bits(&full_key, sizeof(full_key));
+  auto it = transfer_pipelines_.find(pipeline_key);
+  if (it != transfer_pipelines_.end()) {
+    return it->second;
+  }
+  MTLFunctionConstantValues* constants = [[MTLFunctionConstantValues alloc] init];
+  uint32_t values_uint[4] = {dest_key.resource_format, uint32_t(dest_key.msaa_samples),
+                             source_key.resource_format, uint32_t(source_key.msaa_samples)};
+  bool values_bool[4] = {bool(dest_key.is_depth), dest_key.Is64bpp(), bool(source_key.is_depth),
+                         source_key.Is64bpp()};
+  [constants setConstantValue:&values_uint[0] type:MTLDataTypeUInt atIndex:0];
+  [constants setConstantValue:&values_bool[0] type:MTLDataTypeBool atIndex:1];
+  [constants setConstantValue:&values_uint[1] type:MTLDataTypeUInt atIndex:2];
+  [constants setConstantValue:&values_bool[1] type:MTLDataTypeBool atIndex:3];
+  [constants setConstantValue:&values_uint[2] type:MTLDataTypeUInt atIndex:4];
+  [constants setConstantValue:&values_bool[2] type:MTLDataTypeBool atIndex:5];
+  [constants setConstantValue:&values_uint[3] type:MTLDataTypeUInt atIndex:6];
+  [constants setConstantValue:&values_bool[3] type:MTLDataTypeBool atIndex:7];
+  NSError* error = nil;
+  id<MTLFunction> fragment = [transfer_library_
+      newFunctionWithName:dest_key.is_depth ? @"transfer_depth_ps"
+                          : pass_formats    ? @"transfer_color_mrt_ps"
+                                            : @"transfer_color_ps"
+           constantValues:constants
+                    error:&error];
+  id<MTLRenderPipelineState> pipeline = nil;
+  if (fragment) {
+    MTLRenderPipelineDescriptor* descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+    descriptor.label = @"render target transfer";
+    descriptor.vertexFunction = transfer_vs_;
+    descriptor.fragmentFunction = fragment;
+    descriptor.rasterSampleCount = texture.sampleCount;
+    if (pass_formats) {
+      // All the attachments of the guest render pass, writing only to the
+      // destination.
+      for (uint32_t j = 0; j < xenos::kMaxColorRenderTargets; ++j) {
+        descriptor.colorAttachments[j].pixelFormat = pass_formats->color[j];
+        descriptor.colorAttachments[j].writeMask =
+            (!dest_key.is_depth && j == pass_color_index) ? MTLColorWriteMaskAll
+                                                          : MTLColorWriteMaskNone;
+      }
+      descriptor.depthAttachmentPixelFormat = pass_formats->depth;
+      descriptor.stencilAttachmentPixelFormat = pass_formats->depth;
+      descriptor.rasterSampleCount = pass_formats->sample_count;
+    } else if (dest_key.is_depth) {
+      descriptor.depthAttachmentPixelFormat = texture.pixelFormat;
+      descriptor.stencilAttachmentPixelFormat = texture.pixelFormat;
+    } else {
+      descriptor.colorAttachments[0].pixelFormat = texture.pixelFormat;
+    }
+    pipeline = [command_processor_.device() newRenderPipelineStateWithDescriptor:descriptor
+                                                                           error:&error];
+  }
+  if (!pipeline) {
+    REXGPU_ERROR("MetalRenderTargetCache: Failed to create a render target transfer pipeline: {}",
+                 error ? [error.localizedDescription UTF8String] : "unknown error");
+  }
+  transfer_pipelines_.emplace(pipeline_key, pipeline);
+  return pipeline;
+}
+
+void MetalRenderTargetCache::FlushPendingTransfers() {
+  if (!has_pending_transfers_) {
+    return;
+  }
+  has_pending_transfers_ = false;
+  PerformTransfers(1 + xenos::kMaxColorRenderTargets, pending_transfer_render_targets_,
+                   pending_transfers_);
+  for (auto& transfers : pending_transfers_) {
+    transfers.clear();
+  }
+}
+
+void MetalRenderTargetCache::PerformPendingTransfersInRenderPass(
+    id<MTLRenderCommandEncoder> encoder) {
+  if (!has_pending_transfers_) {
+    return;
+  }
+  has_pending_transfers_ = false;
+  if (!transfer_no_depth_stencil_state_) {
+    MTLDepthStencilDescriptor* descriptor = [[MTLDepthStencilDescriptor alloc] init];
+    descriptor.depthCompareFunction = MTLCompareFunctionAlways;
+    descriptor.depthWriteEnabled = NO;
+    transfer_no_depth_stencil_state_ =
+        [command_processor_.device() newDepthStencilStateWithDescriptor:descriptor];
+  }
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    RenderTarget* dest_rt = pending_transfer_render_targets_[i];
+    std::vector<Transfer>& transfers = pending_transfers_[i];
+    if (!dest_rt || transfers.empty()) {
+      transfers.clear();
+      continue;
+    }
+    auto& dest = *static_cast<MetalRenderTarget*>(dest_rt);
+    RenderTargetKey dest_key = dest.key();
+    id<MTLTexture> texture = dest.texture();
+    [encoder setDepthStencilState:dest_key.is_depth ? transfer_depth_stencil_state_
+                                                    : transfer_no_depth_stencil_state_];
+    for (const Transfer& transfer : transfers) {
+      if (!transfer.source || transfer.source == dest_rt) {
+        continue;
+      }
+      auto& source = *static_cast<MetalRenderTarget*>(transfer.source);
+      RenderTargetKey source_key = source.key();
+      Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithCutout];
+      uint32_t rectangle_count =
+          transfer.GetRectangles(dest_key.base_tiles, dest_key.GetPitchTiles(),
+                                 dest_key.msaa_samples, dest_key.Is64bpp(), rectangles);
+      if (!rectangle_count) {
+        continue;
+      }
+      id<MTLRenderPipelineState> pipeline = GetTransferPipeline(
+          source_key, dest_key, texture, &last_update_formats_, i ? i - 1 : 0);
+      if (!pipeline) {
+        continue;
+      }
+      ++transfer_count_;
+      [encoder setRenderPipelineState:pipeline];
+      [encoder setFragmentTexture:source.texture() atIndex:30];
+      if (source_key.is_depth) {
+        [encoder setFragmentTexture:source.stencil_view() atIndex:31];
+      }
+      uint32_t params[4] = {dest_key.base_tiles, dest_key.GetPitchTiles(), source_key.base_tiles,
+                            std::max(source_key.GetPitchTiles(), uint32_t(1))};
+      [encoder setFragmentBytes:params length:sizeof(params) atIndex:30];
+      MTLViewport viewport = {0.0, 0.0, double(last_update_width_), double(last_update_height_),
+                              0.0, 1.0};
+      [encoder setViewport:viewport];
+      [encoder setCullMode:MTLCullModeNone];
+      [encoder setTriangleFillMode:MTLTriangleFillModeFill];
+      [encoder setDepthBias:0.0f slopeScale:0.0f clamp:0.0f];
+      for (uint32_t j = 0; j < rectangle_count; ++j) {
+        const Transfer::Rectangle& rectangle = rectangles[j];
+        // Within the pass render area (the smallest attachment).
+        NSUInteger area_width = std::min(NSUInteger(last_update_width_), texture.width);
+        NSUInteger area_height = std::min(NSUInteger(last_update_height_), texture.height);
+        MTLScissorRect scissor;
+        scissor.x = std::min(NSUInteger(rectangle.x_pixels), area_width);
+        scissor.y = std::min(NSUInteger(rectangle.y_pixels), area_height);
+        scissor.width = std::min(NSUInteger(rectangle.width_pixels), area_width - scissor.x);
+        scissor.height = std::min(NSUInteger(rectangle.height_pixels), area_height - scissor.y);
+        if (!scissor.width || !scissor.height) {
+          continue;
+        }
+        [encoder setScissorRect:scissor];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+      }
+    }
+    transfers.clear();
   }
 }
 
@@ -436,6 +1035,8 @@ bool MetalRenderTargetCache::Resolve(const memory::Memory& memory,
   written_address_out = 0;
   written_length_out = 0;
 
+  FlushPendingTransfers();
+
   draw_util::ResolveInfo resolve_info;
   if (!draw_util::GetResolveInfo(register_file(), memory, draw_resolution_scale_x(),
                                  draw_resolution_scale_y(), IsFixedRG16TruncatedToMinus1To1(),
@@ -497,7 +1098,8 @@ bool MetalRenderTargetCache::Resolve(const memory::Memory& memory,
     if (PrepareHostRenderTargetsResolveClear(resolve_info, clear_rectangle, clear_render_targets[0],
                                              clear_transfers_[0], clear_render_targets[1],
                                              clear_transfers_[1])) {
-      PerformTransfers(2, clear_render_targets, clear_transfers_);
+      // The cleared rectangle doesn't need the old data.
+      PerformTransfers(2, clear_render_targets, clear_transfers_, &clear_rectangle);
       if (clear_render_targets[0]) {
         ClearRenderTarget(clear_render_targets[0], resolve_info.rb_depth_clear, clear_rectangle);
       }

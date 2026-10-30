@@ -362,6 +362,10 @@ void MetalCommandProcessor::UpdateCompletedFrame() {
 }
 
 void MetalCommandProcessor::EndSubmission(bool is_swap) {
+  if (render_target_cache_ && render_target_cache_->has_pending_transfers()) {
+    GetCommandBuffer();
+    render_target_cache_->FlushPendingTransfers();
+  }
   if (command_buffer_) {
     EndEncoding();
     [command_buffer_ commit];
@@ -684,6 +688,11 @@ bool MetalCommandProcessor::IssueDrawImpl() {
   id<MTLRenderCommandEncoder> encoder = GetRenderEncoderForCurrentRenderTargets();
   if (!encoder) {
     return draw_fail("encoder");
+  }
+  if (render_target_cache_->has_pending_transfers()) {
+    render_target_cache_->PerformPendingTransfersInRenderPass(encoder);
+    encoder_pipeline_ = nil;
+    encoder_depth_stencil_state_ = nil;
   }
   if (encoder_pipeline_ != pipeline) {
     [encoder setRenderPipelineState:pipeline];
@@ -1086,9 +1095,9 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     if (now - stats_.last_log >= std::chrono::seconds(5)) {
       REXGPU_INFO(
           "Metal stats: {} swaps, {} draws requested, {} encoded, {} failed, {} resolves "
-          "({} written)",
+          "({} written), {} transfers in total",
           stats_.swaps, stats_.draws_requested, stats_.draws_encoded, stats_.draws_failed,
-          stats_.resolves, stats_.resolves_written);
+          stats_.resolves, stats_.resolves_written, render_target_cache_->transfer_count());
       Stats empty;
       empty.last_log = now;
       stats_ = empty;

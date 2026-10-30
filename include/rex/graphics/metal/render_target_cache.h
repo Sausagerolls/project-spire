@@ -78,6 +78,12 @@ class MetalRenderTargetCache final : public RenderTargetCache {
               uint32_t normalized_color_mask, const Shader& vertex_shader) override;
 
   const RenderPassAttachments& last_update_attachments() const { return last_update_attachments_; }
+
+  // Ownership transfers of the last update: performed in the guest render pass
+  // of the draw if possible, or in their own render passes otherwise.
+  bool has_pending_transfers() const { return has_pending_transfers_; }
+  void PerformPendingTransfersInRenderPass(id<MTLRenderCommandEncoder> encoder);
+  void FlushPendingTransfers();
   const RenderPassFormats& last_update_formats() const { return last_update_formats_; }
   uint32_t last_update_width() const { return last_update_width_; }
   uint32_t last_update_height() const { return last_update_height_; }
@@ -96,6 +102,9 @@ class MetalRenderTargetCache final : public RenderTargetCache {
   bool gamma_render_target_as_unorm16() const { return false; }
   bool depth_float24_round() const { return false; }
   bool depth_float24_convert_in_pixel_shader() const { return false; }
+
+  // For statistics.
+  uint64_t transfer_count() const { return transfer_count_; }
 
  protected:
   uint32_t GetMaxRenderTargetWidth() const override { return 16384; }
@@ -186,7 +195,14 @@ class MetalRenderTargetCache final : public RenderTargetCache {
   bool DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,
                          uint32_t dump_pitch);
   void PerformTransfers(uint32_t render_target_count, RenderTarget* const* render_targets,
-                        const std::vector<Transfer>* render_target_transfers);
+                        const std::vector<Transfer>* render_target_transfers,
+                        const Transfer::Rectangle* cutout = nullptr);
+  // pass_formats: for a transfer inside a guest render pass with these
+  // attachments (writing to color pass_color_index or to depth).
+  id<MTLRenderPipelineState> GetTransferPipeline(RenderTargetKey source_key,
+                                                 RenderTargetKey dest_key, id<MTLTexture> texture,
+                                                 const RenderPassFormats* pass_formats = nullptr,
+                                                 uint32_t pass_color_index = 0);
   // Clears a rectangle of a render target to a guest clear value.
   void ClearRenderTarget(RenderTarget* render_target, uint64_t clear_value,
                          const Transfer::Rectangle& rectangle);
@@ -210,6 +226,19 @@ class MetalRenderTargetCache final : public RenderTargetCache {
   std::unordered_map<uint32_t, id<MTLRenderPipelineState>> clear_pipelines_;
   id<MTLDepthStencilState> clear_depth_stencil_state_ = nil;
   std::vector<Transfer> clear_transfers_[2];
+
+  // EDRAM ownership transfers between render targets.
+  id<MTLLibrary> transfer_library_ = nil;
+  id<MTLFunction> transfer_vs_ = nil;
+  std::unordered_map<uint64_t, id<MTLRenderPipelineState>> transfer_pipelines_;
+  id<MTLDepthStencilState> transfer_no_depth_stencil_state_ = nil;
+  // Transfers of the last update, deferred to the guest render pass.
+  bool has_pending_transfers_ = false;
+  RenderTarget* pending_transfer_render_targets_[1 + xenos::kMaxColorRenderTargets] = {};
+  std::vector<Transfer> pending_transfers_[1 + xenos::kMaxColorRenderTargets];
+  id<MTLDepthStencilState> transfer_depth_stencil_state_ = nil;
+
+  uint64_t transfer_count_ = 0;
 
   RenderPassAttachments last_update_attachments_;
   RenderPassFormats last_update_formats_;
