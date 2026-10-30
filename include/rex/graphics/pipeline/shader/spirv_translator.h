@@ -33,7 +33,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
     // prototyping stage (easier to do small granular updates with an
     // incremental counter).
-    static constexpr uint32_t kVersion = 13;
+    static constexpr uint32_t kVersion = 14;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -76,6 +76,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
       // patch instead of using host tessellation (see
       // VulkanPipelineCache::GetTessellationGridFactor).
       uint32_t tessellation_grid : 1;
+      // All textures fetched by the shader are unsigned for all components
+      // (no signed, biased or gamma components), so the per-draw signedness
+      // handling can be omitted (see vulkan_specialize_texture_signs).
+      uint32_t textures_unsigned : 1;
     } vertex;
     struct PixelShaderModification {
       // uint32_t 0.
@@ -94,6 +98,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
       uint32_t param_gen_point : 1;
       // For host render targets - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 3;
+      // Like vertex.textures_unsigned.
+      uint32_t textures_unsigned : 1;
     } pixel;
     uint64_t value = 0;
 
@@ -676,6 +682,14 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // Bits of `value` not in `replace_mask` will be ignored.
   void StoreUint32ToSharedMemory(spv::Id value, spv::Id address_dwords_int,
                                  spv::Id replace_mask = spv::NoResult);
+
+  // Whether the texture signedness of all fetches is known to be unsigned
+  // (Modification textures_unsigned).
+  bool AreTexturesKnownUnsigned() const {
+    Modification shader_modification = GetSpirvShaderModification();
+    return is_pixel_shader() ? bool(shader_modification.pixel.textures_unsigned)
+                             : bool(shader_modification.vertex.textures_unsigned);
+  }
 
   bool IsMemoryExportSupported() const {
     if (is_pixel_shader()) {

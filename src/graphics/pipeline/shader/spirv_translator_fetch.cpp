@@ -1295,10 +1295,16 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
       // All 32 bits containing the values for 4 fetch constants (use
       // OpBitFieldUExtract to get the signednesses for the specific components
       // of this texture).
-      spv::Id swizzled_signs_word = builder_->createLoad(
-          builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
-                                      id_vector_temp_),
-          spv::NoPrecision);
+      // With the signedness known to be unsigned for all components, use a
+      // constant, so the host compiler drops the signed, biased and gamma
+      // paths.
+      spv::Id swizzled_signs_word =
+          AreTexturesKnownUnsigned()
+              ? const_uint_0_
+              : builder_->createLoad(
+                    builder_->createAccessChain(spv::StorageClassUniform,
+                                                uniform_system_constants_, id_vector_temp_),
+                    spv::NoPrecision);
       uint32_t swizzled_signs_word_offset = 8 * (fetch_constant_index & 3);
 
       spv::Builder::TextureParameters texture_parameters = {};

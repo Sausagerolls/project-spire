@@ -34,6 +34,7 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline_util.h>
+#include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/pipeline/shader/spirv_builder.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/register_file.h>
@@ -72,6 +73,11 @@ REXCVAR_DEFINE_BOOL(vulkan_tessellation_grid_adaptive, REX_VULKAN_TESSELLATION_G
                     "instead of its per-edge factors. Finer than the guest asks for, but crack-free "
                     "(shared edges get the same factor), and it avoids MoltenVK restarting the "
                     "render pass for the compute stages of every tessellated draw.");
+REXCVAR_DEFINE_BOOL(vulkan_specialize_texture_signs, REX_VULKAN_TESSELLATION_GRID_DEFAULT,
+                    "GPU/Vulkan",
+                    "Translate a separate variant of shaders whose textures are all unsigned for "
+                    "the current draw, without the per-draw handling of signed, biased and gamma "
+                    "texture components (smaller, faster host shaders).");
 REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
                     "Render tessellation as wireframe")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -954,6 +960,23 @@ uint32_t VulkanPipelineCache::GetTessellationGridFactor(
   return factor_integer;
 }
 
+namespace {
+// Whether all textures fetched by the shader are unsigned for all components
+// with the current fetch constants (Modification textures_unsigned).
+bool AreShaderTexturesUnsigned(const Shader& shader, const RegisterFile& regs) {
+  if (!REXCVAR_GET(vulkan_specialize_texture_signs)) {
+    return false;
+  }
+  for (const Shader::TextureBinding& binding : shader.texture_bindings()) {
+    if (texture_util::SwizzleSigns(regs.GetTextureFetch(binding.fetch_constant)) !=
+        uint8_t(xenos::TextureSign::kUnsigned) * 0b01010101) {
+      return false;
+    }
+  }
+  return true;
+}
+}  // namespace
+
 SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentVertexShaderModification(
     const Shader& shader, Shader::HostVertexShaderType host_vertex_shader_type,
     uint32_t interpolator_mask, bool ps_param_gen_used) const {
@@ -1007,6 +1030,7 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentVertexShaderM
   modification.vertex.vertex_kill_and = uint32_t(
       device_properties.shaderCullDistance &&
       (shader.writes_point_size_edge_flag_kill_vertex() & 0b100) && !pa_cl_clip_cntl.vtx_kill_or);
+  modification.vertex.textures_unsigned = uint32_t(AreShaderTexturesUnsigned(shader, regs));
 
   return modification;
 }
@@ -1059,6 +1083,8 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
       }
     }
   }
+
+  modification.pixel.textures_unsigned = uint32_t(AreShaderTexturesUnsigned(shader, regs));
 
   return modification;
 }
