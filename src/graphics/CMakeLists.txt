@@ -58,7 +58,12 @@ set(REXGPU_XENOS_VULKAN_SOURCES
 set(REXGPU_XENOS_METAL_SOURCES
     metal/command_processor.mm
     metal/graphics_system.mm
+    metal/pipeline_cache.mm
+    metal/primitive_processor.mm
+    metal/render_target_cache.mm
     metal/shader.mm
+    metal/shared_memory.mm
+    metal/texture_cache.mm
 )
 
 # D3D12 backend

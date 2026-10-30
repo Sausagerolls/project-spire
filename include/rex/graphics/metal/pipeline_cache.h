@@ -1,0 +1,85 @@
+#pragma once
+/**
+ * @file        graphics/metal/pipeline_cache.h
+ * @brief       Shader translation and pipeline states for the Metal backend
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ */
+
+// Objective-C++ only.
+
+#include <cstdint>
+#include <memory>
+#include <unordered_map>
+
+#import <Metal/Metal.h>
+
+#include <rex/graphics/metal/render_target_cache.h>
+#include <rex/graphics/metal/shader.h>
+#include <rex/graphics/pipeline/shader/spirv_translator.h>
+#include <rex/graphics/primitive_processor.h>
+#include <rex/graphics/register_file.h>
+#include <rex/graphics/registers.h>
+#include <rex/string/buffer.h>
+
+namespace rex::graphics::metal {
+
+class MetalCommandProcessor;
+
+class MetalPipelineCache {
+ public:
+  MetalPipelineCache(MetalCommandProcessor& command_processor, const RegisterFile& register_file,
+                     MetalRenderTargetCache& render_target_cache);
+  ~MetalPipelineCache();
+
+  bool Initialize();
+  void Shutdown();
+
+  MetalShader* LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
+                          uint32_t dword_count);
+  void AnalyzeShaderUcode(Shader& shader);
+
+  SpirvShaderTranslator::Modification GetCurrentVertexShaderModification(
+      const Shader& shader, Shader::HostVertexShaderType host_vertex_shader_type,
+      uint32_t interpolator_mask, bool ps_param_gen_used) const;
+  SpirvShaderTranslator::Modification GetCurrentPixelShaderModification(
+      const Shader& shader, uint32_t interpolator_mask, uint32_t param_gen_pos,
+      reg::RB_DEPTHCONTROL normalized_depth_control) const;
+
+  // Translates (if needed) and compiles the shaders. Returns false if a shader
+  // can't be used.
+  bool EnsureShadersTranslated(MetalShader::MetalTranslation* vertex_shader,
+                               MetalShader::MetalTranslation* pixel_shader);
+
+  // The pipeline state for the current registers and render target formats,
+  // nil if it can't be created.
+  id<MTLRenderPipelineState> GetPipeline(
+      MetalShader::MetalTranslation* vertex_shader, MetalShader::MetalTranslation* pixel_shader,
+      const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+      uint32_t normalized_color_mask, const MetalRenderTargetCache::RenderPassFormats& formats);
+  id<MTLDepthStencilState> GetDepthStencilState(reg::RB_DEPTHCONTROL normalized_depth_control,
+                                                bool depth_attachment_bound,
+                                                bool primitive_polygonal);
+
+  // Like VulkanPipelineCache::GetTessellationGridFactor: the integer factor
+  // for drawing quad patches as a triangle grid in the vertex shader, or 0 if
+  // the draw can't be drawn that way (Metal has no tessellation stages usable
+  // by the translated shaders).
+  static uint32_t GetTessellationGridFactor(const RegisterFile& regs,
+                                            Shader::HostVertexShaderType host_vertex_shader_type);
+
+ private:
+  MetalCommandProcessor& command_processor_;
+  const RegisterFile& register_file_;
+  MetalRenderTargetCache& render_target_cache_;
+
+  std::unique_ptr<SpirvShaderTranslator> shader_translator_;
+  string::StringBuffer ucode_disasm_buffer_;
+
+  std::unordered_map<uint64_t, std::unique_ptr<MetalShader>> shaders_;
+  std::unordered_map<uint64_t, id<MTLRenderPipelineState>> pipelines_;
+  std::unordered_map<uint64_t, id<MTLDepthStencilState>> depth_stencil_states_;
+};
+
+}  // namespace rex::graphics::metal

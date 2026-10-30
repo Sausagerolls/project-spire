@@ -9,15 +9,25 @@
 
 // Objective-C++ only.
 
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <deque>
 #include <memory>
-#include <unordered_map>
+#include <vector>
 
 #import <Metal/Metal.h>
 
 #include <rex/graphics/command_processor.h>
+#include <rex/graphics/metal/pipeline_cache.h>
+#include <rex/graphics/metal/primitive_processor.h>
+#include <rex/graphics/metal/render_target_cache.h>
+#include <rex/graphics/metal/shader.h>
+#include <rex/graphics/metal/shared_memory.h>
+#include <rex/graphics/metal/texture_cache.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
-#include <rex/string/buffer.h>
+#include <rex/graphics/util/draw.h>
 
 namespace rex::ui::metal {
 class MetalProvider;
@@ -32,14 +42,58 @@ class MetalCommandProcessor : public CommandProcessor {
   MetalCommandProcessor(MetalGraphicsSystem* graphics_system, system::KernelState* kernel_state);
   ~MetalCommandProcessor() override;
 
+  void ClearCaches() override;
+
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                  uint32_t frontbuffer_height) override;
 
   const ui::metal::MetalProvider& GetMetalProvider() const;
+  id<MTLDevice> device() const { return device_; }
+
+  // Submissions are command buffers, frames are guest frames (between swaps).
+  uint64_t GetCurrentSubmission() const { return submission_current_; }
+  uint64_t GetCompletedSubmission() const {
+    return submission_completed_.load(std::memory_order_acquire);
+  }
+  uint64_t GetCurrentFrame() const { return frame_current_; }
+  uint64_t GetCompletedFrame() const { return frame_completed_; }
+  // Ends the current submission and waits until all GPU work has completed.
+  void AwaitAllSubmissionsCompletion();
+
+  // The command buffer of the current submission (begins it if needed).
+  id<MTLCommandBuffer> GetCommandBuffer();
+  // Ends the current render, compute or blit encoder.
+  void EndEncoding();
+  // Return the compute or blit encoder, ending any other encoder.
+  id<MTLComputeCommandEncoder> GetComputeEncoder();
+  id<MTLBlitCommandEncoder> GetBlitEncoder();
+  // The render encoder for the render targets from the last render target
+  // cache update, beginning a new render pass if needed.
+  id<MTLRenderCommandEncoder> GetRenderEncoderForCurrentRenderTargets();
+  // Begins a render pass with the given descriptor for utility drawing (the
+  // caller ends it implicitly via EndEncoding).
+  id<MTLRenderCommandEncoder> BeginUtilityRenderPass(MTLRenderPassDescriptor* descriptor);
+
+  // Per-frame transient GPU memory (constants and other small data), valid
+  // until the frame completes on the GPU.
+  bool RequestTransientBuffer(size_t size, size_t alignment, __strong id<MTLBuffer>& buffer_out,
+                              NSUInteger& offset_out, void*& mapping_out);
+
+  // Converts a SPIR-V utility shader to MSL and compiles it.
+  id<MTLFunction> CompileUtilitySpirv(const uint32_t* spirv, size_t spirv_word_count,
+                                      const char* debug_name);
 
  protected:
   bool SetupContext() override;
   void ShutdownContext() override;
+
+  void WriteRegister(uint32_t index, uint32_t value) override;
+  void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
+
+  void OnGammaRamp256EntryTableValueWritten() override;
+  void OnGammaRampPWLValueWritten() override;
+
+  void OnPrimaryBufferEnd() override;
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
@@ -48,15 +102,101 @@ class MetalCommandProcessor : public CommandProcessor {
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
 
- private:
-  // Temporary (until the pipeline cache exists): translates and compiles the
-  // active shaders of each draw to verify the SPIR-V to MSL path.
-  void TestTranslateShader(Shader* shader, bool is_vertex);
+  void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
+                               bool blocking) override;
 
-  std::unordered_map<uint64_t, std::unique_ptr<Shader>> shaders_;
-  std::unique_ptr<SpirvShaderTranslator> shader_translator_;
-  string::StringBuffer ucode_disasm_buffer_;
-  uint32_t test_translated_ = 0, test_failed_ = 0;
+ private:
+  bool IssueDrawImpl();
+  void BeginFrameIfNeeded();
+  // Commits the current command buffer if there is one, and if is_swap, ends
+  // the guest frame.
+  void EndSubmission(bool is_swap);
+  void UpdateCompletedFrame();
+
+  void UpdateSystemConstantValues(
+      bool primitive_polygonal,
+      const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+      const draw_util::ViewportInfo& viewport_info, uint32_t used_texture_mask,
+      reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask);
+  bool UpdateConstantBuffers(const MetalShader* vertex_shader, const MetalShader* pixel_shader);
+  void BindDrawResources(id<MTLRenderCommandEncoder> encoder, const MetalShader* vertex_shader,
+                         const MetalShader* pixel_shader);
+  // Returns false if nothing will be drawn (empty scissor or all culled).
+  bool UpdateDynamicState(id<MTLRenderCommandEncoder> encoder,
+                          const draw_util::ViewportInfo& viewport_info, bool primitive_polygonal,
+                          reg::RB_DEPTHCONTROL normalized_depth_control);
+
+  id<MTLDevice> device_ = nil;
+  id<MTLCommandQueue> queue_ = nil;
+
+  std::unique_ptr<MetalSharedMemory> shared_memory_;
+  std::unique_ptr<MetalPrimitiveProcessor> primitive_processor_;
+  std::unique_ptr<MetalRenderTargetCache> render_target_cache_;
+  std::unique_ptr<MetalPipelineCache> pipeline_cache_;
+  std::unique_ptr<MetalTextureCache> texture_cache_;
+
+  id<MTLComputePipelineState> swap_pipeline_ = nil;
+
+  // Submissions.
+  id<MTLCommandBuffer> command_buffer_ = nil;
+  uint64_t submission_current_ = 1;
+  std::atomic<uint64_t> submission_completed_{0};
+  // Frames.
+  static constexpr uint32_t kMaxFramesInFlight = 2;
+  bool frame_open_ = false;
+  uint64_t frame_current_ = 1;
+  uint64_t frame_completed_ = 0;
+  uint64_t closed_frame_submissions_[kMaxFramesInFlight] = {};
+
+  // Encoders (one at a time).
+  id<MTLRenderCommandEncoder> render_encoder_ = nil;
+  id<MTLComputeCommandEncoder> compute_encoder_ = nil;
+  id<MTLBlitCommandEncoder> blit_encoder_ = nil;
+  MetalRenderTargetCache::RenderPassAttachments render_encoder_attachments_;
+  // The render encoder is for utility drawing, not the guest render targets.
+  bool render_encoder_is_utility_ = false;
+  // State bound to the current render encoder.
+  id<MTLRenderPipelineState> encoder_pipeline_ = nil;
+  id<MTLDepthStencilState> encoder_depth_stencil_state_ = nil;
+  id<MTLRenderCommandEncoder> encoder_shared_memory_bound_ = nil;
+
+  // Transient memory: pages of shared buffers, reused when their frame has
+  // completed.
+  static constexpr size_t kTransientPageSize = 4 * 1024 * 1024;
+  struct TransientPage {
+    id<MTLBuffer> buffer;
+    uint64_t last_frame;
+  };
+  std::deque<TransientPage> transient_pages_free_;
+  std::deque<TransientPage> transient_pages_used_;
+  id<MTLBuffer> transient_page_current_ = nil;
+  size_t transient_page_current_used_ = kTransientPageSize;
+
+  // Per-draw state.
+  SpirvShaderTranslator::SystemConstants system_constants_;
+  uint64_t current_float_constant_map_vertex_[4] = {};
+  uint64_t current_float_constant_map_pixel_[4] = {};
+  // Bits of SpirvShaderTranslator::ConstantBuffer.
+  uint32_t current_constant_buffers_up_to_date_ = 0;
+  uint32_t constant_buffers_to_bind_ = 0;
+  struct ConstantBufferBinding {
+    id<MTLBuffer> buffer = nil;
+    NSUInteger offset = 0;
+  };
+  std::array<ConstantBufferBinding, SpirvShaderTranslator::kConstantBufferCount>
+      current_constant_buffers_;
+  std::vector<draw_util::MemExportRange> memexport_ranges_;
+
+  struct Stats {
+    uint64_t swaps = 0;
+    uint64_t draws_requested = 0;
+    uint64_t draws_encoded = 0;
+    uint64_t draws_failed = 0;
+    uint64_t resolves = 0;
+    uint64_t resolves_written = 0;
+    std::chrono::steady_clock::time_point last_log{};
+  };
+  Stats stats_;
 };
 
 }  // namespace rex::graphics::metal
