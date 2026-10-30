@@ -49,6 +49,13 @@ set(REXUI_VULKAN_SOURCES
     vulkan/vulkan_util.cpp
 )
 
+# Metal UI backend (Objective-C++)
+set(REXUI_METAL_SOURCES
+    metal/metal_immediate_drawer.mm
+    metal/metal_presenter.mm
+    metal/metal_provider.mm
+)
+
 # D3D12 UI backend
 if(REXGLUE_USE_D3D12)
     set(REXUI_D3D12_SOURCES
@@ -91,6 +98,13 @@ endif()
 
 if(REXGLUE_USE_D3D12)
     list(APPEND REXUI_SOURCES ${REXUI_D3D12_SOURCES})
+endif()
+
+if(REXGLUE_USE_METAL)
+    list(APPEND REXUI_SOURCES ${REXUI_METAL_SOURCES})
+    set_source_files_properties(${REXUI_METAL_SOURCES} PROPERTIES
+        COMPILE_OPTIONS "-fobjc-arc"
+        SKIP_PRECOMPILE_HEADERS ON)
 endif()
 
 add_library(rexui OBJECT ${REXUI_SOURCES})

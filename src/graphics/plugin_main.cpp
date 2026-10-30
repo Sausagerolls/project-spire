@@ -20,6 +20,9 @@
 #if REX_HAS_VULKAN
 #include <rex/graphics/vulkan/graphics_system.h>
 #endif
+#if REX_HAS_METAL
+#include <rex/graphics/metal/graphics_system.h>
+#endif
 
 extern "C" REX_GPU_PLUGIN_EXPORT uint32_t rex_gpu_abi_version(void) {
   return rex::system::kGpuPluginAbiVersion;
@@ -38,6 +41,12 @@ extern "C" REX_GPU_PLUGIN_EXPORT rex::system::IGraphicsSystem* rex_gpu_create(
   }
 
   std::string_view backend = info->backend ? info->backend : "any";
+#if REX_HAS_METAL
+  // Experimental - only when requested explicitly.
+  if (backend == "metal") {
+    return new rex::graphics::metal::MetalGraphicsSystem();
+  }
+#endif
 #if REX_HAS_D3D12
   if (backend == "any" || backend == "d3d12") {
     return new rex::graphics::d3d12::D3D12GraphicsSystem();

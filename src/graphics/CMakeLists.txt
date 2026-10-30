@@ -54,6 +54,12 @@ set(REXGPU_XENOS_VULKAN_SOURCES
     vulkan/texture_cache.cpp
 )
 
+# Metal backend (Objective-C++)
+set(REXGPU_XENOS_METAL_SOURCES
+    metal/command_processor.mm
+    metal/graphics_system.mm
+)
+
 # D3D12 backend
 if(REXGLUE_USE_D3D12)
     # DXBC third-party dependency
@@ -87,6 +93,13 @@ endif()
 
 if(REXGLUE_USE_VULKAN)
     list(APPEND REXGPU_XENOS_SOURCES ${REXGPU_XENOS_SPIRV_SOURCES} ${REXGPU_XENOS_VULKAN_SOURCES})
+endif()
+
+if(REXGLUE_USE_METAL)
+    list(APPEND REXGPU_XENOS_SOURCES ${REXGPU_XENOS_METAL_SOURCES})
+    set_source_files_properties(${REXGPU_XENOS_METAL_SOURCES} PROPERTIES
+        COMPILE_OPTIONS "-fobjc-arc"
+        SKIP_PRECOMPILE_HEADERS ON)
 endif()
 
 if(REXGLUE_USE_D3D12)
@@ -148,6 +161,14 @@ if(REXGLUE_USE_VULKAN)
         GenericCodeGen
         OSDependent
         OGLCompiler
+    )
+endif()
+
+if(REXGLUE_USE_METAL)
+    target_link_libraries(rexgpu-xenos PRIVATE
+        "-framework Metal"
+        "-framework QuartzCore"
+        "-framework Foundation"
     )
 endif()
 

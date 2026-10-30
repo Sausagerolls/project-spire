@@ -123,3 +123,11 @@ if(REXGLUE_USE_VULKAN)
     )
     target_compile_definitions(rexruntime PUBLIC REX_HAS_VULKAN=1)
 endif()
+if(REXGLUE_USE_METAL)
+    target_link_libraries(rexruntime PUBLIC
+        "-framework Metal"
+        "-framework QuartzCore"
+        "-framework Foundation"
+    )
+    target_compile_definitions(rexruntime PUBLIC REX_HAS_METAL=1)
+endif()
