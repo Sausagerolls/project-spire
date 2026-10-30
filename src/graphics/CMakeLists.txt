@@ -58,6 +58,7 @@ set(REXGPU_XENOS_VULKAN_SOURCES
 set(REXGPU_XENOS_METAL_SOURCES
     metal/command_processor.mm
     metal/graphics_system.mm
+    metal/shader.mm
 )
 
 # D3D12 backend
@@ -96,7 +97,7 @@ if(REXGLUE_USE_VULKAN)
 endif()
 
 if(REXGLUE_USE_METAL)
-    list(APPEND REXGPU_XENOS_SOURCES ${REXGPU_XENOS_METAL_SOURCES})
+    list(APPEND REXGPU_XENOS_SOURCES ${REXGPU_XENOS_METAL_SOURCES} metal/msl_util.cpp)
     set_source_files_properties(${REXGPU_XENOS_METAL_SOURCES} PROPERTIES
         COMPILE_OPTIONS "-fobjc-arc"
         SKIP_PRECOMPILE_HEADERS ON)
@@ -166,6 +167,7 @@ endif()
 
 if(REXGLUE_USE_METAL)
     target_link_libraries(rexgpu-xenos PRIVATE
+        spirv-cross-msl
         "-framework Metal"
         "-framework QuartzCore"
         "-framework Foundation"

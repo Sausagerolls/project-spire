@@ -57,7 +57,10 @@
 #endif
 #endif
 
-#if REX_PLATFORM_MAC
+// Not in Objective-C++ with ARC (the Metal backend, which only needs the
+// SPIR-V translator's view of Vulkan): the C++ wrappers of the Metal surface
+// structures hold CAMetalLayer pointers, which ARC makes non-trivial.
+#if REX_PLATFORM_MAC && !(defined(__OBJC__) && __has_feature(objc_arc))
 #ifndef VK_USE_PLATFORM_METAL_EXT
 #define VK_USE_PLATFORM_METAL_EXT
 #endif

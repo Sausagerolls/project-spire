@@ -16,6 +16,8 @@
 #import <Metal/Metal.h>
 
 #include <rex/graphics/command_processor.h>
+#include <rex/graphics/pipeline/shader/spirv_translator.h>
+#include <rex/string/buffer.h>
 
 namespace rex::ui::metal {
 class MetalProvider;
@@ -47,7 +49,14 @@ class MetalCommandProcessor : public CommandProcessor {
   bool IssueCopy() override;
 
  private:
+  // Temporary (until the pipeline cache exists): translates and compiles the
+  // active shaders of each draw to verify the SPIR-V to MSL path.
+  void TestTranslateShader(Shader* shader, bool is_vertex);
+
   std::unordered_map<uint64_t, std::unique_ptr<Shader>> shaders_;
+  std::unique_ptr<SpirvShaderTranslator> shader_translator_;
+  string::StringBuffer ucode_disasm_buffer_;
+  uint32_t test_translated_ = 0, test_failed_ = 0;
 };
 
 }  // namespace rex::graphics::metal
