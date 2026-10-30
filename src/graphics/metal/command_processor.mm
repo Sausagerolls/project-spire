@@ -415,6 +415,7 @@ id<MTLComputeCommandEncoder> MetalCommandProcessor::GetComputeEncoder() {
   }
   EndEncoding();
   compute_encoder_ = [GetCommandBuffer() computeCommandEncoder];
+  compute_encoder_.label = @"compute";
   return compute_encoder_;
 }
 
@@ -424,6 +425,7 @@ id<MTLBlitCommandEncoder> MetalCommandProcessor::GetBlitEncoder() {
   }
   EndEncoding();
   blit_encoder_ = [GetCommandBuffer() blitCommandEncoder];
+  blit_encoder_.label = @"blit";
   return blit_encoder_;
 }
 
@@ -466,6 +468,7 @@ id<MTLRenderCommandEncoder> MetalCommandProcessor::GetRenderEncoderForCurrentRen
     pass.defaultRasterSampleCount = render_target_cache_->last_update_formats().sample_count;
   }
   render_encoder_ = [GetCommandBuffer() renderCommandEncoderWithDescriptor:pass];
+  render_encoder_.label = @"guest";
   render_encoder_is_utility_ = false;
   render_encoder_attachments_ = attachments;
   encoder_pipeline_ = nil;

@@ -13,12 +13,15 @@
 
 #include <algorithm>
 #include <cstring>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <SPIRV/GLSL.std.450.h>
 #include <xxhash.h>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/graphics/metal/command_processor.h>
 #include <rex/graphics/metal/msl_util.h>
 #include <rex/graphics/metal/shared_memory.h>
@@ -30,6 +33,15 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+
+REXCVAR_DEFINE_BOOL(metal_render_target_transfers_in_pass, true, "GPU/Metal",
+                    "Perform EDRAM ownership transfers inside the guest render pass of the draw "
+                    "when possible")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(metal_render_target_transfers, true, "GPU/Metal",
+                    "Copy the EDRAM data between render targets aliasing the same EDRAM range "
+                    "(disable only for debugging - causes artefacts)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::metal {
 
@@ -112,6 +124,12 @@ constant uint kSourceFormat [[function_constant(4)]];
 constant bool kSourceIsDepth [[function_constant(5)]];
 constant uint kSourceMsaaLog2 [[function_constant(6)]];
 constant bool kSourceIs64bpp [[function_constant(7)]];
+// Same pitch, base and bits per sample - the EDRAM addresses of the
+// destination samples are the same sample coordinates in the source.
+constant bool kSameLayout [[function_constant(8)]];
+// Same format too - no conversion needed.
+constant bool kSameFormat = kSameLayout && kSourceFormat == kDestFormat &&
+                            kSourceIsDepth == kDestIsDepth;
 constant bool kSourceColor1x = !kSourceIsDepth && kSourceMsaaLog2 == 0u;
 constant bool kSourceColorMs = !kSourceIsDepth && kSourceMsaaLog2 != 0u;
 constant bool kSourceDepth1x = kSourceIsDepth && kSourceMsaaLog2 == 0u;
@@ -307,6 +325,9 @@ uint2 read_source(uint2 samples, thread const Sources& sources) {
 uint2 fetch_edram(uint2 dest_pixel, uint dest_sample, constant Params& params,
                   thread const Sources& sources) {
   uint2 dest_samples = pixel_to_samples(dest_pixel, dest_sample, kDestMsaaLog2);
+  if (kSameLayout) {
+    return read_source(dest_samples, sources);
+  }
   uint dest_tile_width = kDestIs64bpp ? 40u : 80u;
   uint tile_x = dest_samples.x / dest_tile_width;
   uint tile_y = dest_samples.y / 16u;
@@ -355,6 +376,13 @@ fragment float4 transfer_color_ps(
   if (kSourceColorMs) sources.color_ms = color_ms;
   if (kSourceDepth1x) { sources.depth_1x = depth_1x; sources.stencil_1x = stencil_1x; }
   if (kSourceDepthMs) { sources.depth_ms = depth_ms; sources.stencil_ms = stencil_ms; }
+  if (kSameFormat && !kDestIsDepth) {
+    uint2 pixel;
+    uint source_sample;
+    samples_to_pixel(pixel_to_samples(uint2(in.position.xy), sample, kDestMsaaLog2),
+                     kSourceMsaaLog2, pixel, source_sample);
+    return kSourceColorMs ? color_ms.read(pixel, source_sample) : color_1x.read(pixel);
+  }
   return unpack_color(fetch_edram(uint2(in.position.xy), sample, params, sources), kDestFormat);
 }
 // For transfers inside a guest render pass with multiple attachments - the
@@ -378,8 +406,16 @@ fragment ColorOut4 transfer_color_mrt_ps(
   if (kSourceColorMs) sources.color_ms = color_ms;
   if (kSourceDepth1x) { sources.depth_1x = depth_1x; sources.stencil_1x = stencil_1x; }
   if (kSourceDepthMs) { sources.depth_ms = depth_ms; sources.stencil_ms = stencil_ms; }
-  float4 color =
-      unpack_color(fetch_edram(uint2(in.position.xy), sample, params, sources), kDestFormat);
+  float4 color;
+  if (kSameFormat && !kDestIsDepth) {
+    uint2 pixel;
+    uint source_sample;
+    samples_to_pixel(pixel_to_samples(uint2(in.position.xy), sample, kDestMsaaLog2),
+                     kSourceMsaaLog2, pixel, source_sample);
+    color = kSourceColorMs ? color_ms.read(pixel, source_sample) : color_1x.read(pixel);
+  } else {
+    color = unpack_color(fetch_edram(uint2(in.position.xy), sample, params, sources), kDestFormat);
+  }
   ColorOut4 out;
   out.color0 = color;
   out.color1 = color;
@@ -404,8 +440,18 @@ fragment DepthOut transfer_depth_ps(
   if (kSourceColorMs) sources.color_ms = color_ms;
   if (kSourceDepth1x) { sources.depth_1x = depth_1x; sources.stencil_1x = stencil_1x; }
   if (kSourceDepthMs) { sources.depth_ms = depth_ms; sources.stencil_ms = stencil_ms; }
-  uint value = fetch_edram(uint2(in.position.xy), sample, params, sources).x;
   DepthOut out;
+  if (kSameFormat) {
+    uint2 pixel;
+    uint source_sample;
+    samples_to_pixel(pixel_to_samples(uint2(in.position.xy), sample, kDestMsaaLog2),
+                     kSourceMsaaLog2, pixel, source_sample);
+    out.depth = kSourceDepthMs ? depth_ms.read(pixel, source_sample) : depth_1x.read(pixel);
+    out.stencil = kSourceDepthMs ? stencil_ms.read(pixel, source_sample).x
+                                 : stencil_1x.read(pixel).x;
+    return out;
+  }
+  uint value = fetch_edram(uint2(in.position.xy), sample, params, sources).x;
   // 0 - D24S8, 1 - D24FS8 (stored as [0, 0.5) on the host).
   out.depth = kDestFormat == 1u ? f20e4_to_f32(value >> 8u) * 0.5
                                 : float(value >> 8u) / 16777215.0;
@@ -592,8 +638,8 @@ bool MetalRenderTargetCache::Update(bool is_rasterization_done,
       }
     }
   }
-  if (any_transfers) {
-    if (source_bound) {
+  if (any_transfers && REXCVAR_GET(metal_render_target_transfers)) {
+    if (source_bound || !REXCVAR_GET(metal_render_target_transfers_in_pass)) {
       PerformTransfers(1 + xenos::kMaxColorRenderTargets, render_targets, transfers);
     } else {
       for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
@@ -684,6 +730,7 @@ void MetalRenderTargetCache::PerformTransfers(uint32_t render_target_count,
           pass.colorAttachments[0].storeAction = MTLStoreActionStore;
         }
         encoder = command_processor_.BeginUtilityRenderPass(pass);
+        encoder.label = @"transfer";
         if (dest_key.is_depth) {
           [encoder setDepthStencilState:transfer_depth_stencil_state_];
         }
@@ -728,7 +775,10 @@ id<MTLRenderPipelineState> MetalRenderTargetCache::GetTransferPipeline(
   full_key.key = uint32_t(dest_key.resource_format) | (uint32_t(dest_key.is_depth) << 4) |
                  (uint32_t(dest_key.msaa_samples) << 5) |
                  (uint32_t(source_key.resource_format) << 8) |
-                 (uint32_t(source_key.is_depth) << 12) | (uint32_t(source_key.msaa_samples) << 13);
+                 (uint32_t(source_key.is_depth) << 12) | (uint32_t(source_key.msaa_samples) << 13) |
+                 (uint32_t(source_key.base_tiles == dest_key.base_tiles &&
+                           source_key.GetPitchTiles() == dest_key.GetPitchTiles())
+                  << 15);
   if (pass_formats) {
     full_key.pass_color_index = pass_color_index;
     full_key.formats = *pass_formats;
@@ -751,6 +801,11 @@ id<MTLRenderPipelineState> MetalRenderTargetCache::GetTransferPipeline(
   [constants setConstantValue:&values_bool[2] type:MTLDataTypeBool atIndex:5];
   [constants setConstantValue:&values_uint[3] type:MTLDataTypeUInt atIndex:6];
   [constants setConstantValue:&values_bool[3] type:MTLDataTypeBool atIndex:7];
+  bool same_layout = source_key.base_tiles == dest_key.base_tiles &&
+                     source_key.GetPitchTiles() == dest_key.GetPitchTiles() &&
+                     source_key.Is64bpp() == dest_key.Is64bpp() &&
+                     bool(source_key.is_depth) == bool(dest_key.is_depth);
+  [constants setConstantValue:&same_layout type:MTLDataTypeBool atIndex:8];
   NSError* error = nil;
   id<MTLFunction> fragment = [transfer_library_
       newFunctionWithName:dest_key.is_depth ? @"transfer_depth_ps"
@@ -996,6 +1051,7 @@ void MetalRenderTargetCache::ClearRenderTarget(RenderTarget* render_target, uint
   if (!encoder) {
     return;
   }
+  encoder.label = @"clear";
   [encoder setRenderPipelineState:pipeline];
   if (key.is_depth) {
     if (!clear_depth_stencil_state_) {
