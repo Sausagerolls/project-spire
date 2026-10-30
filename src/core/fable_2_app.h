@@ -49,6 +49,7 @@ void start();
 void stop();
 std::int64_t t_ms();
 void record_a_press(std::int64_t ms);
+void set_arena(std::uintptr_t base);
 }
 #endif  // FABLE2_REMOTE_CONTROL
 #include "xex_verify.h"
@@ -396,6 +397,12 @@ class Fable2App : public rex::ReXApp {
     // Lets the direct-mouse-look hook (src/core/fable2_hooks.cpp) translate the
     // camera object's guest address to a host pointer.
     fable2::mouselook::set_memory(runtime()->memory());
+#ifdef FABLE2_REMOTE_CONTROL
+    // The state classifier reads guest memory at the arena base, which is not
+    // fixed on every platform.
+    fable2::stateprobe::set_arena(
+        reinterpret_cast<std::uintptr_t>(runtime()->memory()->virtual_membase()));
+#endif  // FABLE2_REMOTE_CONTROL
   }
 
   // Startup integrity check: this build was recompiled against a specific

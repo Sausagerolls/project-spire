@@ -126,7 +126,8 @@ target_compile_definitions(fable_2 PRIVATE
 # only useful for debugging). Defining FABLE2_REMOTE_CONTROL compiles the pad
 # driver registration + server start/stop into the app; without it (non-Debug)
 # those are #ifdef'd out entirely and no port is ever opened.
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+option(FABLE2_ENABLE_REMOTE_CONTROL "Compile the remote control server into non-Debug builds (local debugging only)" OFF)
+if(CMAKE_BUILD_TYPE STREQUAL "Debug" OR FABLE2_ENABLE_REMOTE_CONTROL)
     target_compile_definitions(fable_2 PRIVATE FABLE2_REMOTE_CONTROL)
 endif()
 
