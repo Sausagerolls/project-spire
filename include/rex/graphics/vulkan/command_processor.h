@@ -539,6 +539,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   // submissions. Values updated in the beginning of a frame.
   uint64_t frame_current_ = 1;
   uint64_t frame_completed_ = 0;
+  // Guest draws requested since startup, for vulkan_log_frame_rate.
+  uint64_t frame_rate_draw_count_ = 0;
   // Submission indices of frames that have already been submitted.
   uint64_t closed_frame_submissions_[kMaxFramesInFlight] = {};
 

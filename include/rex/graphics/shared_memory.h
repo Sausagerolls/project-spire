@@ -79,6 +79,17 @@ class SharedMemory {
   bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
   bool RequestRange(uint32_t start, uint32_t length);
 
+  // Uploads all pages that have been requested before but have been
+  // invalidated since then (by CPU writes or by the per-frame page state
+  // refresh) in one batch, so the draws that need them later don't have to
+  // upload them individually, which, as uploads can't be done inside render
+  // passes, would split the render passes. Does nothing if no pages have been
+  // invalidated since the last call.
+  bool UploadInvalidatedRequestedPages();
+  // Starts a new frame for UploadInvalidatedRequestedPages, which only
+  // considers pages requested in the current and the previous frames.
+  void BeginRequestedPagesFrame();
+
   // Marks the range and, if not exact_range, potentially its surroundings
   // (to up to the first GPU-written page, as an access violation exception
   // count optimization) as modified by the CPU, also invalidating GPU-written
@@ -174,6 +185,13 @@ class SharedMemory {
   std::vector<uint64_t> system_page_flags_valid_;
   // Subset of valid pages containing data written by the GPU.
   std::vector<uint64_t> system_page_flags_valid_and_gpu_written_;
+  // Pages that have been requested for GPU usage in the current and in the
+  // previous frames.
+  std::vector<uint64_t> system_page_flags_requested_;
+  std::vector<uint64_t> system_page_flags_requested_previous_frame_;
+  // Incremented when pages may have become invalid.
+  uint64_t page_invalidation_count_ = 0;
+  uint64_t page_invalidation_count_at_batch_upload_ = 0;
   uint32_t num_system_page_flags_ = 0;
 
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(

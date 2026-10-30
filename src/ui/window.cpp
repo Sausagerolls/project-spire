@@ -35,13 +35,7 @@ REXCVAR_DEFINE_INT32(window_height, 0, "UI/Window",
 // kHotReload (default): Window::SetFullscreen can be applied live, so the
 // change callback registered in ReXApp::SetupPresentation keeps the window
 // in sync whenever this cvar is changed at runtime.
-#if REX_PLATFORM_MAC
-// macOS: fullscreen currently presents a black screen after the window resizes
-// into fullscreen (the drawable is shown magnified), so start windowed.
-REXCVAR_DEFINE_BOOL(fullscreen, false, "UI/Window", "Start the window in fullscreen mode");
-#else
 REXCVAR_DEFINE_BOOL(fullscreen, true, "UI/Window", "Start the window in fullscreen mode");
-#endif
 
 REXCVAR_DEFINE_INT32(monitor, 0, "UI/Window",
                      "Monitor index to display on (0 = default, 1 = primary, 2 = "

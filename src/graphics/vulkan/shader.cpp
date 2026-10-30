@@ -10,13 +10,62 @@
  */
 
 #include <cstdint>
+#include <vector>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
+#include <rex/platform.h>
 #include <rex/graphics/vulkan/shader.h>
 #include <rex/logging.h>
 #include <rex/ui/vulkan/provider.h>
 
+#if REX_PLATFORM_MAC
+#define REX_VULKAN_STRIP_NO_CONTRACTION_DEFAULT true
+#else
+#define REX_VULKAN_STRIP_NO_CONTRACTION_DEFAULT false
+#endif
+REXCVAR_DEFINE_BOOL(vulkan_strip_no_contraction, REX_VULKAN_STRIP_NO_CONTRACTION_DEFAULT,
+                    "GPU/Vulkan",
+                    "Remove NoContraction decorations from translated guest shaders. SPIRV-Cross "
+                    "turns every NoContraction operation into a call to an unoptimized "
+                    "([[clang::optnone]]) helper on Metal, which makes MoltenVK shaders run many "
+                    "times slower.");
+
 namespace rex::graphics::vulkan {
+
+namespace {
+
+// Returns a copy of the SPIR-V module without OpDecorate NoContraction instructions.
+std::vector<uint32_t> StripNoContraction(const uint32_t* code, size_t word_count) {
+  constexpr uint32_t kOpDecorate = 71;
+  constexpr uint32_t kDecorationNoContraction = 42;
+  constexpr size_t kHeaderWordCount = 5;
+  std::vector<uint32_t> result;
+  result.reserve(word_count);
+  if (word_count < kHeaderWordCount) {
+    result.assign(code, code + word_count);
+    return result;
+  }
+  result.assign(code, code + kHeaderWordCount);
+  size_t i = kHeaderWordCount;
+  while (i < word_count) {
+    uint32_t instruction_word_count = code[i] >> 16;
+    if (!instruction_word_count || i + instruction_word_count > word_count) {
+      // Malformed - keep the rest as is.
+      result.insert(result.end(), code + i, code + word_count);
+      break;
+    }
+    bool strip = (code[i] & 0xFFFF) == kOpDecorate && instruction_word_count == 3 &&
+                 code[i + 2] == kDecorationNoContraction;
+    if (!strip) {
+      result.insert(result.end(), code + i, code + i + instruction_word_count);
+    }
+    i += instruction_word_count;
+  }
+  return result;
+}
+
+}  // namespace
 
 VulkanShader::VulkanTranslation::~VulkanTranslation() {
   if (shader_module_) {
@@ -42,6 +91,13 @@ VkShaderModule VulkanShader::VulkanTranslation::GetOrCreateShaderModule() {
   shader_module_create_info.flags = 0;
   shader_module_create_info.codeSize = translated_binary().size();
   shader_module_create_info.pCode = reinterpret_cast<const uint32_t*>(translated_binary().data());
+  std::vector<uint32_t> stripped_code;
+  if (REXCVAR_GET(vulkan_strip_no_contraction)) {
+    stripped_code = StripNoContraction(shader_module_create_info.pCode,
+                                       shader_module_create_info.codeSize / sizeof(uint32_t));
+    shader_module_create_info.codeSize = stripped_code.size() * sizeof(uint32_t);
+    shader_module_create_info.pCode = stripped_code.data();
+  }
   if (vulkan_device->functions().vkCreateShaderModule(vulkan_device->device(),
                                                       &shader_module_create_info, nullptr,
                                                       &shader_module_) != VK_SUCCESS) {

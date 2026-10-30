@@ -41,6 +41,7 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
+#include <rex/platform.h>
 #include <rex/graphics/vulkan/shader.h>
 #include <rex/graphics/xenos.h>
 #include <rex/hash.h>
@@ -55,6 +56,15 @@ REXCVAR_DEFINE_INT32(
     .range(-1, 32)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+#if REX_PLATFORM_MAC
+#define REX_VULKAN_TESSELLATION_GRID_DEFAULT true
+#else
+#define REX_VULKAN_TESSELLATION_GRID_DEFAULT false
+#endif
+REXCVAR_DEFINE_BOOL(vulkan_tessellation_grid, REX_VULKAN_TESSELLATION_GRID_DEFAULT, "GPU/Vulkan",
+                    "Draw quad patch tessellation with a constant integer factor as a triangle "
+                    "grid with the domain shader running as the vertex shader instead of using "
+                    "host tessellation, which MoltenVK emulates slowly.");
 REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
                     "Render tessellation as wireframe")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -91,7 +101,11 @@ constexpr bool IsPatchIndexedHostVertexShaderType(
 
 std::string GetTessellationSystemConstantsBlockGlsl() {
   std::string source;
-  source += "layout(set = 0, binding = 0, std140) uniform XeSystemConstants {\n";
+  // Must match the guest shader pipeline layout: the system constants are in the constants
+  // descriptor set, not in set 0 (which holds the shared memory and EDRAM).
+  source += fmt::format("layout(set = {}, binding = {}, std140) uniform XeSystemConstants {{\n",
+                        uint32_t(SpirvShaderTranslator::kDescriptorSetConstants),
+                        uint32_t(SpirvShaderTranslator::kConstantBufferSystem));
   source += fmt::format("  layout(offset = {}) uint xe_vertex_index_endian;\n",
                         offsetof(SpirvShaderTranslator::SystemConstants, vertex_index_endian));
   source += fmt::format("  layout(offset = {}) int xe_vertex_base_index;\n",
@@ -168,7 +182,9 @@ void main() {
   if (endian == 2u || endian == 3u) {
     value = xe_swap_16_in_32(value);
   }
-  float tessellation_factor = float(value) + 1.0;
+  // The index buffer holds 32-bit floating-point edge factors - reinterpret
+  // the bits, like the Direct3D 12 shader (the factor is not an integer).
+  float tessellation_factor = uintBitsToFloat(value) + 1.0;
   tessellation_factor = max(
       tessellation_factor, xe_system_cbuffer.xe_tessellation_factor_range_min);
   tessellation_factor = min(
@@ -903,6 +919,31 @@ VulkanShader* VulkanPipelineCache::LoadShader(xenos::ShaderType shader_type,
   return shader;
 }
 
+uint32_t VulkanPipelineCache::GetTessellationGridFactor(
+    const RegisterFile& regs, Shader::HostVertexShaderType host_vertex_shader_type) {
+  if (!REXCVAR_GET(vulkan_tessellation_grid) ||
+      host_vertex_shader_type != Shader::HostVertexShaderType::kQuadDomainPatchIndexed) {
+    return 0;
+  }
+  xenos::TessellationMode tessellation_mode = regs.Get<reg::VGT_HOS_CNTL>().tess_mode;
+  if (tessellation_mode == xenos::TessellationMode::kAdaptive) {
+    return 0;
+  }
+  // Same factor as the tessellation control shader uses. The grid is only
+  // equivalent to the host tessellator output for integer factors, and, with
+  // fractional_even spacing in the continuous mode, for even ones.
+  float factor = regs.Get<float>(XE_GPU_REG_VGT_HOS_MAX_TESS_LEVEL) + 1.0f;
+  if (!(factor >= 1.0f && factor <= 64.0f)) {
+    return 0;
+  }
+  uint32_t factor_integer = uint32_t(factor);
+  if (float(factor_integer) != factor ||
+      (tessellation_mode == xenos::TessellationMode::kContinuous && (factor_integer & 1))) {
+    return 0;
+  }
+  return factor_integer;
+}
+
 SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentVertexShaderModification(
     const Shader& shader, Shader::HostVertexShaderType host_vertex_shader_type,
     uint32_t interpolator_mask, bool ps_param_gen_used) const {
@@ -919,6 +960,8 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentVertexShaderM
   modification.vertex.interpolator_mask = interpolator_mask;
   if (Shader::IsHostVertexShaderTypeDomain(host_vertex_shader_type)) {
     modification.vertex.tessellation_mode = uint32_t(regs.Get<reg::VGT_HOS_CNTL>().tess_mode);
+    modification.vertex.tessellation_grid =
+        GetTessellationGridFactor(regs, host_vertex_shader_type) != 0;
   } else {
     modification.vertex.tessellation_mode = 0;
   }
@@ -1397,7 +1440,10 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
   bool tessellated = primitive_processing_result.IsTessellated();
   PipelineGeometryShader geometry_shader = PipelineGeometryShader::kNone;
   PipelinePrimitiveTopology primitive_topology;
-  if (tessellated) {
+  if (tessellated && vertex_shader_modification.vertex.tessellation_grid) {
+    primitive_topology = PipelinePrimitiveTopology::kTriangleList;
+    description_out.tessellation_mode = primitive_processing_result.tessellation_mode;
+  } else if (tessellated) {
     switch (primitive_processing_result.host_primitive_type) {
       case xenos::PrimitiveType::kTriangleList:
       case xenos::PrimitiveType::kQuadList:
@@ -1572,7 +1618,9 @@ bool VulkanPipelineCache::ArePipelineRequirementsMet(const PipelineDescription& 
   VkShaderStageFlags vertex_shader_stage =
       Shader::IsHostVertexShaderTypeDomain(
           SpirvShaderTranslator::Modification(description.vertex_shader_modification)
-              .vertex.host_vertex_shader_type)
+              .vertex.host_vertex_shader_type) &&
+              !SpirvShaderTranslator::Modification(description.vertex_shader_modification)
+                   .vertex.tessellation_grid
           ? VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT
           : VK_SHADER_STAGE_VERTEX_BIT;
   if (!(guest_shader_vertex_stages_ & vertex_shader_stage)) {
@@ -2912,7 +2960,8 @@ bool VulkanPipelineCache::TryGetPipelineCreationArgumentsForDescription(
       description.vertex_shader_modification);
   Shader::HostVertexShaderType host_vertex_shader_type =
       vertex_shader_modification.vertex.host_vertex_shader_type;
-  bool tessellated = Shader::IsHostVertexShaderTypeDomain(host_vertex_shader_type);
+  bool tessellated = Shader::IsHostVertexShaderTypeDomain(host_vertex_shader_type) &&
+                     !vertex_shader_modification.vertex.tessellation_grid;
 
   VulkanShader::VulkanTranslation* pixel_shader = nullptr;
   if (description.pixel_shader_hash && !for_placeholder) {

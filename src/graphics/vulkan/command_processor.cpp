@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <iterator>
@@ -34,6 +35,7 @@
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/vulkan/command_processor.h>
+#include <rex/platform.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
 #include <rex/graphics/vulkan/shader.h>
@@ -47,12 +49,40 @@
 #include <rex/ui/vulkan/util.h>
 
 // Legacy backend compatibility aliases for shared readback controls.
+#if REX_PLATFORM_MAC
+#define REX_VULKAN_SHARED_MEMORY_BATCH_UPLOAD_DEFAULT true
+#else
+#define REX_VULKAN_SHARED_MEMORY_BATCH_UPLOAD_DEFAULT false
+#endif
+REXCVAR_DEFINE_BOOL(vulkan_shared_memory_batch_upload,
+                    REX_VULKAN_SHARED_MEMORY_BATCH_UPLOAD_DEFAULT, "GPU/Vulkan",
+                    "Before beginning a render pass, upload the recently used guest memory pages "
+                    "that have been invalidated, instead of uploading them in the middle of the "
+                    "render pass when a draw needs them (which splits the render pass - costly "
+                    "with tile-based GPUs and MoltenVK).");
 REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                     "Read render-to-texture results on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(vulkan_readback_memexport, false, "GPU/Vulkan",
                     "Read data written by memory export in shaders on the CPU")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+#if REX_PLATFORM_MAC
+#define REX_VULKAN_MEMEXPORT_READBACK_AVOID_STALLS_DEFAULT true
+#else
+#define REX_VULKAN_MEMEXPORT_READBACK_AVOID_STALLS_DEFAULT false
+#endif
+REXCVAR_DEFINE_BOOL(vulkan_memexport_readback_avoid_stalls,
+                    REX_VULKAN_MEMEXPORT_READBACK_AVOID_STALLS_DEFAULT, "GPU/Vulkan",
+                    "With readback_memexport_fast, when the data from the previous export to the "
+                    "same range is not available yet, keep the data read back before (if it was "
+                    "exported again in the current submission) or wait for only the older "
+                    "submission, instead of waiting for all GPU work including the current one.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(vulkan_log_frame_rate, false, "GPU/Vulkan",
+                    "Log the guest frame rate (swaps per second) and draws per frame about every "
+                    "5 seconds")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
@@ -2283,6 +2313,22 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     return;
   }
 
+  if (REXCVAR_GET(vulkan_log_frame_rate)) {
+    static auto rate_start = std::chrono::steady_clock::now();
+    static uint32_t rate_swaps = 0;
+    static uint64_t rate_draws_start = 0;
+    ++rate_swaps;
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - rate_start).count();
+    if (seconds >= 5.0) {
+      REXGPU_INFO("Frame rate: {:.2f} fps, {} draws per frame", rate_swaps / seconds,
+                  (frame_rate_draw_count_ - rate_draws_start) / rate_swaps);
+      rate_start = now;
+      rate_swaps = 0;
+      rate_draws_start = frame_rate_draw_count_;
+    }
+  }
+
   // In case the swap command is the only one in the frame.
   if (!BeginSubmission(true)) {
     REXGPU_ERROR("XELOG_GPU PRESENT: BeginSubmission FAILED");
@@ -3106,6 +3152,14 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     }
   }
 
+  // A different render pass is about to begin - upload the guest memory pages
+  // that will likely be needed by the draws in it before beginning it, so that
+  // individual uploads don't split it.
+  if (REXCVAR_GET(vulkan_shared_memory_batch_upload) && shared_memory_) {
+    shared_memory_->UploadInvalidatedRequestedPages();
+    SubmitBarriers(false);
+  }
+
   if (in_render_pass_) {
     if (use_dynamic_rendering) {
       deferred_command_buffer_.CmdVkEndRendering();
@@ -3178,6 +3232,14 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     if (current_render_pass_ == render_pass && current_framebuffer_ == framebuffer) {
       return;
     }
+  }
+
+  // A different render pass is about to begin - upload the guest memory pages
+  // that will likely be needed by the draws in it before beginning it, so that
+  // individual uploads don't split it.
+  if (REXCVAR_GET(vulkan_shared_memory_batch_upload) && shared_memory_) {
+    shared_memory_->UploadInvalidatedRequestedPages();
+    SubmitBarriers(false);
   }
 
   if (in_render_pass_) {
@@ -3594,6 +3656,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+  ++frame_rate_draw_count_;
   const RegisterFile& regs = *register_file_;
   (void)index_buffer_info;
   auto draw_fail = [&](const char* stage) {
@@ -4116,9 +4179,19 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       render_target_cache_->last_update_framebuffer());
 
   // Draw.
-  if (primitive_processing_result.index_buffer_type ==
-          PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
-      shader_32bit_index_dma) {
+  uint32_t tessellation_grid_factor =
+      primitive_processing_result.IsTessellated()
+          ? VulkanPipelineCache::GetTessellationGridFactor(
+                regs, primitive_processing_result.host_vertex_shader_type)
+          : 0;
+  if (tessellation_grid_factor) {
+    // The vertex shader loads the patch indices itself if needed.
+    deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count *
+                                           tessellation_grid_factor * tessellation_grid_factor * 6,
+                                       1, 0, 0);
+  } else if (primitive_processing_result.index_buffer_type ==
+                 PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
+             shader_32bit_index_dma) {
     deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
   } else {
     std::pair<VkBuffer, VkDeviceSize> index_buffer;
@@ -4166,8 +4239,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     shared_memory_->RangeWrittenByGpu(0, SharedMemory::kBufferSize);
   }
 
-  if (IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport)) &&
-      !memexport_ranges_.empty()) {
+  // Check for memexport first - IsReadbackMemexportEnabled looks a cvar up by
+  // name.
+  if (!memexport_ranges_.empty() &&
+      IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport))) {
     uint32_t memexport_total_size = 0;
     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
       memexport_total_size += memexport_range.size_bytes;
@@ -4356,6 +4431,20 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
       readback.mapped_data[read_index] != nullptr && total_size <= readback.sizes[read_index] &&
       total_size <= readback.written_size[read_index] && readback.submission_written[read_index] &&
       readback.submission_written[read_index] <= submission_completed_;
+  if (!previous_slot_ready && REXCVAR_GET(vulkan_memexport_readback_avoid_stalls) &&
+      readback.buffers[read_index] != VK_NULL_HANDLE &&
+      readback.memories[read_index] != VK_NULL_HANDLE &&
+      readback.mapped_data[read_index] != nullptr && total_size <= readback.sizes[read_index] &&
+      total_size <= readback.written_size[read_index] && readback.submission_written[read_index]) {
+    if (readback.submission_written[read_index] >= GetCurrentSubmission()) {
+      // The range was also exported earlier in this submission, so the guest
+      // memory already has the data read back before that export - keep it.
+      readback.current_index = read_index;
+      return true;
+    }
+    CheckSubmissionFenceAndDeviceLoss(readback.submission_written[read_index]);
+    previous_slot_ready = readback.submission_written[read_index] <= submission_completed_;
+  }
   if (!previous_slot_ready) {
     IssueDraw_MemexportReadbackFullPath(total_size);
     readback.current_index = read_index;
@@ -5447,6 +5536,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
   if (is_closing_frame) {
     if (REXCVAR_GET(clear_memory_page_state) && shared_memory_) {
       shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
+    }
+    if (shared_memory_) {
+      shared_memory_->BeginRequestedPagesFrame();
     }
     frame_open_ = false;
     // Submission already closed now, so minus 1.

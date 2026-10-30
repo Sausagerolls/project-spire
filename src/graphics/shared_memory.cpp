@@ -34,6 +34,8 @@ void SharedMemory::InitializeCommon() {
   num_system_page_flags_ = ((kBufferSize >> page_size_log2_) + 63) / 64;
   system_page_flags_valid_.assign(num_system_page_flags_, 0);
   system_page_flags_valid_and_gpu_written_.assign(num_system_page_flags_, 0);
+  system_page_flags_requested_.assign(num_system_page_flags_, 0);
+  system_page_flags_requested_previous_frame_.assign(num_system_page_flags_, 0);
 
   memory_invalidation_callback_handle_ =
       memory_.RegisterPhysicalMemoryInvalidationCallback(MemoryInvalidationCallbackThunk, this);
@@ -86,6 +88,10 @@ void SharedMemory::ShutdownCommon() {
   system_page_flags_valid_.shrink_to_fit();
   system_page_flags_valid_and_gpu_written_.clear();
   system_page_flags_valid_and_gpu_written_.shrink_to_fit();
+  system_page_flags_requested_.clear();
+  system_page_flags_requested_.shrink_to_fit();
+  system_page_flags_requested_previous_frame_.clear();
+  system_page_flags_requested_previous_frame_.shrink_to_fit();
   num_system_page_flags_ = 0;
 }
 
@@ -95,6 +101,7 @@ void SharedMemory::InvalidateAllPages() {
   std::fill(system_page_flags_valid_.begin(), system_page_flags_valid_.end(), uint64_t(0));
   std::fill(system_page_flags_valid_and_gpu_written_.begin(),
             system_page_flags_valid_and_gpu_written_.end(), uint64_t(0));
+  ++page_invalidation_count_;
 }
 
 void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
@@ -103,6 +110,7 @@ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
   // Pages that are valid only because the CPU uploaded them lose their valid
   // bit here, so the next frame re-reads them from guest memory.
   system_page_flags_valid_ = system_page_flags_valid_and_gpu_written_;
+  ++page_invalidation_count_;
 }
 
 void SharedMemory::ClearCache() {
@@ -412,6 +420,14 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
       uint32_t block_last = page_last >> 6;
       uint32_t range_start = UINT32_MAX;
       for (uint32_t i = block_first; i <= block_last; ++i) {
+        uint64_t requested_bits = UINT64_MAX;
+        if (i == block_first) {
+          requested_bits &= ~((uint64_t(1) << (page_first & 63)) - 1);
+        }
+        if (i == block_last && (page_last & 63) != 63) {
+          requested_bits &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+        }
+        system_page_flags_requested_[i] |= requested_bits;
         uint64_t block_valid = system_page_flags_valid_[i];
         // Consider pages in the block outside the requested range valid.
         if (i == block_first) {
@@ -466,6 +482,59 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   }
 
   return UploadRanges(upload_ranges_);
+}
+
+bool SharedMemory::UploadInvalidatedRequestedPages() {
+  upload_ranges_.clear();
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    if (page_invalidation_count_ == page_invalidation_count_at_batch_upload_) {
+      return true;
+    }
+    page_invalidation_count_at_batch_upload_ = page_invalidation_count_;
+    uint32_t range_start = UINT32_MAX;
+    for (uint32_t i = 0; i < num_system_page_flags_; ++i) {
+      uint64_t block_upload =
+          (system_page_flags_requested_[i] | system_page_flags_requested_previous_frame_[i]) &
+          ~system_page_flags_valid_[i];
+      uint32_t block_page = 0;
+      while (block_page < 64) {
+        uint64_t remaining = block_page ? (block_upload >> block_page) : block_upload;
+        if (range_start == UINT32_MAX) {
+          uint32_t offset;
+          if (!rex::bit_scan_forward(remaining, &offset)) {
+            break;
+          }
+          block_page += offset;
+          range_start = (i << 6) + block_page;
+        } else {
+          uint32_t offset;
+          if (!rex::bit_scan_forward(~remaining & (block_page ? (UINT64_MAX >> block_page)
+                                                              : UINT64_MAX),
+                                     &offset)) {
+            break;
+          }
+          block_page += offset;
+          upload_ranges_.emplace_back(range_start, (i << 6) + block_page - range_start);
+          range_start = UINT32_MAX;
+        }
+      }
+    }
+    if (range_start != UINT32_MAX) {
+      upload_ranges_.emplace_back(range_start, (num_system_page_flags_ << 6) - range_start);
+    }
+  }
+  if (upload_ranges_.empty()) {
+    return true;
+  }
+  return UploadRanges(upload_ranges_);
+}
+
+void SharedMemory::BeginRequestedPagesFrame() {
+  auto global_lock = global_critical_region_.Acquire();
+  system_page_flags_requested_previous_frame_.swap(system_page_flags_requested_);
+  std::fill(system_page_flags_requested_.begin(), system_page_flags_requested_.end(),
+            uint64_t(0));
 }
 
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
@@ -527,6 +596,7 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
     system_page_flags_valid_[i] &= ~invalidate_bits;
     system_page_flags_valid_and_gpu_written_[i] &= ~invalidate_bits;
   }
+  ++page_invalidation_count_;
 
   FireWatches(page_first, page_last, false);
 

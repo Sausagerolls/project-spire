@@ -77,6 +77,13 @@ class VulkanPipelineCache {
 
   // Retrieves the shader modification for the current state. The shader must
   // have microcode analyzed.
+  // If nonzero, draws with this host vertex shader type are drawn as a
+  // factor x factor quad grid per patch with the domain shader running as the
+  // vertex shader instead of using host tessellation (which is slow with
+  // MoltenVK).
+  static uint32_t GetTessellationGridFactor(const RegisterFile& regs,
+                                            Shader::HostVertexShaderType host_vertex_shader_type);
+
   SpirvShaderTranslator::Modification GetCurrentVertexShaderModification(
       const Shader& shader, Shader::HostVertexShaderType host_vertex_shader_type,
       uint32_t interpolator_mask, bool ps_param_gen_used) const;

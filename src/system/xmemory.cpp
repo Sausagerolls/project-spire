@@ -543,10 +543,17 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
   uint32_t virtual_address = HostToGuestVirtual(host_address);
   BaseHeap* heap = LookupHeap(virtual_address);
   if (!heap || heap->heap_type() != memory::HeapType::kGuestPhysical) {
-    REXSYS_ERROR(
-        "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
-        is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
-        rex::thread::current_thread_id());
+    // An unhandled access is retried, and usually repeats forever, so only log
+    // the first ones and then a sample (the global lock is held here).
+    static uint64_t unhandled_count = 0;
+    ++unhandled_count;
+    if (unhandled_count <= 16 || !(unhandled_count & 0xFFFF)) {
+      REXSYS_ERROR(
+          "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread "
+          "0x{:X} ({} so far)",
+          is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
+          rex::thread::current_thread_id(), unhandled_count);
+    }
     return false;
   }
 

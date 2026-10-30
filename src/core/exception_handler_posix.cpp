@@ -20,6 +20,7 @@
 #if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
 
 #include <signal.h>
+#include <time.h>
 
 #include <cstdint>
 #include <cstring>
@@ -416,6 +417,16 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
 #endif  // REX_ARCH
       return;
     }
+  }
+
+  // Nothing handled the exception, so returning re-executes the faulting
+  // instruction, which faults again. A guest thread that dereferences an
+  // invalid pointer then spins here forever, taking the global critical region
+  // on every attempt and starving the other threads (the GPU command processor
+  // in particular). Back off so that such a thread costs little.
+  if (signal_number == SIGSEGV || signal_number == SIGBUS) {
+    struct timespec backoff = {0, 1000000};
+    nanosleep(&backoff, nullptr);
   }
 }
 

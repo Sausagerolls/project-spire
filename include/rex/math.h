@@ -167,8 +167,22 @@ inline uint8_t tzcnt(int64_t v) {
 // Search the value from least significant bit (LSB) to the most significant bit
 // (MSB) for a set bit (1).
 // Returns false if no bits are set and the output index is invalid.
+#if REX_PLATFORM_WIN32
 bool bit_scan_forward(uint32_t v, uint32_t* out_first_set_index);
 bool bit_scan_forward(uint64_t v, uint32_t* out_first_set_index);
+#else
+// Inline - called in hot loops over binding masks.
+inline bool bit_scan_forward(uint32_t v, uint32_t* out_first_set_index) {
+  int i = __builtin_ffs(static_cast<int>(v));
+  *out_first_set_index = i - 1;
+  return i != 0;
+}
+inline bool bit_scan_forward(uint64_t v, uint32_t* out_first_set_index) {
+  int i = __builtin_ffsll(static_cast<long long>(v));
+  *out_first_set_index = i - 1;
+  return i != 0;
+}
+#endif
 inline bool bit_scan_forward(int32_t v, uint32_t* out_first_set_index) {
   return bit_scan_forward(static_cast<uint32_t>(v), out_first_set_index);
 }

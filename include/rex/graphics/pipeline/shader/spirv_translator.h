@@ -33,7 +33,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
     // prototyping stage (easier to do small granular updates with an
     // incremental counter).
-    static constexpr uint32_t kVersion = 12;
+    static constexpr uint32_t kVersion = 13;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -70,6 +70,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
       Shader::HostVertexShaderType host_vertex_shader_type : Shader::kHostVertexShaderTypeBitCount;
       // For domain host vertex shader types only, xenos::TessellationMode.
       uint32_t tessellation_mode : 2;
+      // For kQuadDomainPatchIndexed, run the domain shader as a vertex shader
+      // over a host-generated triangle grid of
+      // tessellation_factor_range_max x tessellation_factor_range_max quads per
+      // patch instead of using host tessellation (see
+      // VulkanPipelineCache::GetTessellationGridFactor).
+      uint32_t tessellation_grid : 1;
     } vertex;
     struct PixelShaderModification {
       // uint32_t 0.
@@ -518,12 +524,18 @@ class SpirvShaderTranslator : public ShaderTranslator {
   }
 
   bool IsSpirvVertexShader() const {
-    return is_vertex_shader() && !Shader::IsHostVertexShaderTypeDomain(
-                                     GetSpirvShaderModification().vertex.host_vertex_shader_type);
+    return is_vertex_shader() && (!Shader::IsHostVertexShaderTypeDomain(
+                                      GetSpirvShaderModification().vertex.host_vertex_shader_type) ||
+                                  IsSpirvTessellationGridShader());
   }
   bool IsSpirvTessEvalShader() const {
-    return is_vertex_shader() && Shader::IsHostVertexShaderTypeDomain(
-                                     GetSpirvShaderModification().vertex.host_vertex_shader_type);
+    return is_vertex_shader() &&
+           Shader::IsHostVertexShaderTypeDomain(
+               GetSpirvShaderModification().vertex.host_vertex_shader_type) &&
+           !IsSpirvTessellationGridShader();
+  }
+  bool IsSpirvTessellationGridShader() const {
+    return is_vertex_shader() && GetSpirvShaderModification().vertex.tessellation_grid;
   }
   bool IsSpirvComputeShader() const {
     return is_vertex_shader() && GetSpirvShaderModification().vertex.host_vertex_shader_type ==
@@ -879,8 +891,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantEdramRTKeepMask,
     kSystemConstantEdramRTClamp,
     kSystemConstantEdramBlendConstant,
+    kSystemConstantTessellationFactorRangeMax,
   };
   spv::Id uniform_system_constants_;
+  // Domain location of the vertex in tessellation grid vertex shaders.
+  spv::Id grid_domain_location_x_ = spv::NoResult;
+  spv::Id grid_domain_location_y_ = spv::NoResult;
   spv::Id uniform_float_constants_;
   spv::Id uniform_bool_loop_constants_;
   spv::Id uniform_fetch_constants_;

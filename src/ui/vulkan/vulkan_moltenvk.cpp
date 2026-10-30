@@ -187,6 +187,16 @@ MacOSVulkanRuntimePaths DetectMacOSVulkanRuntimePaths() {
 }
 
 void ConfigureMacOSVulkanEnvironment(const MacOSVulkanRuntimePaths& paths) {
+  // Descriptor sets are rewritten for almost every guest draw. With Metal
+  // argument buffers, MoltenVK encodes every descriptor write into an argument
+  // buffer, which costs more on the GPU command thread than binding resources
+  // directly (about 5% higher frame rate in Fable II without them). Keep any
+  // value the user has set.
+  const char* mvk_argument_buffers = std::getenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS");
+  if (!mvk_argument_buffers || !mvk_argument_buffers[0]) {
+    setenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "0", 1);
+  }
+
   if (!paths.sdk_root.empty()) {
     const char* vulkan_sdk = std::getenv("VULKAN_SDK");
     if (!vulkan_sdk || !vulkan_sdk[0]) {

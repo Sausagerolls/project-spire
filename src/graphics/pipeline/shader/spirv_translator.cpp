@@ -21,6 +21,7 @@
 #include <fmt/format.h>
 
 #include <rex/assert.h>
+#include <rex/platform.h>
 #include <rex/graphics/pipeline/shader/spirv.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/math.h>
@@ -115,6 +116,8 @@ void SpirvShaderTranslator::Reset() {
   input_vertex_index_ = spv::NoResult;
   input_primitive_id_ = spv::NoResult;
   input_tess_coord_ = spv::NoResult;
+  grid_domain_location_x_ = spv::NoResult;
+  grid_domain_location_y_ = spv::NoResult;
   input_patch_control_point_indices_ = spv::NoResult;
   input_point_coordinates_ = spv::NoResult;
   input_fragment_coordinates_ = spv::NoResult;
@@ -309,6 +312,8 @@ void SpirvShaderTranslator::StartTranslation() {
       {"edram_rt_keep_mask", offsetof(SystemConstants, edram_rt_keep_mask), type_uint4_array_2},
       {"edram_rt_clamp", offsetof(SystemConstants, edram_rt_clamp), type_float4_array_4},
       {"edram_blend_constant", offsetof(SystemConstants, edram_blend_constant), type_float4_},
+      {"tessellation_factor_range_max", offsetof(SystemConstants, tessellation_factor_range_max),
+       type_float_},
   };
   id_vector_temp_.clear();
   id_vector_temp_.reserve(rex::countof(system_constants));
@@ -1982,15 +1987,90 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
                                                         line_loop_closing_index),
                                   vertex_index, const_uint_0_);
       }
+      if (IsSpirvTessellationGridShader()) {
+        // The host draws factor x factor quads (two triangles, 6 vertices,
+        // each) per patch. Split the host vertex index into the patch index
+        // and the domain location.
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(kSystemConstantTessellationFactorRangeMax));
+        spv::Id grid_factor = builder_->createUnaryOp(
+            spv::OpConvertFToU, type_uint_,
+            builder_->createLoad(builder_->createAccessChain(spv::StorageClassUniform,
+                                                             uniform_system_constants_,
+                                                             id_vector_temp_),
+                                 spv::NoPrecision));
+        spv::Id grid_vertices_per_patch = builder_->createBinOp(
+            spv::OpIMul, type_uint_,
+            builder_->createBinOp(spv::OpIMul, type_uint_, grid_factor, grid_factor),
+            builder_->makeUintConstant(6));
+        spv::Id grid_vertex_in_patch =
+            builder_->createBinOp(spv::OpUMod, type_uint_, vertex_index, grid_vertices_per_patch);
+        spv::Id grid_quad = builder_->createBinOp(spv::OpUDiv, type_uint_, grid_vertex_in_patch,
+                                                  builder_->makeUintConstant(6));
+        spv::Id grid_quad_vertex = builder_->createBinOp(spv::OpUMod, type_uint_,
+                                                         grid_vertex_in_patch,
+                                                         builder_->makeUintConstant(6));
+        spv::Id grid_quad_x = builder_->createBinOp(spv::OpUMod, type_uint_, grid_quad, grid_factor);
+        spv::Id grid_quad_y = builder_->createBinOp(spv::OpUDiv, type_uint_, grid_quad, grid_factor);
+        // Like the host tessellator, split the quads with diagonals pointing
+        // to the center of the patch (so the triangulation is symmetric and
+        // matches other passes drawing the same patches with host
+        // tessellation, possibly with a different factor).
+        spv::Id grid_half_factor =
+            builder_->createBinOp(spv::OpShiftRightLogical, type_uint_, grid_factor,
+                                  builder_->makeUintConstant(1));
+        spv::Id grid_main_diagonal = builder_->createBinOp(
+            spv::OpLogicalEqual, type_bool_,
+            builder_->createBinOp(spv::OpULessThan, type_bool_, grid_quad_x, grid_half_factor),
+            builder_->createBinOp(spv::OpULessThan, type_bool_, grid_quad_y, grid_half_factor));
+        // Clockwise in the domain like the host tessellator output
+        // (VertexOrderCw). Main diagonal: (0, 0), (1, 0), (1, 1) and
+        // (0, 0), (1, 1), (0, 1). Other diagonal: (0, 0), (1, 0), (0, 1) and
+        // (1, 0), (1, 1), (0, 1). As bits 0:5 of the X and Y offset masks.
+        spv::Id grid_offset_x = builder_->createTriOp(
+            spv::OpBitFieldUExtract, type_uint_,
+            builder_->createTriOp(spv::OpSelect, type_uint_, grid_main_diagonal,
+                                  builder_->makeUintConstant(0b010110),
+                                  builder_->makeUintConstant(0b011010)),
+            grid_quad_vertex, builder_->makeUintConstant(1));
+        spv::Id grid_offset_y = builder_->createTriOp(
+            spv::OpBitFieldUExtract, type_uint_, builder_->makeUintConstant(0b110100),
+            grid_quad_vertex, builder_->makeUintConstant(1));
+        spv::Id grid_factor_float =
+            builder_->createUnaryOp(spv::OpConvertUToF, type_float_, grid_factor);
+        grid_domain_location_x_ = builder_->createBinOp(
+            spv::OpFDiv, type_float_,
+            builder_->createUnaryOp(
+                spv::OpConvertUToF, type_float_,
+                builder_->createBinOp(
+                    spv::OpIAdd, type_uint_,
+                    grid_quad_x, grid_offset_x)),
+            grid_factor_float);
+        grid_domain_location_y_ = builder_->createBinOp(
+            spv::OpFDiv, type_float_,
+            builder_->createUnaryOp(
+                spv::OpConvertUToF, type_float_,
+                builder_->createBinOp(
+                    spv::OpIAdd, type_uint_,
+                    grid_quad_y, grid_offset_y)),
+            grid_factor_float);
+        vertex_index =
+            builder_->createBinOp(spv::OpUDiv, type_uint_, vertex_index, grid_vertices_per_patch);
+      }
       if (IsSpirvVertexShader() &&
           (host_vertex_shader_type == Shader::HostVertexShaderType::kPointListAsTriangleStrip ||
            host_vertex_shader_type ==
-               Shader::HostVertexShaderType::kRectangleListAsTriangleStrip)) {
+               Shader::HostVertexShaderType::kRectangleListAsTriangleStrip ||
+           IsSpirvTessellationGridShader())) {
         spv::Id const_uint_2 = builder_->makeUintConstant(2);
         spv::Id two_triangle_strip_vertex_index = vertex_index;
-        // Extract the primitive index from the two-triangle strip vertex index.
-        vertex_index = builder_->createBinOp(spv::OpShiftRightLogical, type_uint_,
-                                             two_triangle_strip_vertex_index, const_uint_2);
+        if (!IsSpirvTessellationGridShader()) {
+          // Extract the primitive index from the two-triangle strip vertex
+          // index.
+          vertex_index = builder_->createBinOp(spv::OpShiftRightLogical, type_uint_,
+                                               two_triangle_strip_vertex_index, const_uint_2);
+        }
         if (host_vertex_shader_type ==
             Shader::HostVertexShaderType::kRectangleListAsTriangleStrip) {
           spv::Id const_uint_3 = builder_->makeUintConstant(3);
@@ -2429,6 +2509,15 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
           store_register_component(0, 0, vertex_index_float);
         }
         if_cp_indexed.makeEndIf();
+      } else if (IsSpirvTessellationGridShader()) {
+        // Like kQuadDomainPatchIndexed: r0.x = patch index, r0.yz = domain
+        // location xy, r1.x = swizzle.
+        store_register_component(0, 0, vertex_index_float);
+        store_register_component(0, 1, grid_domain_location_x_);
+        store_register_component(0, 2, grid_domain_location_y_);
+        if (register_count() >= 2) {
+          store_register_component(1, 0, const_float_0_);
+        }
       } else {
         store_register_component(0, 0, vertex_index_float);
       }
@@ -2919,8 +3008,14 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
   }
 
   // Sample mask input.
+  // SPIRV-Cross (MoltenVK) treats any fragment shader declaring
+  // SampleRateShading as running at sample rate, which multiplies the pixel
+  // shader cost by the sample count on MSAA render targets, so only declare it
+  // for alpha to coverage where the host doesn't do that.
+  bool sample_rate_shading_for_alpha_to_coverage =
+      alpha_to_coverage_possible && features_.sample_rate_shading && !REX_PLATFORM_MAC;
   if (edram_fragment_shader_interlock_ || IsSampleRate() ||
-      (alpha_to_coverage_possible && features_.sample_rate_shading)) {
+      sample_rate_shading_for_alpha_to_coverage) {
     // SampleMask depends on SampleRateShading in some SPIR-V revisions.
     builder_->addCapability(spv::CapabilitySampleRateShading);
   }

@@ -145,10 +145,12 @@ bool WindowSDL::OpenImpl() {
   int initial_height = int(SizeToPhysical(GetDesiredLogicalHeight()));
 #endif
 #if REX_PLATFORM_MAC
-  // Fullscreen without a separate Space. Native Spaces fullscreen animates the
-  // window through intermediate sizes and the presenter never shows a frame
-  // afterwards (black screen); borderless desktop fullscreen presents normally.
-  SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0");
+  // The Vulkan swapchain (MoltenVK) owns the CAMetalLayer drawable size. If SDL
+  // also resizes the drawable on pixel size changes, recreating the swapchain
+  // at the size SDL already set leaves the layer showing only the top-left
+  // pixel of each frame stretched over the window (black screen in
+  // fullscreen).
+  SDL_SetHint(SDL_HINT_VIDEO_METAL_AUTO_RESIZE_DRAWABLE, "0");
 #endif
   sdl_window_ = SDL_CreateWindow(GetTitle().c_str(), initial_width, initial_height, flags);
   if (!sdl_window_) {
