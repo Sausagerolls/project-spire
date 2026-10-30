@@ -14,7 +14,9 @@
 #include <algorithm>
 #include <cstring>
 #include <chrono>
+#include <string>
 #include <thread>
+#include <unordered_map>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -34,6 +36,10 @@
 #include <rex/ui/metal/metal_presenter.h>
 #include <rex/ui/metal/metal_provider.h>
 
+REXCVAR_DEFINE_BOOL(metal_log_frame_rate, false, "GPU/Metal",
+                    "Log the guest frame rate (swaps per second) and draws per frame about every "
+                    "5 seconds")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(metal_log_stats, false, "GPU/Metal",
                     "Log Metal backend draw and resolve statistics about every 5 seconds")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -534,6 +540,7 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
                                       IndexBufferInfo* index_buffer_info,
                                       bool major_mode_explicit) {
   ++stats_.draws_requested;
+  ++frame_rate_draw_count_;
   bool result = IssueDrawImpl();
   if (!result) {
     ++stats_.draws_failed;
@@ -543,6 +550,14 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
 
 bool MetalCommandProcessor::IssueDrawImpl() {
   const RegisterFile& regs = *register_file_;
+  auto draw_fail = [](const char* reason) {
+    static std::unordered_map<std::string, bool> logged;
+    if (!logged[reason]) {
+      logged[reason] = true;
+      REXGPU_ERROR("Metal draw failed: {}", reason);
+    }
+    return false;
+  };
 
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
@@ -553,7 +568,7 @@ bool MetalCommandProcessor::IssueDrawImpl() {
 
   auto vertex_shader = static_cast<MetalShader*>(active_vertex_shader());
   if (!vertex_shader) {
-    return false;
+    return draw_fail("no vertex shader");
   }
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
@@ -592,7 +607,7 @@ bool MetalCommandProcessor::IssueDrawImpl() {
   GetCommandBuffer();
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
   if (!primitive_processor_->Process(primitive_processing_result)) {
-    return false;
+    return draw_fail("primitive processing");
   }
   if (!primitive_processing_result.host_draw_vertex_count) {
     return true;
@@ -615,7 +630,7 @@ bool MetalCommandProcessor::IssueDrawImpl() {
              host_vertex_shader_type != Shader::HostVertexShaderType::kPointListAsTriangleStrip &&
              host_vertex_shader_type !=
                  Shader::HostVertexShaderType::kRectangleListAsTriangleStrip) {
-    return false;
+    return draw_fail("host vertex shader type");
   }
 
   SpirvShaderTranslator::Modification vertex_shader_modification =
@@ -635,7 +650,7 @@ bool MetalCommandProcessor::IssueDrawImpl() {
                    : nullptr;
   if (!pipeline_cache_->EnsureShadersTranslated(vertex_shader_translation,
                                                 pixel_shader_translation)) {
-    return false;
+    return draw_fail("shader translation");
   }
 
   uint32_t normalized_color_mask =
@@ -648,14 +663,14 @@ bool MetalCommandProcessor::IssueDrawImpl() {
 
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
-    return false;
+    return draw_fail("render target update");
   }
 
   id<MTLRenderPipelineState> pipeline = pipeline_cache_->GetPipeline(
       vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
       normalized_color_mask, render_target_cache_->last_update_formats());
   if (!pipeline) {
-    return false;
+    return draw_fail("pipeline");
   }
 
   draw_util::ViewportInfo viewport_info;
@@ -668,15 +683,17 @@ bool MetalCommandProcessor::IssueDrawImpl() {
 
   id<MTLRenderCommandEncoder> encoder = GetRenderEncoderForCurrentRenderTargets();
   if (!encoder) {
-    return false;
+    return draw_fail("encoder");
   }
   if (encoder_pipeline_ != pipeline) {
     [encoder setRenderPipelineState:pipeline];
     encoder_pipeline_ = pipeline;
   }
   bool depth_bound = render_target_cache_->last_update_attachments().depth != nil;
+  // Without rasterization in the guest (memexport only), the host still
+  // rasterizes - nothing must be written.
   id<MTLDepthStencilState> depth_stencil_state = pipeline_cache_->GetDepthStencilState(
-      normalized_depth_control, depth_bound, primitive_polygonal);
+      normalized_depth_control, depth_bound && is_rasterization_done, primitive_polygonal);
   if (encoder_depth_stencil_state_ != depth_stencil_state) {
     [encoder setDepthStencilState:depth_stencil_state];
     encoder_depth_stencil_state_ = depth_stencil_state;
@@ -686,7 +703,7 @@ bool MetalCommandProcessor::IssueDrawImpl() {
     return true;
   }
   if (!UpdateConstantBuffers(vertex_shader, pixel_shader)) {
-    return false;
+    return draw_fail("constants");
   }
   BindDrawResources(encoder, vertex_shader, pixel_shader);
   ++stats_.draws_encoded;
@@ -714,7 +731,7 @@ bool MetalCommandProcessor::IssueDrawImpl() {
         primitive_type = MTLPrimitiveTypeTriangleStrip;
         break;
       default:
-        return false;
+        return draw_fail("primitive type");
     }
   }
   if (tessellation_grid_factor) {
@@ -753,7 +770,7 @@ bool MetalCommandProcessor::IssueDrawImpl() {
         index_buffer_offset = pair.second;
       } break;
       default:
-        return false;
+        return draw_fail("index buffer type");
     }
     [encoder drawIndexedPrimitives:primitive_type
                         indexCount:primitive_processing_result.host_draw_vertex_count
@@ -1049,6 +1066,21 @@ bool MetalCommandProcessor::IssueCopy() {
 void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   ++stats_.swaps;
+  if (REXCVAR_GET(metal_log_frame_rate)) {
+    static auto rate_start = std::chrono::steady_clock::now();
+    static uint32_t rate_swaps = 0;
+    static uint64_t rate_draws_start = 0;
+    ++rate_swaps;
+    auto now = std::chrono::steady_clock::now();
+    double seconds = std::chrono::duration<double>(now - rate_start).count();
+    if (seconds >= 5.0) {
+      REXGPU_INFO("Frame rate: {:.2f} fps, {} draws per frame", rate_swaps / seconds,
+                  (frame_rate_draw_count_ - rate_draws_start) / rate_swaps);
+      rate_start = now;
+      rate_swaps = 0;
+      rate_draws_start = frame_rate_draw_count_;
+    }
+  }
   if (REXCVAR_GET(metal_log_stats)) {
     auto now = std::chrono::steady_clock::now();
     if (now - stats_.last_log >= std::chrono::seconds(5)) {

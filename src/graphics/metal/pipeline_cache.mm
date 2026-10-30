@@ -367,7 +367,12 @@ id<MTLRenderPipelineState> MetalPipelineCache::GetPipeline(
   descriptor.fragmentFunction = pixel_shader ? pixel_shader->GetOrCreateFunction(provider) : nil;
   descriptor.inputPrimitiveTopology = topology_class;
   descriptor.rasterSampleCount = formats.sample_count;
-  descriptor.rasterizationEnabled = rasterization_enabled;
+  // Metal requires a void vertex function without rasterization. Draws not
+  // rasterizing (memexport only) are drawn without a fragment shader and with
+  // all writes masked instead (the command processor disables depth writes).
+  if (!rasterization_enabled) {
+    descriptor.fragmentFunction = nil;
+  }
   descriptor.alphaToCoverageEnabled = alpha_to_coverage;
   for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
     MTLRenderPipelineColorAttachmentDescriptor* color = descriptor.colorAttachments[i];
@@ -380,7 +385,7 @@ id<MTLRenderPipelineState> MetalPipelineCache::GetPipeline(
                       ((write_mask & 0b0010) ? MTLColorWriteMaskGreen : 0) |
                       ((write_mask & 0b0100) ? MTLColorWriteMaskBlue : 0) |
                       ((write_mask & 0b1000) ? MTLColorWriteMaskAlpha : 0);
-    if (!write_mask || !pixel_shader) {
+    if (!write_mask || !pixel_shader || !rasterization_enabled) {
       color.writeMask = MTLColorWriteMaskNone;
       continue;
     }

@@ -197,6 +197,7 @@ class MetalCommandProcessor : public CommandProcessor {
     std::chrono::steady_clock::time_point last_log{};
   };
   Stats stats_;
+  uint64_t frame_rate_draw_count_ = 0;
 };
 
 }  // namespace rex::graphics::metal
