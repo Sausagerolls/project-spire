@@ -42,6 +42,14 @@ REXCVAR_DEFINE_BOOL(metal_native_surfaces, false, "GPU/Metal",
                     "Keep each render target the game's D3D binds in its own texture (reported "
                     "by the game's hooks) instead of emulating the EDRAM")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(metal_resolve_snapshots, true, "GPU/Metal",
+                    "With native surfaces, copy color resolves to whole textures directly to the "
+                    "texture (host to host) instead of reloading them from guest memory")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(metal_resolve_to_memory, false, "GPU/Metal",
+                    "With resolve snapshots, still write resolves to guest memory (needed if "
+                    "the CPU reads them)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(metal_render_target_transfers, true, "GPU/Metal",
                     "Copy the EDRAM data between render targets aliasing the same EDRAM range "
                     "(disable only for debugging - causes artefacts)")
@@ -1311,6 +1319,153 @@ bool MetalRenderTargetCache::Resolve(const memory::Memory& memory,
   return copied;
 }
 
+namespace {
+const char kSnapshotShaderSource[] = R"(
+#include <metal_stdlib>
+using namespace metal;
+struct SnapshotConstants {
+  uint2 source_offset;
+  uint swap_red_blue;
+  uint sample_index;
+};
+kernel void snapshot_copy(texture2d<float> source [[texture(0)]],
+                          texture2d<float, access::write> dest [[texture(1)]],
+                          constant SnapshotConstants& c [[buffer(0)]],
+                          uint2 id [[thread_position_in_grid]]) {
+  if (id.x >= dest.get_width() || id.y >= dest.get_height()) return;
+  float4 color = source.read(c.source_offset + id);
+  dest.write(c.swap_red_blue ? color.bgra : color, id);
+}
+kernel void snapshot_copy_ms(texture2d_ms<float> source [[texture(0)]],
+                             texture2d<float, access::write> dest [[texture(1)]],
+                             constant SnapshotConstants& c [[buffer(0)]],
+                             uint2 id [[thread_position_in_grid]]) {
+  if (id.x >= dest.get_width() || id.y >= dest.get_height()) return;
+  float4 color = source.read(c.source_offset + id, c.sample_index);
+  dest.write(c.swap_red_blue ? color.bgra : color, id);
+}
+)";
+}  // namespace
+
+void MetalRenderTargetCache::MakeResolveSnapshot(const draw_util::ResolveInfo& resolve_info,
+                                                 MetalRenderTarget& source) {
+  // Whole-texture color copies without conversion only.
+  if (resolve_info.IsCopyingDepth() || !resolve_info.copy_dest_extent_length ||
+      resolve_info.copy_dest_info.copy_dest_exp_bias || resolve_info.copy_dest_info.copy_dest_array ||
+      resolve_info.copy_dest_coordinate_info.offset_x_div_8 ||
+      resolve_info.copy_dest_coordinate_info.offset_y_div_8 || draw_resolution_scale_x() != 1 ||
+      draw_resolution_scale_y() != 1) {
+    return;
+  }
+  xenos::ColorFormat dest_format = resolve_info.copy_dest_info.copy_dest_format;
+  MTLPixelFormat pixel_format = source.texture().pixelFormat;
+  bool format_matches = false;
+  switch (dest_format) {
+    case xenos::ColorFormat::k_8_8_8_8:
+      format_matches = pixel_format == MTLPixelFormatRGBA8Unorm;
+      break;
+    case xenos::ColorFormat::k_2_10_10_10:
+      format_matches = pixel_format == MTLPixelFormatRGB10A2Unorm;
+      break;
+    case xenos::ColorFormat::k_16_16_16_16_FLOAT:
+      format_matches = pixel_format == MTLPixelFormatRGBA16Float;
+      break;
+    case xenos::ColorFormat::k_16_16_FLOAT:
+      format_matches = pixel_format == MTLPixelFormatRG16Float;
+      break;
+    case xenos::ColorFormat::k_32_FLOAT:
+      format_matches = pixel_format == MTLPixelFormatR32Float;
+      break;
+    default:
+      break;
+  }
+  if (!format_matches) {
+    return;
+  }
+  uint32_t width = uint32_t(resolve_info.coordinate_info.width_div_8) << 3;
+  uint32_t height = uint32_t(resolve_info.height_div_8) << 3;
+  uint32_t source_x = uint32_t(resolve_info.coordinate_info.edram_offset_x_div_8) << 3;
+  uint32_t source_y = uint32_t(resolve_info.coordinate_info.edram_offset_y_div_8) << 3;
+  id<MTLTexture> source_texture = source.texture();
+  if (source_x + width > source_texture.width || source_y + height > source_texture.height) {
+    return;
+  }
+  if (!snapshot_pipeline_) {
+    id<MTLLibrary> library =
+        command_processor_.GetMetalProvider().CompileLibrary(@(kSnapshotShaderSource), "snapshot");
+    if (!library) {
+      return;
+    }
+    NSError* error = nil;
+    snapshot_pipeline_ = [command_processor_.device()
+        newComputePipelineStateWithFunction:[library newFunctionWithName:@"snapshot_copy"]
+                                      error:&error];
+    snapshot_ms_pipeline_ = [command_processor_.device()
+        newComputePipelineStateWithFunction:[library newFunctionWithName:@"snapshot_copy_ms"]
+                                      error:&error];
+    if (!snapshot_pipeline_ || !snapshot_ms_pipeline_) {
+      return;
+    }
+  }
+  ResolveSnapshot& snapshot = resolve_snapshots_[resolve_info.copy_dest_base];
+  if (!snapshot.texture || snapshot.texture.width != width || snapshot.texture.height != height ||
+      snapshot.texture.pixelFormat != pixel_format) {
+    MTLTextureDescriptor* descriptor =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixel_format
+                                                           width:width
+                                                          height:height
+                                                       mipmapped:NO];
+    descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    descriptor.storageMode = MTLStorageModePrivate;
+    snapshot.texture = [command_processor_.device() newTextureWithDescriptor:descriptor];
+    if (!snapshot.texture) {
+      resolve_snapshots_.erase(resolve_info.copy_dest_base);
+      return;
+    }
+    snapshot.texture.label = @"resolve snapshot";
+  }
+  snapshot.width = width;
+  snapshot.height = height;
+  snapshot.format = uint32_t(dest_format);
+  struct {
+    uint32_t source_offset[2];
+    uint32_t swap_red_blue;
+    uint32_t sample_index;
+  } constants = {{source_x, source_y},
+                 uint32_t(resolve_info.copy_dest_info.copy_dest_swap),
+                 0};
+  id<MTLComputeCommandEncoder> encoder = command_processor_.GetComputeEncoder("resolve");
+  [encoder setComputePipelineState:source_texture.sampleCount > 1 ? snapshot_ms_pipeline_
+                                                                  : snapshot_pipeline_];
+  [encoder setTexture:source_texture atIndex:0];
+  [encoder setTexture:snapshot.texture atIndex:1];
+  [encoder setBytes:&constants length:sizeof(constants) atIndex:0];
+  [encoder dispatchThreadgroups:MTLSizeMake((width + 7) / 8, (height + 7) / 8, 1)
+          threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+  ++resolve_snapshots_made_;
+}
+
+id<MTLTexture> MetalRenderTargetCache::TakeResolveSnapshot(uint32_t address, uint32_t width,
+                                                           uint32_t height, uint32_t format,
+                                                           MTLPixelFormat pixel_format) {
+  auto it = resolve_snapshots_.find(address);
+  if (it == resolve_snapshots_.end()) {
+    return nil;
+  }
+  ResolveSnapshot& snapshot = it->second;
+  if (!snapshot.texture || snapshot.format != format ||
+      snapshot.texture.pixelFormat != pixel_format || width > snapshot.width ||
+      height > snapshot.height) {
+    return nil;
+  }
+  id<MTLTexture> texture = snapshot.texture;
+  // Once - later loads (after CPU writes) come from guest memory. The texture
+  // object stays for reuse by the next resolve to this address.
+  snapshot.format = UINT32_MAX;
+  ++resolve_snapshots_taken_;
+  return texture;
+}
+
 bool MetalRenderTargetCache::ResolveNative(const draw_util::ResolveInfo& resolve_info,
                                            MetalSharedMemory& shared_memory,
                                            MetalTextureCache& texture_cache,
@@ -1324,8 +1479,22 @@ bool MetalRenderTargetCache::ResolveNative(const draw_util::ResolveInfo& resolve
   MetalRenderTarget* source = GetNativeRenderTarget(
       native_bound_[source_is_depth ? 0 : 1 + source_select], source_is_depth);
 
+  bool snapshot_made = false;
+  if (source && REXCVAR_GET(metal_resolve_snapshots)) {
+    uint64_t made_before = resolve_snapshots_made_;
+    MakeResolveSnapshot(resolve_info, *source);
+    snapshot_made = resolve_snapshots_made_ != made_before;
+  }
   bool copied = false;
-  if (resolve_info.copy_dest_extent_length && source) {
+  if (snapshot_made && !REXCVAR_GET(metal_resolve_to_memory)) {
+    // The texture cache gets the data from the snapshot - just invalidate
+    // the textures there.
+    texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
+                                      resolve_info.copy_dest_extent_length);
+    command_processor_.MarkGpuWrittenInSubmission(resolve_info.copy_dest_extent_start,
+                                                  resolve_info.copy_dest_extent_length);
+    copied = true;
+  } else if (resolve_info.copy_dest_extent_length && source) {
     draw_util::ResolveCopyShaderConstants copy_shader_constants;
     uint32_t copy_group_count_x, copy_group_count_y;
     draw_util::ResolveCopyShaderIndex copy_shader =

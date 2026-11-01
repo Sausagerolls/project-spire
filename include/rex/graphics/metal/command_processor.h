@@ -54,6 +54,7 @@ class MetalCommandProcessor : public CommandProcessor {
 
   const ui::metal::MetalProvider& GetMetalProvider() const;
   id<MTLDevice> device() const { return device_; }
+  MetalRenderTargetCache& render_target_cache() { return *render_target_cache_; }
 
   // Submissions are command buffers, frames are guest frames (between swaps).
   uint64_t GetCurrentSubmission() const { return submission_current_; }

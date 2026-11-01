@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 
 #include <rex/assert.h>
@@ -58,8 +59,10 @@ bool SDLAudioDriver::Initialize() {
   sdl_stream_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &desired_spec,
                                           SDLCallback, this);
   if (!sdl_stream_) {
-    REXAPU_ERROR("SDL_OpenAudioDeviceStream() failed: {}", SDL_GetError());
-    return false;
+    REXAPU_ERROR("SDL_OpenAudioDeviceStream() failed: {} - continuing without sound",
+                 SDL_GetError());
+    StartSilentOutput();
+    return true;
   }
 
   SDL_AudioDeviceID sdl_device = SDL_GetAudioStreamDevice(sdl_stream_);
@@ -109,6 +112,28 @@ bool SDLAudioDriver::Initialize() {
   return true;
 }
 
+void SDLAudioDriver::StartSilentOutput() {
+  silent_running_ = true;
+  silent_thread_ = std::thread([this]() {
+    auto frame_duration = std::chrono::microseconds(1000000ull * channel_samples_ /
+                                                    frame_frequency_);
+    auto next = std::chrono::steady_clock::now();
+    while (silent_running_) {
+      next += frame_duration;
+      std::this_thread::sleep_until(next);
+      {
+        std::unique_lock<std::mutex> guard(frames_mutex_);
+        if (frames_queued_.empty()) {
+          continue;
+        }
+        frames_unused_.push(frames_queued_.front());
+        frames_queued_.pop();
+      }
+      semaphore_->Release(1, nullptr);
+    }
+  });
+}
+
 void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
   const auto input_frame = memory_->TranslateVirtual<float*>(frame_ptr);
   float* output_frame;
@@ -139,6 +164,10 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
 }
 
 void SDLAudioDriver::Shutdown() {
+  if (silent_thread_.joinable()) {
+    silent_running_ = false;
+    silent_thread_.join();
+  }
   if (sdl_stream_) {
     SDL_DestroyAudioStream(sdl_stream_);
     sdl_stream_ = nullptr;

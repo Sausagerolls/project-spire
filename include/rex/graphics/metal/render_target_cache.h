@@ -97,6 +97,15 @@ class MetalRenderTargetCache final : public RenderTargetCache {
   void SetNativeSurfaces(const NativeSurface* surfaces);
   bool native_surfaces_active() const;
 
+  // Native surfaces: color resolves to whole textures are also copied to host
+  // textures (snapshots), which the texture cache copies from instead of
+  // loading the resolved guest memory. Returns the snapshot of a resolve to
+  // the address with the format and at least the size, once.
+  id<MTLTexture> TakeResolveSnapshot(uint32_t address, uint32_t width, uint32_t height,
+                                     uint32_t format, MTLPixelFormat pixel_format);
+  uint64_t resolve_snapshots_taken() const { return resolve_snapshots_taken_; }
+  uint64_t resolve_snapshots_made() const { return resolve_snapshots_made_; }
+
   const RenderPassAttachments& last_update_attachments() const { return last_update_attachments_; }
 
   // Ownership transfers of the last update: performed in the guest render pass
@@ -220,6 +229,18 @@ class MetalRenderTargetCache final : public RenderTargetCache {
   bool ResolveNative(const draw_util::ResolveInfo& resolve_info, MetalSharedMemory& shared_memory,
                      MetalTextureCache& texture_cache, uint32_t& written_address_out,
                      uint32_t& written_length_out);
+  void MakeResolveSnapshot(const draw_util::ResolveInfo& resolve_info, MetalRenderTarget& source);
+  struct ResolveSnapshot {
+    uint32_t width;
+    uint32_t height;
+    uint32_t format;
+    id<MTLTexture> texture;
+  };
+  std::unordered_map<uint32_t, ResolveSnapshot> resolve_snapshots_;
+  id<MTLComputePipelineState> snapshot_pipeline_ = nil;
+  id<MTLComputePipelineState> snapshot_ms_pipeline_ = nil;
+  uint64_t resolve_snapshots_taken_ = 0;
+  uint64_t resolve_snapshots_made_ = 0;
   NativeSurface native_bound_[1 + xenos::kMaxColorRenderTargets];
   bool native_bound_valid_ = false;
   struct NativeTarget {

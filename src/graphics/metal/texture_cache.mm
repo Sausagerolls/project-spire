@@ -573,6 +573,28 @@ bool MetalTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
     }
     return false;
   }
+  // A whole texture just resolved by the GPU: copy from the resolve snapshot.
+  if (load_base && (!load_mips || !texture_key.mip_max_level) &&
+      texture_key.dimension == xenos::DataDimension::k2DOrStacked &&
+      texture_key.GetDepthOrArraySize() == 1) {
+    MetalRenderTargetCache& render_target_cache = command_processor_.render_target_cache();
+    id<MTLTexture> snapshot = render_target_cache.TakeResolveSnapshot(
+        texture_key.base_page << 12, texture_key.GetWidth(), texture_key.GetHeight(),
+        uint32_t(texture_key.format), host_format.format);
+    if (snapshot) {
+      id<MTLBlitCommandEncoder> blit = command_processor_.GetBlitEncoder("texture copy");
+      [blit copyFromTexture:snapshot
+                sourceSlice:0
+                sourceLevel:0
+               sourceOrigin:MTLOriginMake(0, 0, 0)
+                 sourceSize:MTLSizeMake(texture_key.GetWidth(), texture_key.GetHeight(), 1)
+                  toTexture:metal_texture.texture()
+           destinationSlice:0
+           destinationLevel:0
+          destinationOrigin:MTLOriginMake(0, 0, 0)];
+      return true;
+    }
+  }
   id<MTLComputePipelineState> pipeline = load_pipelines_[load_shader];
   const LoadShaderInfo& load_shader_info = GetLoadShaderInfo(load_shader);
 

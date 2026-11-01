@@ -18,6 +18,9 @@
 #include <rex/audio/audio_driver.h>
 #include <rex/thread.h>
 
+#include <atomic>
+#include <thread>
+
 #include <SDL3/SDL.h>
 
 namespace rex::audio::sdl {
@@ -39,6 +42,11 @@ class SDLAudioDriver : public AudioDriver {
 
   SDL_AudioStream* sdl_stream_ = nullptr;
   bool sdl_initialized_ = false;
+  // Without a usable host audio device, frames are consumed silently at the
+  // audio rate so the guest's audio thread keeps running.
+  void StartSilentOutput();
+  std::thread silent_thread_;
+  std::atomic<bool> silent_running_{false};
   uint8_t sdl_device_channels_ = 0;
 
   static const uint32_t frame_frequency_ = 48000;
