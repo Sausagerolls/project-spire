@@ -1239,7 +1239,9 @@ bool MetalRenderTargetCache::Resolve(const memory::Memory& memory,
   draw_util::ResolveInfo resolve_info;
   if (!draw_util::GetResolveInfo(register_file(), memory, draw_resolution_scale_x(),
                                  draw_resolution_scale_y(), IsFixedRG16TruncatedToMinus1To1(),
-                                 IsFixedRGBA16TruncatedToMinus1To1(), resolve_info)) {
+                                 IsFixedRGBA16TruncatedToMinus1To1(), resolve_info,
+                                 native_surfaces_active() ? merged_tile_height_ : 0,
+                                 native_surfaces_active() ? merged_height_ : 0)) {
     return false;
   }
   if (!resolve_info.coordinate_info.width_div_8 || !resolve_info.height_div_8) {

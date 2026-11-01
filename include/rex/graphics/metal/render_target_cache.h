@@ -95,6 +95,12 @@ class MetalRenderTargetCache final : public RenderTargetCache {
   };
   // [0] is depth / stencil, [1 + i] is color i.
   void SetNativeSurfaces(const NativeSurface* surfaces);
+  // A predicated tile merged by the game's hooks: its height and the height of
+  // the merged area.
+  void SetMergedTile(uint32_t tile_height, uint32_t merged_height) {
+    merged_tile_height_ = tile_height;
+    merged_height_ = merged_height;
+  }
   bool native_surfaces_active() const;
 
   // Native surfaces: color resolves to whole textures are also copied to host
@@ -254,6 +260,8 @@ class MetalRenderTargetCache final : public RenderTargetCache {
   id<MTLComputePipelineState> snapshot_ms_pipeline_ = nil;
   uint64_t resolve_snapshots_taken_ = 0;
   uint64_t resolve_snapshots_made_ = 0;
+  uint32_t merged_tile_height_ = 0;
+  uint32_t merged_height_ = 0;
   NativeSurface native_bound_[1 + xenos::kMaxColorRenderTargets];
   bool native_bound_valid_ = false;
   struct NativeTarget {

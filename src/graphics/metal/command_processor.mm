@@ -528,9 +528,26 @@ bool MetalCommandProcessor::ExecutePacketType3_XE_NATIVE(memory::RingBuffer* rea
     }
     remaining -= kSurfaceCount * 5;
     render_target_cache_->SetNativeSurfaces(surfaces);
+    // The first tile of a predicated tiling list merged by the game's hooks,
+    // and the height of the merged area.
+    if (remaining >= 3) {
+      merged_tile_scissor_br_ = reader->ReadAndSwap<uint32_t>();
+      merged_scissor_br_ = reader->ReadAndSwap<uint32_t>();
+      render_target_cache_->SetMergedTile(merged_tile_scissor_br_ >> 16, merged_scissor_br_ >> 16);
+      reader->ReadAndSwap<uint32_t>();
+      remaining -= 3;
+    }
   }
   reader->AdvanceRead(remaining * sizeof(uint32_t));
   return true;
+}
+
+void MetalCommandProcessor::ApplyMergedTileScissor() {
+  // The prerecorded packets of the first tile set its bounds as the scissor.
+  if (merged_tile_scissor_br_ &&
+      register_file_->values[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR] == merged_tile_scissor_br_) {
+    register_file_->values[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR] = merged_scissor_br_;
+  }
 }
 
 void MetalCommandProcessor::WriteMemoryFromCommandStream(uint32_t address, uint32_t value,
@@ -1021,6 +1038,7 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
           regs.values[XE_GPU_REG_RB_COLORCONTROL], regs.values[XE_GPU_REG_PA_SU_SC_MODE_CNTL]);
     }
   }
+  ApplyMergedTileScissor();
   // The worker thread has no run loop - without a pool, autoreleased Metal
   // objects (encoders, descriptors, strings) would never be released.
   bool result;
@@ -1671,6 +1689,7 @@ void MetalCommandProcessor::BindDrawResources(id<MTLRenderCommandEncoder> encode
 // Copies and swaps.
 
 bool MetalCommandProcessor::IssueCopy() {
+  ApplyMergedTileScissor();
   GetCommandBuffer();
   uint32_t written_address, written_length;
   bool result;

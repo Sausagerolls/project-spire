@@ -136,6 +136,7 @@ class MetalCommandProcessor : public CommandProcessor {
 
  private:
   bool IssueDrawImpl();
+  void ApplyMergedTileScissor();
   void IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                      uint32_t frontbuffer_height);
   void BeginFrameIfNeeded();
@@ -292,6 +293,10 @@ class MetalCommandProcessor : public CommandProcessor {
   };
   Stats stats_;
   uint64_t frame_rate_draw_count_ = 0;
+  // PA_SC_WINDOW_SCISSOR_BR of the first tile of a merged tiling list and of
+  // the merged area, zero if none (reported by the game's hooks).
+  uint32_t merged_tile_scissor_br_ = 0;
+  uint32_t merged_scissor_br_ = 0;
   uint64_t total_swaps_ = 0;
 };
 
