@@ -123,3 +123,23 @@ the same save at the same spot).
 - One game instance at a time (two instances exhausted memory and froze the Mac).
 - Memory watchdog on every run; no tracing or building while the game runs.
 - No game data or generated code is committed or distributed.
+
+## Predicated tiling (measured 2026-11-01)
+
+The D3D runtime tiles the main scene: 1120x720 at 2x MSAA doesn't fit the EDRAM, so
+the token interpreter `82B9ED28` (render thread `sub_82B9F598`, list runner
+`82B9F280`) replays the frame once per tile (tile count at state +112, index at +52).
+Tile 0 is 1120x576 with window offset 0; tile 1 uses window offset -576 and scissor
+576..720. The command processor fakes EVENT_WRITE_EXT screen extents as full screen,
+so every predicated draw passes in both tiles: about 900 draws run twice per frame,
+and draws executed are about 2x the calls to the D3D draw functions.
+
+Skipping tile 1 (bottom 144 lines missing) gives 36 -> 41 fps uncapped. Merging needs:
+taller surfaces (known only after seeing tile 1), scissor extended in tile 0, tile 1
+draws skipped, and resolves extended to the whole surface, since later passes in
+tile 0 sample textures that tile 1 would only resolve afterwards. Not done yet.
+
+Replacing PM4 entirely must also handle this replay: the D3D draw hooks record into
+command buffers that the interpreter replays, so a hook-only renderer would see each
+draw once, which is what merging needs anyway. Parsing is about 7% of the command
+processor thread, so removing it is about correctness rather than speed.
