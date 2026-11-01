@@ -773,6 +773,9 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     case PM4_XE_SWAP:
       result = ExecutePacketType3_XE_SWAP(reader, packet, count);
       break;
+    case PM4_XE_NATIVE:
+      result = ExecutePacketType3_XE_NATIVE(reader, packet, count);
+      break;
     case PM4_INDIRECT_BUFFER:
     case PM4_INDIRECT_BUFFER_PFD:
       result = ExecutePacketType3_INDIRECT_BUFFER(reader, packet, count);
@@ -968,6 +971,12 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 
   ++counter_;
+  return true;
+}
+
+bool CommandProcessor::ExecutePacketType3_XE_NATIVE(memory::RingBuffer* reader, uint32_t packet,
+                                                    uint32_t count) {
+  reader->AdvanceRead(count * sizeof(uint32_t));
   return true;
 }
 

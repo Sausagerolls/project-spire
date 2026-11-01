@@ -38,6 +38,10 @@ REXCVAR_DEFINE_BOOL(metal_render_target_transfers_in_pass, true, "GPU/Metal",
                     "Perform EDRAM ownership transfers inside the guest render pass of the draw "
                     "when possible")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(metal_native_surfaces, false, "GPU/Metal",
+                    "Keep each render target the game's D3D binds in its own texture (reported "
+                    "by the game's hooks) instead of emulating the EDRAM")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(metal_render_target_transfers, true, "GPU/Metal",
                     "Copy the EDRAM data between render targets aliasing the same EDRAM range "
                     "(disable only for debugging - causes artefacts)")
@@ -581,13 +585,20 @@ bool MetalRenderTargetCache::IsHostDepthEncodingDifferent(
 }
 
 RenderTargetCache::RenderTarget* MetalRenderTargetCache::CreateRenderTarget(RenderTargetKey key) {
+  return CreateMetalRenderTarget(
+      key, key.GetWidth() * draw_resolution_scale_x(),
+      GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples) *
+          draw_resolution_scale_y());
+}
+
+MetalRenderTargetCache::MetalRenderTarget* MetalRenderTargetCache::CreateMetalRenderTarget(
+    RenderTargetKey key, uint32_t width, uint32_t height) {
   MTLTextureDescriptor* descriptor = [[MTLTextureDescriptor alloc] init];
   uint32_t sample_count = uint32_t(1) << uint32_t(key.msaa_samples);
   descriptor.textureType = sample_count > 1 ? MTLTextureType2DMultisample : MTLTextureType2D;
   descriptor.sampleCount = sample_count;
-  descriptor.width = key.GetWidth() * draw_resolution_scale_x();
-  descriptor.height =
-      GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples) * draw_resolution_scale_y();
+  descriptor.width = std::max(width, uint32_t(1));
+  descriptor.height = std::max(height, uint32_t(1));
   descriptor.pixelFormat = key.is_depth ? GetDepthMetalFormat(key.GetDepthFormat())
                                         : GetColorMetalFormat(key.GetColorFormat());
   if (descriptor.pixelFormat == MTLPixelFormatInvalid) {
@@ -613,9 +624,133 @@ RenderTargetCache::RenderTarget* MetalRenderTargetCache::CreateRenderTarget(Rend
   return new MetalRenderTarget(key, texture, stencil_view);
 }
 
+// Native surfaces.
+
+void MetalRenderTargetCache::SetNativeSurfaces(const NativeSurface* surfaces) {
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    native_bound_[i] = surfaces[i];
+  }
+  native_bound_valid_ = true;
+}
+
+bool MetalRenderTargetCache::native_surfaces_active() const {
+  return native_bound_valid_ && REXCVAR_GET(metal_native_surfaces);
+}
+
+MetalRenderTargetCache::MetalRenderTarget* MetalRenderTargetCache::GetNativeRenderTarget(
+    const NativeSurface& surface, bool is_depth) {
+  if (!surface.object) {
+    return nullptr;
+  }
+  auto it = native_targets_.find(surface.object);
+  if (it != native_targets_.end() && it->second.surface == surface &&
+      it->second.render_target) {
+    return it->second.render_target.get();
+  }
+  // The key describes the surface in guest terms (for resolves and clears);
+  // the texture has the size of the surface, not of the EDRAM.
+  auto surface_info = reg::RB_SURFACE_INFO{surface.surface_info};
+  RenderTargetKey key;
+  key.msaa_samples = surface_info.msaa_samples;
+  uint32_t msaa_samples_x_log2 = uint32_t(key.msaa_samples >= xenos::MsaaSamples::k4X);
+  key.pitch_tiles_at_32bpp =
+      ((surface_info.surface_pitch << msaa_samples_x_log2) + (xenos::kEdramTileWidthSamples - 1)) /
+      xenos::kEdramTileWidthSamples;
+  key.is_depth = uint32_t(is_depth);
+  if (is_depth) {
+    auto depth_info = reg::RB_DEPTH_INFO{surface.info};
+    key.base_tiles = depth_info.depth_base;
+    key.resource_format = uint32_t(depth_info.depth_format);
+  } else {
+    auto color_info = reg::RB_COLOR_INFO{surface.info};
+    key.base_tiles = color_info.color_base;
+    key.resource_format = uint32_t(xenos::GetStorageColorFormat(color_info.color_format));
+    if (key.Is64bpp()) {
+      key.pitch_tiles_at_32bpp <<= 1;
+    }
+  }
+  uint32_t width = (surface.size >> 18) + 1;
+  uint32_t height = ((surface.size >> 3) & 0x7FFF) + 1;
+  MetalRenderTarget* render_target = CreateMetalRenderTarget(
+      key, width * draw_resolution_scale_x(), height * draw_resolution_scale_y());
+  NativeTarget& target = native_targets_[surface.object];
+  target.surface = surface;
+  target.render_target.reset(render_target);
+  return render_target;
+}
+
+bool MetalRenderTargetCache::UpdateNative(bool is_rasterization_done,
+                                          reg::RB_DEPTHCONTROL normalized_depth_control,
+                                          uint32_t normalized_color_mask) {
+  RenderPassAttachments attachments;
+  RenderPassFormats formats;
+  formats.sample_count = uint32_t(1) << uint32_t(register_file().Get<reg::RB_SURFACE_INFO>().msaa_samples);
+  uint32_t width = 0, height = 0;
+  auto add = [&](MetalRenderTarget* render_target, int32_t color_index) {
+    if (!render_target) {
+      return;
+    }
+    id<MTLTexture> texture = render_target->texture();
+    if (texture.sampleCount != formats.sample_count) {
+      return;
+    }
+    if (color_index < 0) {
+      attachments.depth = texture;
+      formats.depth = texture.pixelFormat;
+    } else {
+      attachments.color[color_index] = texture;
+      formats.color[color_index] = texture.pixelFormat;
+    }
+    width = width ? std::min(width, uint32_t(texture.width)) : uint32_t(texture.width);
+    height = height ? std::min(height, uint32_t(texture.height)) : uint32_t(texture.height);
+  };
+  if (is_rasterization_done) {
+    bool depth_used = normalized_depth_control.z_enable || normalized_depth_control.stencil_enable;
+    if (depth_used) {
+      add(GetNativeRenderTarget(native_bound_[0], true), -1);
+    }
+    bool color_used[xenos::kMaxColorRenderTargets];
+    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+      color_used[i] = ((normalized_color_mask >> (i * 4)) & 0xF) != 0;
+      if (color_used[i]) {
+        add(GetNativeRenderTarget(native_bound_[1 + i], false), int32_t(i));
+      }
+    }
+    // Also keep the bound surfaces this draw doesn't use attached (nothing is
+    // written to them - the pipeline masks them out), so draws switching depth
+    // testing or color writes stay in one render pass. Only if they don't
+    // shrink the render area.
+    auto add_unused = [&](MetalRenderTarget* render_target, int32_t color_index) {
+      if (!render_target || !width) {
+        return;
+      }
+      id<MTLTexture> texture = render_target->texture();
+      if (texture.width >= width && texture.height >= height) {
+        add(render_target, color_index);
+      }
+    };
+    if (!depth_used) {
+      add_unused(GetNativeRenderTarget(native_bound_[0], true), -1);
+    }
+    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+      if (!color_used[i]) {
+        add_unused(GetNativeRenderTarget(native_bound_[1 + i], false), int32_t(i));
+      }
+    }
+  }
+  last_update_attachments_ = attachments;
+  last_update_formats_ = formats;
+  last_update_width_ = width;
+  last_update_height_ = height;
+  return true;
+}
+
 bool MetalRenderTargetCache::Update(bool is_rasterization_done,
                                     reg::RB_DEPTHCONTROL normalized_depth_control,
                                     uint32_t normalized_color_mask, const Shader& vertex_shader) {
+  if (native_surfaces_active()) {
+    return UpdateNative(is_rasterization_done, normalized_depth_control, normalized_color_mask);
+  }
   if (!RenderTargetCache::Update(is_rasterization_done, normalized_depth_control,
                                  normalized_color_mask, vertex_shader)) {
     return false;
@@ -1102,6 +1237,10 @@ bool MetalRenderTargetCache::Resolve(const memory::Memory& memory,
   if (!resolve_info.coordinate_info.width_div_8 || !resolve_info.height_div_8) {
     return true;
   }
+  if (native_surfaces_active()) {
+    return ResolveNative(resolve_info, shared_memory, texture_cache, written_address_out,
+                         written_length_out);
+  }
 
   bool copied = false;
   if (resolve_info.copy_dest_extent_length) {
@@ -1172,10 +1311,99 @@ bool MetalRenderTargetCache::Resolve(const memory::Memory& memory,
   return copied;
 }
 
+bool MetalRenderTargetCache::ResolveNative(const draw_util::ResolveInfo& resolve_info,
+                                           MetalSharedMemory& shared_memory,
+                                           MetalTextureCache& texture_cache,
+                                           uint32_t& written_address_out,
+                                           uint32_t& written_length_out) {
+  // The source is the bound surface selected by the copy (color index or
+  // depth), at the EDRAM base the guest addresses it by.
+  auto rb_copy_control = register_file().Get<reg::RB_COPY_CONTROL>();
+  uint32_t source_select = uint32_t(rb_copy_control.copy_src_select);
+  bool source_is_depth = source_select >= xenos::kMaxColorRenderTargets;
+  MetalRenderTarget* source = GetNativeRenderTarget(
+      native_bound_[source_is_depth ? 0 : 1 + source_select], source_is_depth);
+
+  bool copied = false;
+  if (resolve_info.copy_dest_extent_length && source) {
+    draw_util::ResolveCopyShaderConstants copy_shader_constants;
+    uint32_t copy_group_count_x, copy_group_count_y;
+    draw_util::ResolveCopyShaderIndex copy_shader =
+        resolve_info.GetCopyShader(draw_resolution_scale_x(), draw_resolution_scale_y(),
+                                   copy_shader_constants, copy_group_count_x, copy_group_count_y);
+    if (copy_shader != draw_util::ResolveCopyShaderIndex::kUnknown &&
+        resolve_copy_pipelines_[size_t(copy_shader)]) {
+      uint32_t dump_base, dump_row_length_used, dump_rows, dump_pitch;
+      resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+      // The surface owns the whole area of the resolve.
+      dump_rectangles_.clear();
+      if (dump_row_length_used && dump_rows) {
+        dump_rectangles_.emplace_back(source, 0, dump_rows, 0,
+                                      std::min(dump_row_length_used, dump_pitch));
+      }
+      if (!DumpRenderTargetRectangles(dump_base, dump_row_length_used, dump_rows, dump_pitch)) {
+        return false;
+      }
+      if (shared_memory.RequestRange(resolve_info.copy_dest_extent_start,
+                                     resolve_info.copy_dest_extent_length)) {
+        id<MTLComputeCommandEncoder> encoder = command_processor_.GetComputeEncoder("resolve");
+        [encoder setComputePipelineState:resolve_copy_pipelines_[size_t(copy_shader)]];
+        [encoder setBuffer:edram_buffer_ offset:0 atIndex:UtilityBuffer(0, 0)];
+        NSUInteger dest_offset = resolve_info.copy_dest_base;
+        [encoder setBuffer:shared_memory.buffer() offset:dest_offset atIndex:UtilityBuffer(1, 0)];
+        copy_shader_constants.dest_base -= uint32_t(dest_offset);
+        [encoder setBytes:&copy_shader_constants
+                   length:sizeof(copy_shader_constants)
+                  atIndex:kMslBufferPushConstants];
+        [encoder dispatchThreadgroups:MTLSizeMake(copy_group_count_x, copy_group_count_y, 1)
+                threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
+                                          resolve_info.copy_dest_extent_length);
+        command_processor_.MarkGpuWrittenInSubmission(resolve_info.copy_dest_extent_start,
+                                                      resolve_info.copy_dest_extent_length);
+        written_address_out = resolve_info.copy_dest_extent_start;
+        written_length_out = resolve_info.copy_dest_extent_length;
+        copied = true;
+      }
+    }
+  } else {
+    copied = true;
+  }
+
+  // Clears of the bound surfaces, in their own pixel coordinates.
+  Transfer::Rectangle clear_rectangle;
+  clear_rectangle.x_pixels = uint32_t(resolve_info.coordinate_info.edram_offset_x_div_8) << 3;
+  clear_rectangle.y_pixels = uint32_t(resolve_info.coordinate_info.edram_offset_y_div_8) << 3;
+  clear_rectangle.width_pixels = uint32_t(resolve_info.coordinate_info.width_div_8) << 3;
+  clear_rectangle.height_pixels = uint32_t(resolve_info.height_div_8) << 3;
+  if (resolve_info.IsClearingDepth()) {
+    if (MetalRenderTarget* depth = GetNativeRenderTarget(native_bound_[0], true)) {
+      ClearRenderTarget(depth, resolve_info.rb_depth_clear, clear_rectangle);
+    }
+  }
+  if (resolve_info.IsClearingColor()) {
+    uint32_t color_index = source_is_depth ? 0 : source_select;
+    if (MetalRenderTarget* color =
+            GetNativeRenderTarget(native_bound_[1 + color_index], false)) {
+      ClearRenderTarget(color,
+                        resolve_info.rb_color_clear |
+                            (uint64_t(resolve_info.rb_color_clear_lo) << 32),
+                        clear_rectangle);
+    }
+  }
+  return copied;
+}
+
 bool MetalRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used,
                                                uint32_t dump_rows, uint32_t dump_pitch) {
   GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
                                  dump_rectangles_);
+  return DumpRenderTargetRectangles(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+}
+
+bool MetalRenderTargetCache::DumpRenderTargetRectangles(uint32_t dump_base,
+                                                        uint32_t dump_row_length_used,
+                                                        uint32_t dump_rows, uint32_t dump_pitch) {
   if (dump_rectangles_.empty()) {
     return true;
   }

@@ -10,6 +10,7 @@
 // Objective-C++ only.
 
 #include <array>
+#include <memory>
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
@@ -76,6 +77,25 @@ class MetalRenderTargetCache final : public RenderTargetCache {
 
   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
               uint32_t normalized_color_mask, const Shader& vertex_shader) override;
+
+  // Native surfaces: render targets bound by the game's D3D (reported by game
+  // hooks through PM4_XE_NATIVE), each kept in its own host texture, instead
+  // of emulating the EDRAM with ownership transfers.
+  struct NativeSurface {
+    uint32_t object = 0;        // Guest address of the D3D surface, 0 if none.
+    uint32_t surface_info = 0;  // RB_SURFACE_INFO.
+    uint32_t info = 0;          // RB_COLOR_INFO or RB_DEPTH_INFO.
+    uint32_t size = 0;          // Packed (width - 1) << 18 | (height - 1) << 3.
+    uint32_t format = 0;        // D3DFORMAT.
+    bool operator==(const NativeSurface& other) const {
+      return object == other.object && surface_info == other.surface_info &&
+             info == other.info && size == other.size && format == other.format;
+    }
+    bool operator!=(const NativeSurface& other) const { return !(*this == other); }
+  };
+  // [0] is depth / stencil, [1 + i] is color i.
+  void SetNativeSurfaces(const NativeSurface* surfaces);
+  bool native_surfaces_active() const;
 
   const RenderPassAttachments& last_update_attachments() const { return last_update_attachments_; }
 
@@ -191,9 +211,29 @@ class MetalRenderTargetCache final : public RenderTargetCache {
     return a.key != b.key;
   }
 
+  MetalRenderTarget* CreateMetalRenderTarget(RenderTargetKey key, uint32_t width,
+                                             uint32_t height);
+  // Native surfaces.
+  MetalRenderTarget* GetNativeRenderTarget(const NativeSurface& surface, bool is_depth);
+  bool UpdateNative(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
+                    uint32_t normalized_color_mask);
+  bool ResolveNative(const draw_util::ResolveInfo& resolve_info, MetalSharedMemory& shared_memory,
+                     MetalTextureCache& texture_cache, uint32_t& written_address_out,
+                     uint32_t& written_length_out);
+  NativeSurface native_bound_[1 + xenos::kMaxColorRenderTargets];
+  bool native_bound_valid_ = false;
+  struct NativeTarget {
+    NativeSurface surface;
+    std::unique_ptr<MetalRenderTarget> render_target;
+  };
+  std::unordered_map<uint32_t, NativeTarget> native_targets_;
+
   id<MTLComputePipelineState> GetDumpPipeline(DumpPipelineKey key);
   bool DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,
                          uint32_t dump_pitch);
+  // Dumps dump_rectangles_.
+  bool DumpRenderTargetRectangles(uint32_t dump_base, uint32_t dump_row_length_used,
+                                  uint32_t dump_rows, uint32_t dump_pitch);
   void PerformTransfers(uint32_t render_target_count, RenderTarget* const* render_targets,
                         const std::vector<Transfer>* render_target_transfers,
                         const Transfer::Rectangle* cutout = nullptr);

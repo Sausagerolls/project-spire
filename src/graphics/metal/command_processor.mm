@@ -322,6 +322,33 @@ void MetalCommandProcessor::OnPrimaryBufferEnd() {
   }
 }
 
+bool MetalCommandProcessor::ExecutePacketType3_XE_NATIVE(memory::RingBuffer* reader,
+                                                         uint32_t packet, uint32_t count) {
+  if (!count) {
+    return true;
+  }
+  uint32_t subcommand = reader->ReadAndSwap<uint32_t>();
+  uint32_t remaining = count - 1;
+  // Subcommand 1: the D3D surfaces bound (depth / stencil, then 4 colors), 5
+  // dwords each: object, RB_SURFACE_INFO, RB_COLOR_INFO / RB_DEPTH_INFO, size,
+  // D3DFORMAT.
+  constexpr uint32_t kSurfaceCount = 1 + xenos::kMaxColorRenderTargets;
+  if (subcommand == 1 && remaining >= kSurfaceCount * 5) {
+    MetalRenderTargetCache::NativeSurface surfaces[kSurfaceCount];
+    for (uint32_t i = 0; i < kSurfaceCount; ++i) {
+      surfaces[i].object = reader->ReadAndSwap<uint32_t>();
+      surfaces[i].surface_info = reader->ReadAndSwap<uint32_t>();
+      surfaces[i].info = reader->ReadAndSwap<uint32_t>();
+      surfaces[i].size = reader->ReadAndSwap<uint32_t>();
+      surfaces[i].format = reader->ReadAndSwap<uint32_t>();
+    }
+    remaining -= kSurfaceCount * 5;
+    render_target_cache_->SetNativeSurfaces(surfaces);
+  }
+  reader->AdvanceRead(remaining * sizeof(uint32_t));
+  return true;
+}
+
 void MetalCommandProcessor::WriteMemoryFromCommandStream(uint32_t address, uint32_t value) {
   // The write must become visible to the guest only after the GPU work
   // encoded so far: the current command buffer if there is one, otherwise the

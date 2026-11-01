@@ -192,6 +192,10 @@ class CommandProcessor {
   bool ExecutePacketType3_NOP(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
   bool ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
   bool ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
+  // Host-only packet with D3D-level information inserted by game hooks (the
+  // first dword is the subcommand). Skipped by default.
+  virtual bool ExecutePacketType3_XE_NATIVE(memory::RingBuffer* reader, uint32_t packet,
+                                            uint32_t count);
   bool ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* reader, uint32_t packet,
                                           uint32_t count);
   bool ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reader, uint32_t packet, uint32_t count);

@@ -116,6 +116,8 @@ class MetalCommandProcessor : public CommandProcessor {
   void OnPrimaryBufferEnd() override;
 
   void WriteMemoryFromCommandStream(uint32_t address, uint32_t value) override;
+  bool ExecutePacketType3_XE_NATIVE(memory::RingBuffer* reader, uint32_t packet,
+                                    uint32_t count) override;
   bool AwaitCommandStreamMemoryWrites() override;
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
