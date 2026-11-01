@@ -47,6 +47,51 @@ PM4 type-3 headers inline -> pm4.txt).
   in `sub_82219418`. Indirect buffers (precompiled command buffers) in
   `ProcessAndProcessAndProcess816_82286248`.
 
+## D3D device layout (reversed so far)
+
+The device (`r3` of the draw functions; the frame limiter's `limit`) mirrors the
+Xenos registers and flushes dirty ones before each draw, like the Xbox 360 D3D
+runtime. Offsets in bytes:
+
+| Offset | Contents |
+|---|---|
+| +0 .. +32 | five 64-bit dirty masks (constants VS, constants PS, register groups, fetch constants, misc) |
+| +40 | mask of registers that need special handling (`822155E0`) |
+| +48 / +56 | command buffer write pointer / limit (`821E8D20` makes space) |
+| +1152 | fetch constants, register 0x4800, 32 x 6 dwords |
+| +1920 | ALU constants, register 0x4000 (vertex, 256 x float4) |
+| +6016 | ALU constants, register 0x4400 (pixel, 256 x float4) |
+| +10112 | registers 0x4900.. (boolean / loop constants) |
+| +10368 | registers 0x2000.. (RB_SURFACE_INFO, RB_COLOR_INFO, RB_DEPTH_INFO, ...) |
+| +10444 | registers 0x2100.. (VGT_MAX_VTX_INDX, RB_COLOR_MASK, ...) |
+| +10528 | registers 0x2180.. (SQ_WRAPPING, ...) |
+| +10548 | registers 0x2200.. (RB_DEPTHCONTROL, RB_BLENDCONTROL0, RB_COLORCONTROL, PA_*) |
+| +10596 | registers 0x2280.. (PA_SU_POINT_SIZE, ...) |
+| +10680 | registers 0x2300.. (RB_COPY_* resolve registers at +10776) |
+| +10832 | registers 0x2380.. |
+| +10896 / +10908 | GPU progress counter pointer / frame deadline (frame limiter) |
+| +10940 .. +10943 | device flags |
+| +12440 .. +12452 | current color render target surfaces [4] |
+| +12456 | current depth/stencil surface |
+| +12728 .. | previously flushed render targets (compared in `822155E0`) |
+
+Identified functions:
+
+| Function | Role |
+|---|---|
+| `ProcessAndProcessAndProcess522_8221C908` | write dirty register runs: (dev, mask, base register, shadow) as type-0 packets |
+| `ProcessAndProcessAndProcess558_8221D2E0` | write dirty fetch constants (0x4800) |
+| `ProcessAndProcessAndProcess532_8221DF98` | write dirty ALU constants (0x4000 / 0x4400) |
+| `ProcessAndProcessAndProcess557_8221B140` | shaders (IM_LOAD) and their constants |
+| `ProcessAndProcessAndProcess612_822155E0` | render target / surface state flush |
+| `FastHelper_821E8D20` | command buffer make-space (kicks the ring, frame limiter) |
+| `ProcessAndProcessAndProcess806_822069C0` | `D3DDevice_Resolve` (flags & 7 = source: 0-3 color, 4 depth) |
+| `ProcessAndProcessAndProcess567_82286508` | likely `SetRenderTarget(dev, index, surface)` |
+| `ProcessAndProcessAndProcess811_82264550` | likely `SetDepthStencilSurface` |
+| `sub_82B91A60` | likely `GetRenderTarget` |
+| `sub_831BFFB0` | sets all surfaces at once (state restore / reset) |
+| `sub_8221E0F0` and five siblings | indexed draws (DRAW_INDX after the dirty flush) |
+
 ## Approach
 
 Host implementations replace guest functions (the existing hotfunc override
