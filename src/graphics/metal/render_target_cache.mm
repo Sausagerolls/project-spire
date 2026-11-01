@@ -38,7 +38,7 @@ REXCVAR_DEFINE_BOOL(metal_render_target_transfers_in_pass, true, "GPU/Metal",
                     "Perform EDRAM ownership transfers inside the guest render pass of the draw "
                     "when possible")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_BOOL(metal_native_surfaces, false, "GPU/Metal",
+REXCVAR_DEFINE_BOOL(metal_native_surfaces, true, "GPU/Metal",
                     "Keep each render target the game's D3D binds in its own texture (reported "
                     "by the game's hooks) instead of emulating the EDRAM")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
