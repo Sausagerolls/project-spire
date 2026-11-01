@@ -53,6 +53,10 @@ REXCVAR_DEFINE_BOOL(metal_reorder_texture_loads, true, "GPU/Metal",
                     "Load textures that don't depend on GPU work of the current submission in a "
                     "command buffer submitted before it, so loads don't split render passes")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(metal_log_draws, 0, "GPU/Metal",
+                     "Log the next N draws with the registers the command processor received "
+                     "(for comparison with the game's D3D-level draw capture)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(metal_sync_submissions, false, "GPU/Metal",
                     "Wait for the GPU after every submission (debugging CPU / GPU memory hazards)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -710,6 +714,28 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
                                       bool major_mode_explicit) {
   ++stats_.draws_requested;
   ++frame_rate_draw_count_;
+  {
+    static int32_t last_requested = 0, remaining = 0;
+    int32_t requested = REXCVAR_GET(metal_log_draws);
+    if (requested != last_requested) {
+      last_requested = requested;
+      remaining = requested;
+    }
+    if (remaining > 0) {
+      --remaining;
+      const RegisterFile& regs = *register_file_;
+      REXGPU_INFO(
+          "[cp] draw initiator={:08X} index_base={:08X} index_size={:08X} "
+          "RB_SURFACE_INFO={:08X} RB_COLOR_INFO={:08X} RB_DEPTH_INFO={:08X} "
+          "RB_DEPTHCONTROL={:08X} RB_BLENDCONTROL0={:08X} RB_COLORCONTROL={:08X} "
+          "PA_SU_SC_MODE_CNTL={:08X}",
+          regs.values[XE_GPU_REG_VGT_DRAW_INITIATOR], regs.values[XE_GPU_REG_VGT_DMA_BASE],
+          regs.values[XE_GPU_REG_VGT_DMA_SIZE], regs.values[XE_GPU_REG_RB_SURFACE_INFO],
+          regs.values[XE_GPU_REG_RB_COLOR_INFO], regs.values[XE_GPU_REG_RB_DEPTH_INFO],
+          regs.values[XE_GPU_REG_RB_DEPTHCONTROL], regs.values[XE_GPU_REG_RB_BLENDCONTROL0],
+          regs.values[XE_GPU_REG_RB_COLORCONTROL], regs.values[XE_GPU_REG_PA_SU_SC_MODE_CNTL]);
+    }
+  }
   bool result = IssueDrawImpl();
   if (!result) {
     ++stats_.draws_failed;
