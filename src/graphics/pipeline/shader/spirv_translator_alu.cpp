@@ -24,6 +24,10 @@ namespace rex::graphics {
 
 spv::Id SpirvShaderTranslator::ZeroIfAnyOperandIsZero(spv::Id value, spv::Id operand_0_abs,
                                                       spv::Id operand_1_abs) {
+  if (is_vertex_shader() ? !features_.sm3_zero_multiplication_vertex
+                         : !features_.sm3_zero_multiplication_pixel) {
+    return value;
+  }
   EnsureBuildPointAvailable();
   int num_components = builder_->getNumComponents(value);
   assert_true(builder_->getNumComponents(operand_0_abs) == num_components);

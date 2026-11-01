@@ -120,6 +120,7 @@ void SpirvShaderTranslator::Reset() {
   grid_domain_location_y_ = spv::NoResult;
   input_patch_control_point_indices_ = spv::NoResult;
   input_point_coordinates_ = spv::NoResult;
+  input_point_coordinates_native_ = false;
   input_fragment_coordinates_ = spv::NoResult;
   input_front_facing_ = spv::NoResult;
   input_sample_id_ = spv::NoResult;
@@ -127,6 +128,7 @@ void SpirvShaderTranslator::Reset() {
   std::fill(input_output_interpolators_.begin(), input_output_interpolators_.end(), spv::NoResult);
   output_point_coordinates_ = spv::NoResult;
   output_point_size_ = spv::NoResult;
+  output_native_point_size_ = spv::NoResult;
   output_per_vertex_member_count_ = 0;
   output_per_vertex_member_clip_distance_ = UINT32_MAX;
   output_per_vertex_member_cull_distance_ = UINT32_MAX;
@@ -1696,7 +1698,15 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
 
   Modification shader_modification = GetSpirvShaderModification();
 
-  if (shader_modification.vertex.output_point_parameters) {
+  if (features_.native_point_sprites &&
+      shader_modification.vertex.host_vertex_shader_type ==
+          Shader::HostVertexShaderType::kPointListAsTriangleStrip) {
+    output_native_point_size_ = builder_->createVariable(
+        spv::NoPrecision, spv::StorageClassOutput, type_float_, "gl_PointSize");
+    builder_->addDecoration(output_native_point_size_, spv::DecorationBuiltIn,
+                            spv::BuiltInPointSize);
+    main_interface_.push_back(output_native_point_size_);
+  } else if (shader_modification.vertex.output_point_parameters) {
     if (shader_modification.vertex.host_vertex_shader_type ==
         Shader::HostVertexShaderType::kPointListAsTriangleStrip) {
       // Create the point coordinates output.
@@ -2099,7 +2109,10 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
            IsSpirvTessellationGridShader())) {
         spv::Id const_uint_2 = builder_->makeUintConstant(2);
         spv::Id two_triangle_strip_vertex_index = vertex_index;
-        if (!IsSpirvTessellationGridShader()) {
+        bool native_points = features_.native_point_sprites &&
+                             host_vertex_shader_type ==
+                                 Shader::HostVertexShaderType::kPointListAsTriangleStrip;
+        if (!IsSpirvTessellationGridShader() && !native_points) {
           // Extract the primitive index from the two-triangle strip vertex
           // index.
           vertex_index = builder_->createBinOp(spv::OpShiftRightLogical, type_uint_,
@@ -2757,8 +2770,39 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
   }
 
   // Expand the point sprite.
-  if (shader_modification.vertex.host_vertex_shader_type ==
-      Shader::HostVertexShaderType::kPointListAsTriangleStrip) {
+  if (output_native_point_size_ != spv::NoResult) {
+    // Host point: the diameter in guest pixels, with the override from the
+    // vertex shader if provided (host points are square - the larger axis).
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantPointConstantDiameter));
+    spv::Id point_guest_diameter = builder_->createLoad(
+        builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                    id_vector_temp_),
+        spv::NoPrecision);
+    spv::Id point_diameter = builder_->createBinBuiltinCall(
+        type_float_, ext_inst_glsl_std_450_, GLSLstd450NMax,
+        builder_->createCompositeExtract(point_guest_diameter, type_float_, 0),
+        builder_->createCompositeExtract(point_guest_diameter, type_float_, 1));
+    if (current_shader().writes_point_size_edge_flag_kill_vertex() & 0b001) {
+      assert_true(var_main_point_size_edge_flag_kill_vertex_ != spv::NoResult);
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(const_int_0_);
+      spv::Id point_vertex_diameter = builder_->createLoad(
+          builder_->createAccessChain(spv::StorageClassFunction,
+                                      var_main_point_size_edge_flag_kill_vertex_, id_vector_temp_),
+          spv::NoPrecision);
+      point_diameter = builder_->createTriOp(
+          spv::OpSelect, type_float_,
+          builder_->createBinOp(spv::OpFOrdGreaterThanEqual, type_bool_, point_vertex_diameter,
+                                const_float_0_),
+          point_vertex_diameter, point_diameter);
+    }
+    point_diameter = builder_->createBinBuiltinCall(
+        type_float_, ext_inst_glsl_std_450_, GLSLstd450NMax, point_diameter,
+        builder_->makeFloatConstant(1.0f));
+    builder_->createStore(point_diameter, output_native_point_size_);
+  } else if (shader_modification.vertex.host_vertex_shader_type ==
+             Shader::HostVertexShaderType::kPointListAsTriangleStrip) {
     // Top-left, bottom-left, top-right, bottom-right order (chosen arbitrarily,
     // simply based on counterclockwise meaning front with
     // frontFace = VkFrontFace(0), but faceness is ignored for non-polygon
@@ -2998,7 +3042,16 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
     }
 
     // Point coordinate input.
-    if (shader_modification.pixel.param_gen_point) {
+    if (shader_modification.pixel.param_gen_point && features_.native_point_sprites) {
+      if (param_gen_needed) {
+        input_point_coordinates_ = builder_->createVariable(
+            spv::NoPrecision, spv::StorageClassInput, type_float2_, "gl_PointCoord");
+        builder_->addDecoration(input_point_coordinates_, spv::DecorationBuiltIn,
+                                spv::BuiltInPointCoord);
+        main_interface_.push_back(input_point_coordinates_);
+        input_point_coordinates_native_ = true;
+      }
+    } else if (shader_modification.pixel.param_gen_point) {
       if (param_gen_needed) {
         input_point_coordinates_ = builder_->createVariable(
             spv::NoPrecision, spv::StorageClassInput, type_float2_, "xe_in_point_coordinates");

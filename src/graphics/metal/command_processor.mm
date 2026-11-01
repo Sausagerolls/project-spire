@@ -62,6 +62,18 @@ REXCVAR_DEFINE_INT32(metal_log_draws, 0, "GPU/Metal",
                      "Log the next N draws with the registers the command processor received "
                      "(for comparison with the game's D3D-level draw capture)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(metal_skip_vertex_shader, "", "GPU/Metal",
+                      "Skip draws with the vertex shader of this ucode hash (16 hex digits) - for "
+                      "measuring the cost of a shader")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(metal_skip_pixel_shader, "", "GPU/Metal",
+                      "Skip draws with the pixel shader of this ucode hash (16 hex digits)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DECLARE(bool, metal_native_points);
+REXCVAR_DEFINE_BOOL(metal_tessellation_adaptive_factors, false, "GPU/Metal",
+                    "Use the per-edge factors of adaptive patches with hardware tessellation "
+                    "(currently leaves holes in Fable II's terrain; off uses the maximum factor)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(metal_sync_submissions, false, "GPU/Metal",
                     "Wait for the GPU after every submission (debugging CPU / GPU memory hazards)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -402,6 +414,9 @@ bool MetalCommandProcessor::DrawHardwareTessellated(
         float value;
         std::memcpy(&value, &bits, sizeof(value));
         values[i] = std::min(std::max(value + 1.0f, factor_min), factor_max);
+        if (!REXCVAR_GET(metal_tessellation_adaptive_factors)) {
+          values[i] = factor_max;
+        }
       }
       edge[0] = values[3];
       edge[1] = values[0];
@@ -1002,6 +1017,19 @@ bool MetalCommandProcessor::IssueDrawImpl() {
     return draw_fail("no vertex shader");
   }
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
+  {
+    const std::string& skip = REXCVAR_GET(metal_skip_vertex_shader);
+    if (!skip.empty() &&
+        std::strtoull(skip.c_str(), nullptr, 16) == vertex_shader->ucode_data_hash()) {
+      return true;
+    }
+    const std::string& skip_pixel = REXCVAR_GET(metal_skip_pixel_shader);
+    Shader* active_pixel = active_pixel_shader();
+    if (!skip_pixel.empty() && active_pixel &&
+        std::strtoull(skip_pixel.c_str(), nullptr, 16) == active_pixel->ucode_data_hash()) {
+      return true;
+    }
+  }
   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
 
   bool primitive_polygonal = draw_util::IsPrimitivePolygonal(regs);
@@ -1200,6 +1228,13 @@ bool MetalCommandProcessor::IssueDrawImpl() {
     if (!DrawHardwareTessellated(encoder, primitive_processing_result)) {
       return draw_fail("hardware tessellation");
     }
+  } else if (REXCVAR_GET(metal_native_points) &&
+             host_vertex_shader_type == Shader::HostVertexShaderType::kPointListAsTriangleStrip) {
+    // One host point per guest point - the vertex shader loads the guest index
+    // itself if there is an index buffer.
+    [encoder drawPrimitives:MTLPrimitiveTypePoint
+                vertexStart:0
+                vertexCount:primitive_processing_result.guest_draw_vertex_count];
   } else if (tessellation_grid_factor) {
     uint32_t patch_count =
         primitive_processing_result.tessellation_mode == xenos::TessellationMode::kAdaptive

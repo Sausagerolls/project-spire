@@ -25,6 +25,17 @@
 #include <rex/math.h>
 #include <rex/ui/metal/metal_provider.h>
 
+REXCVAR_DEFINE_BOOL(metal_sm3_multiplication_vertex, true, "GPU/Metal",
+                    "Emulate Shader Model 3 multiplication (0 * infinity = 0) in vertex shaders "
+                    "(costly; off uses plain multiplication)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(metal_sm3_multiplication_pixel, true, "GPU/Metal",
+                    "Emulate Shader Model 3 multiplication (0 * infinity = 0) in pixel shaders")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(metal_native_points, true, "GPU/Metal",
+                    "Draw point sprites as Metal points (the vertex shader runs once per point) "
+                    "instead of expanding each to 4 vertices in the vertex shader")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(metal_hardware_tessellation, true, "GPU/Metal",
                     "Tessellate quad patches with the Metal tessellator and per-patch factors "
                     "instead of drawing a grid at the maximum factor")
@@ -157,6 +168,9 @@ bool MetalPipelineCache::Initialize() {
   features.image_view_format_swizzle = true;
   features.demote_to_helper_invocation = true;
   features.tessellation_grid_indexed = true;
+  features.native_point_sprites = REXCVAR_GET(metal_native_points);
+  features.sm3_zero_multiplication_vertex = REXCVAR_GET(metal_sm3_multiplication_vertex);
+  features.sm3_zero_multiplication_pixel = REXCVAR_GET(metal_sm3_multiplication_pixel);
   // Metal supports 2x MSAA natively.
   shader_translator_ = std::make_unique<SpirvShaderTranslator>(features, true, true, false);
   return true;
@@ -327,9 +341,15 @@ id<MTLRenderPipelineState> MetalPipelineCache::GetPipeline(
   bool tessellation_hardware =
       !tessellation_grid && Shader::IsHostVertexShaderTypeDomain(Shader::HostVertexShaderType(
                                 vertex_modification.vertex.host_vertex_shader_type));
+  bool native_points = REXCVAR_GET(metal_native_points) &&
+                       Shader::HostVertexShaderType(
+                           vertex_modification.vertex.host_vertex_shader_type) ==
+                           Shader::HostVertexShaderType::kPointListAsTriangleStrip;
   MTLPrimitiveTopologyClass topology_class;
   if (tessellation_grid || tessellation_hardware) {
     topology_class = MTLPrimitiveTopologyClassTriangle;
+  } else if (native_points) {
+    topology_class = MTLPrimitiveTopologyClassPoint;
   } else {
     switch (primitive_processing_result.host_primitive_type) {
       case xenos::PrimitiveType::kPointList:
@@ -398,6 +418,8 @@ id<MTLRenderPipelineState> MetalPipelineCache::GetPipeline(
         vertex_modification.vertex.tessellation_mode == uint32_t(xenos::TessellationMode::kDiscrete)
             ? MTLTessellationPartitionModeInteger
             : MTLTessellationPartitionModeFractionalEven;
+    // The domain coordinates are flipped vertically for the upper-left origin of
+    // the guest (Vulkan-style) domain, reversing the winding.
     descriptor.tessellationOutputWindingOrder = MTLWindingCounterClockwise;
     MTLVertexDescriptor* vertex_descriptor = [MTLVertexDescriptor vertexDescriptor];
     vertex_descriptor.attributes[0].format = MTLVertexFormatFloat4;

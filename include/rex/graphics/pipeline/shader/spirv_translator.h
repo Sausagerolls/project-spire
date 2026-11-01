@@ -415,6 +415,16 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // Tessellation drawn as a grid: the host draws an indexed grid of
     // (factor + 1)^2 shared vertices per patch instead of 6 vertices per quad.
     bool tessellation_grid_indexed = false;
+
+    // Shader Model 3 multiplication (zero times anything is zero, even
+    // infinity or NaN) per shader stage. Without it, multiplications are plain
+    // host multiplications, which is much cheaper on some hosts.
+    bool sm3_zero_multiplication_vertex = true;
+    // Point lists drawn as host points (PointSize from the vertex shader,
+    // PointCoord in the pixel shader) for kPointListAsTriangleStrip instead of
+    // expanding each point to 4 vertices in the vertex shader.
+    bool native_point_sprites = false;
+    bool sm3_zero_multiplication_pixel = true;
   };
 
   SpirvShaderTranslator(const Features& features, bool native_2x_msaa_with_attachments,
@@ -939,6 +949,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id input_patch_control_point_indices_;
   // PS, only when needed - float2.
   spv::Id input_point_coordinates_;
+  // Host point coordinates builtin (native point sprites).
+  bool input_point_coordinates_native_;
   // PS, only when needed - float4.
   spv::Id input_fragment_coordinates_;
   // PS, only when needed - bool.
@@ -964,6 +976,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id output_point_coordinates_;
   // VS, only when needed - float.
   spv::Id output_point_size_;
+  // Host point size builtin (native point sprites).
+  spv::Id output_native_point_size_;
 
   enum OutputPerVertexMember : unsigned int {
     kOutputPerVertexMemberPosition,
