@@ -5,6 +5,10 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <unordered_set>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -12,6 +16,13 @@
 #include "fable_2_pch.h"
 #include "native_gpu/d3d_device.h"
 
+// D3D command buffer make-space (kicks the buffer to the GPU).
+extern "C" void FastHelper_821E8D20(PPCContext& ctx, uint8_t* base);
+
+REXCVAR_DEFINE_BOOL(native_gpu_report_surfaces, true, "NativeGPU",
+                    "Report the D3D surfaces bound for each draw and resolve to the GPU backend "
+                    "(PM4_XE_NATIVE packets in the command buffer)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(native_gpu_log_draws, 0, "NativeGPU",
                      "Log the next N draws as seen at the D3D level (device state and the draw "
                      "packet written)")
@@ -78,6 +89,23 @@ void OnDraw(const char* function, const uint8_t* base, uint32_t device_address,
       index_size = LoadGuest32(base, packet + 16);
     }
   }
+  // Dump each distinct surface object once (layout reverse engineering).
+  {
+    static std::mutex mutex;
+    static std::unordered_set<uint32_t> dumped;
+    std::lock_guard<std::mutex> lock(mutex);
+    for (uint32_t surface : {device.render_target(0), device.render_target(1),
+                             device.depth_stencil()}) {
+      if (!surface || !dumped.insert(surface).second) {
+        continue;
+      }
+      std::string words;
+      for (uint32_t i = 0; i < 16; ++i) {
+        words += fmt::format(" {:08X}", LoadGuest32(base, surface + i * 4));
+      }
+      REXSYS_INFO("[native-gpu] surface {:08X}:{}", surface, words);
+    }
+  }
   auto reg = [&](uint32_t index) {
     uint32_t value = 0;
     device.GetRegister(index, value);
@@ -94,12 +122,67 @@ void OnDraw(const char* function, const uint8_t* base, uint32_t device_address,
 }
 
 }  // namespace
+
+// Writes a PM4_XE_NATIVE packet with the bound surfaces into the device's
+// command buffer if they changed since the last one, before the device writes
+// the packets of a draw or a resolve.
+void ReportSurfaces(PPCContext& ctx, uint8_t* base, uint32_t device_address) {
+  if (!REXCVAR_GET(native_gpu_report_surfaces)) {
+    return;
+  }
+  D3DDevice device(base, device_address);
+  constexpr uint32_t kSurfaceCount = 5;
+  constexpr uint32_t kPayload = 1 + kSurfaceCount * 5;
+  uint32_t payload[kPayload];
+  payload[0] = 1;  // Subcommand: surfaces.
+  for (uint32_t i = 0; i < kSurfaceCount; ++i) {
+    uint32_t object = i ? device.render_target(i - 1) : device.depth_stencil();
+    uint32_t* out = payload + 1 + i * 5;
+    out[0] = object;
+    out[1] = object ? LoadGuest32(base, object + 24) : 0;
+    out[2] = object ? LoadGuest32(base, object + 28) : 0;
+    out[3] = object ? LoadGuest32(base, object + 36) : 0;
+    out[4] = object ? LoadGuest32(base, object + 40) : 0;
+  }
+  static uint32_t last_device = 0;
+  static uint32_t last_payload[kPayload] = {};
+  if (last_device == device_address && !std::memcmp(last_payload, payload, sizeof(payload))) {
+    return;
+  }
+  uint32_t write = device.Load(D3DDevice::kCommandBufferWrite);
+  uint32_t limit = device.Load(D3DDevice::kCommandBufferLimit);
+  if (write + 4 * (1 + kPayload) > limit) {
+    // Let the device kick the command buffer and make space, keeping the
+    // caller's registers (the draw arguments and the return address).
+    PPCContext saved = ctx;
+    ctx.r3.u64 = device_address;
+    FastHelper_821E8D20(ctx, base);
+    write = ctx.r3.u32;
+    ctx = saved;
+  }
+  auto store = [&](uint32_t value) {
+    write += 4;
+    *reinterpret_cast<uint32_t*>(const_cast<uint8_t*>(GuestPointer(base, write))) =
+        __builtin_bswap32(value);
+  };
+  store(0xC0000000u | ((kPayload - 1) << 16) | (0x65u << 8));
+  for (uint32_t value : payload) {
+    store(value);
+  }
+  *reinterpret_cast<uint32_t*>(const_cast<uint8_t*>(
+      GuestPointer(base, device_address + D3DDevice::kCommandBufferWrite))) =
+      __builtin_bswap32(write);
+  last_device = device_address;
+  std::memcpy(last_payload, payload, sizeof(payload));
+}
+
 }  // namespace fable2::native_gpu
 
 #define FABLE2_NATIVE_GPU_DRAW_HOOK(name)                                              \
   extern "C" void __imp__##name(PPCContext& __restrict ctx, uint8_t* base);            \
   extern "C" void name(PPCContext& __restrict ctx, uint8_t* base) {                    \
     uint32_t device = ctx.r3.u32;                                                      \
+    fable2::native_gpu::ReportSurfaces(ctx, base, device);                             \
     uint32_t write_before =                                                            \
         fable2::native_gpu::LoadGuest32(base, device + fable2::native_gpu::D3DDevice::kCommandBufferWrite); \
     __imp__##name(ctx, base);                                                          \
@@ -113,3 +196,11 @@ FABLE2_NATIVE_GPU_DRAW_HOOK(sub_82207C30)
 FABLE2_NATIVE_GPU_DRAW_HOOK(ProcessAndProcessAndProcess576_82217EE8)
 FABLE2_NATIVE_GPU_DRAW_HOOK(ProcessAndProcessAndProcess841_8221C518)
 FABLE2_NATIVE_GPU_DRAW_HOOK(ProcessAndProcessAndProcess876_822060A0)
+
+// D3DDevice_Resolve: reads the bound surfaces too.
+extern "C" void __imp__ProcessAndProcessAndProcess806_822069C0(PPCContext& __restrict ctx,
+                                                              uint8_t* base);
+extern "C" void ProcessAndProcessAndProcess806_822069C0(PPCContext& __restrict ctx, uint8_t* base) {
+  fable2::native_gpu::ReportSurfaces(ctx, base, ctx.r3.u32);
+  __imp__ProcessAndProcessAndProcess806_822069C0(ctx, base);
+}
