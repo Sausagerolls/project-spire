@@ -146,3 +146,16 @@ Replacing PM4 entirely must also handle this replay: the D3D draw hooks record i
 command buffers that the interpreter replays, so a hook-only renderer would see each
 draw once, which is what merging needs anyway. Parsing is about 7% of the command
 processor thread, so removing it is about correctness rather than speed.
+
+## Limit of D3D-level draws (measured 2026-11-01)
+
+With tiles merged, the D3D draw functions are called about 350k times per 5 s while
+the command processor executes 609k draws. A scan of the generated code finds no other
+writers of draw packets, and indirect buffers are only issued from `82286248` (called
+by the list interpreter, the kick path and `82B9E610`). So about 40% of draws are
+prerecorded packets replayed from guest memory: hooks never see those executions.
+
+Consequences: removing PM4 would need host-side recording and replay of those lists
+with the guest's bin mask patching, which reimplements the same reader in a different
+form. Reading packets is about 7% of the command processor thread. Decision: keep the
+thin packet-to-Metal translator; spend effort on what still costs time, GPU work first.
