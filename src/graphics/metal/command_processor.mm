@@ -1787,9 +1787,10 @@ void MetalCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fro
                   "free, {} deferred memory writes queued",
                   [device_ currentAllocatedSize] >> 20, transient_pages_used_.size(),
                   transient_pages_free_.size(), deferred_memory_writes_.size());
-      breaks += fmt::format(" resolve snapshots: {} made, {} used,",
+      breaks += fmt::format(" resolve snapshots: {} made, {} used, {} written to memory,",
                             render_target_cache_->resolve_snapshots_made(),
-                            render_target_cache_->resolve_snapshots_taken());
+                            render_target_cache_->resolve_snapshots_taken(),
+                            render_target_cache_->resolves_to_memory());
       REXGPU_INFO("Metal per frame: {:.1f} guest render passes, {:.1f} reordered texture loads, "
                   "ends:{}",
                   double(stats_.guest_render_passes) / std::max(stats_.swaps, uint64_t(1)),

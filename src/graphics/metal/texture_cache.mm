@@ -621,13 +621,17 @@ bool MetalTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
       return true;
     }
   }
+  bool snapshot_compatible = load_base && (!load_mips || !texture_key.mip_max_level) &&
+                             texture_key.dimension == xenos::DataDimension::k2DOrStacked &&
+                             texture_key.GetDepthOrArraySize() == 1;
   if (load_base) {
     command_processor_.render_target_cache().NoteGuestMemoryTextureLoad(
-        texture_key.base_page << 12, metal_texture.GetGuestBaseSize());
+        texture_key.base_page << 12, metal_texture.GetGuestBaseSize(),
+        snapshot_compatible ? uint32_t(texture_key.format) : UINT32_MAX);
   }
   if (load_mips && texture_key.mip_max_level) {
     command_processor_.render_target_cache().NoteGuestMemoryTextureLoad(
-        texture_key.mip_page << 12, metal_texture.GetGuestMipsSize());
+        texture_key.mip_page << 12, metal_texture.GetGuestMipsSize(), UINT32_MAX);
   }
   id<MTLComputePipelineState> pipeline = load_pipelines_[load_shader];
   const LoadShaderInfo& load_shader_info = GetLoadShaderInfo(load_shader);

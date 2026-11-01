@@ -1331,7 +1331,9 @@ using namespace metal;
 struct SnapshotConstants {
   uint2 source_offset;
   uint swap_red_blue;
-  uint sample_index;
+  uint first_sample;
+  uint sample_count;
+  float depth_scale;
 };
 kernel void snapshot_copy(texture2d<float> source [[texture(0)]],
                           texture2d<float, access::write> dest [[texture(1)]],
@@ -1346,46 +1348,133 @@ kernel void snapshot_copy_ms(texture2d_ms<float> source [[texture(0)]],
                              constant SnapshotConstants& c [[buffer(0)]],
                              uint2 id [[thread_position_in_grid]]) {
   if (id.x >= dest.get_width() || id.y >= dest.get_height()) return;
-  float4 color = source.read(c.source_offset + id, c.sample_index);
+  float4 color = float4(0.0);
+  for (uint i = 0; i < c.sample_count; ++i) {
+    color += source.read(c.source_offset + id, c.first_sample + i);
+  }
+  color /= float(c.sample_count);
   dest.write(c.swap_red_blue ? color.bgra : color, id);
+}
+kernel void snapshot_depth(depth2d<float> source [[texture(0)]],
+                           texture2d<float, access::write> dest [[texture(1)]],
+                           constant SnapshotConstants& c [[buffer(0)]],
+                           uint2 id [[thread_position_in_grid]]) {
+  if (id.x >= dest.get_width() || id.y >= dest.get_height()) return;
+  dest.write(float4(source.read(c.source_offset + id) * c.depth_scale), id);
+}
+kernel void snapshot_depth_ms(depth2d_ms<float> source [[texture(0)]],
+                              texture2d<float, access::write> dest [[texture(1)]],
+                              constant SnapshotConstants& c [[buffer(0)]],
+                              uint2 id [[thread_position_in_grid]]) {
+  if (id.x >= dest.get_width() || id.y >= dest.get_height()) return;
+  dest.write(float4(source.read(c.source_offset + id, c.first_sample) * c.depth_scale), id);
 }
 )";
 }  // namespace
 
 void MetalRenderTargetCache::MakeResolveSnapshot(const draw_util::ResolveInfo& resolve_info,
                                                  MetalRenderTarget& source) {
-  // Whole-texture color copies without conversion only.
-  if (resolve_info.IsCopyingDepth() || !resolve_info.copy_dest_extent_length ||
-      resolve_info.copy_dest_info.copy_dest_exp_bias || resolve_info.copy_dest_info.copy_dest_array ||
+  // Copies of whole textures, without exponent biasing.
+  if (!resolve_info.copy_dest_extent_length || resolve_info.copy_dest_info.copy_dest_exp_bias ||
+      resolve_info.copy_dest_info.copy_dest_array ||
       resolve_info.copy_dest_coordinate_info.offset_x_div_8 ||
       resolve_info.copy_dest_coordinate_info.offset_y_div_8 || draw_resolution_scale_x() != 1 ||
       draw_resolution_scale_y() != 1) {
     return;
   }
   xenos::ColorFormat dest_format = resolve_info.copy_dest_info.copy_dest_format;
-  MTLPixelFormat pixel_format = source.texture().pixelFormat;
-  bool format_matches = false;
-  switch (dest_format) {
-    case xenos::ColorFormat::k_8_8_8_8:
-      format_matches = pixel_format == MTLPixelFormatRGBA8Unorm;
+  MTLPixelFormat source_format = source.texture().pixelFormat;
+  bool is_depth = resolve_info.IsCopyingDepth();
+  float depth_scale = 1.0f;
+  // The host format of a texture of the destination format, if the source
+  // can be converted to it by reading and writing normalized values.
+  MTLPixelFormat pixel_format = MTLPixelFormatInvalid;
+  if (is_depth) {
+    // Copying depth takes the texture formats (they have no color format name).
+    uint32_t dest_texture_format = uint32_t(dest_format);
+    xenos::DepthRenderTargetFormat source_depth_format = source.key().GetDepthFormat();
+    if (dest_texture_format == uint32_t(xenos::TextureFormat::k_24_8) &&
+        source_depth_format == xenos::DepthRenderTargetFormat::kD24S8) {
+      pixel_format = MTLPixelFormatR32Float;
+    } else if (dest_texture_format == uint32_t(xenos::TextureFormat::k_24_8_FLOAT) &&
+               source_depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {
+      // Stored multiplied by 0.5 in the host render target (the guest range is
+      // 0...2), not in the texture.
+      pixel_format = MTLPixelFormatR32Float;
+      depth_scale = 2.0f;
+    }
+  } else {
+    bool source_unorm = source_format == MTLPixelFormatRGBA8Unorm ||
+                        source_format == MTLPixelFormatRGB10A2Unorm;
+    switch (dest_format) {
+      case xenos::ColorFormat::k_8:
+        if (source_format == MTLPixelFormatRGBA8Unorm) {
+          pixel_format = MTLPixelFormatR8Unorm;
+        }
+        break;
+      case xenos::ColorFormat::k_8_8_8_8:
+        if (source_unorm) {
+          pixel_format = MTLPixelFormatRGBA8Unorm;
+        }
+        break;
+      case xenos::ColorFormat::k_2_10_10_10:
+        if (source_unorm) {
+          pixel_format = MTLPixelFormatRGB10A2Unorm;
+        }
+        break;
+      case xenos::ColorFormat::k_16_16_16_16_FLOAT:
+        if (source_format == MTLPixelFormatRGBA16Float) {
+          pixel_format = MTLPixelFormatRGBA16Float;
+        }
+        break;
+      case xenos::ColorFormat::k_16_16_FLOAT:
+        if (source_format == MTLPixelFormatRG16Float) {
+          pixel_format = MTLPixelFormatRG16Float;
+        }
+        break;
+      case xenos::ColorFormat::k_32_FLOAT:
+        if (source_format == MTLPixelFormatR32Float) {
+          pixel_format = MTLPixelFormatR32Float;
+        }
+        break;
+      default:
+        break;
+    }
+  }
+  if (pixel_format == MTLPixelFormatInvalid) {
+    return;
+  }
+  // Which samples the copy takes.
+  uint32_t first_sample = 0, sample_count = 1;
+  switch (resolve_info.copy_dest_coordinate_info.copy_sample_select) {
+    case xenos::CopySampleSelect::k0:
       break;
-    case xenos::ColorFormat::k_2_10_10_10:
-      format_matches = pixel_format == MTLPixelFormatRGB10A2Unorm;
+    case xenos::CopySampleSelect::k1:
+      first_sample = 1;
       break;
-    case xenos::ColorFormat::k_16_16_16_16_FLOAT:
-      format_matches = pixel_format == MTLPixelFormatRGBA16Float;
+    case xenos::CopySampleSelect::k2:
+      first_sample = 2;
       break;
-    case xenos::ColorFormat::k_16_16_FLOAT:
-      format_matches = pixel_format == MTLPixelFormatRG16Float;
+    case xenos::CopySampleSelect::k3:
+      first_sample = 3;
       break;
-    case xenos::ColorFormat::k_32_FLOAT:
-      format_matches = pixel_format == MTLPixelFormatR32Float;
+    case xenos::CopySampleSelect::k01:
+      sample_count = 2;
+      break;
+    case xenos::CopySampleSelect::k23:
+      first_sample = 2;
+      sample_count = 2;
+      break;
+    case xenos::CopySampleSelect::k0123:
+      sample_count = 4;
       break;
     default:
-      break;
+      return;
   }
-  if (!format_matches) {
-    return;
+  uint32_t source_samples = uint32_t(source.texture().sampleCount);
+  if (first_sample + sample_count > source_samples) {
+    first_sample = 0;
+    sample_count = source_samples;
   }
   uint32_t width = uint32_t(resolve_info.coordinate_info.width_div_8) << 3;
   uint32_t height = uint32_t(resolve_info.height_div_8) << 3;
@@ -1402,13 +1491,18 @@ void MetalRenderTargetCache::MakeResolveSnapshot(const draw_util::ResolveInfo& r
       return;
     }
     NSError* error = nil;
-    snapshot_pipeline_ = [command_processor_.device()
-        newComputePipelineStateWithFunction:[library newFunctionWithName:@"snapshot_copy"]
-                                      error:&error];
-    snapshot_ms_pipeline_ = [command_processor_.device()
-        newComputePipelineStateWithFunction:[library newFunctionWithName:@"snapshot_copy_ms"]
-                                      error:&error];
-    if (!snapshot_pipeline_ || !snapshot_ms_pipeline_) {
+    auto make = [&](NSString* name) {
+      NSError* error = nil;
+      return [command_processor_.device()
+          newComputePipelineStateWithFunction:[library newFunctionWithName:name]
+                                        error:&error];
+    };
+    snapshot_pipeline_ = make(@"snapshot_copy");
+    snapshot_ms_pipeline_ = make(@"snapshot_copy_ms");
+    snapshot_depth_pipeline_ = make(@"snapshot_depth");
+    snapshot_depth_ms_pipeline_ = make(@"snapshot_depth_ms");
+    if (!snapshot_pipeline_ || !snapshot_ms_pipeline_ || !snapshot_depth_pipeline_ ||
+        !snapshot_depth_ms_pipeline_) {
       return;
     }
   }
@@ -1438,13 +1532,21 @@ void MetalRenderTargetCache::MakeResolveSnapshot(const draw_util::ResolveInfo& r
   struct {
     uint32_t source_offset[2];
     uint32_t swap_red_blue;
-    uint32_t sample_index;
+    uint32_t first_sample;
+    uint32_t sample_count;
+    float depth_scale;
   } constants = {{source_x, source_y},
                  uint32_t(resolve_info.copy_dest_info.copy_dest_swap),
-                 0};
+                 first_sample,
+                 sample_count,
+                 depth_scale};
   id<MTLComputeCommandEncoder> encoder = command_processor_.GetComputeEncoder("resolve");
-  [encoder setComputePipelineState:source_texture.sampleCount > 1 ? snapshot_ms_pipeline_
-                                                                  : snapshot_pipeline_];
+  bool multisampled = source_texture.sampleCount > 1;
+  [encoder setComputePipelineState:is_depth
+                                       ? (multisampled ? snapshot_depth_ms_pipeline_
+                                                       : snapshot_depth_pipeline_)
+                                       : (multisampled ? snapshot_ms_pipeline_
+                                                       : snapshot_pipeline_)];
   [encoder setTexture:source_texture atIndex:0];
   [encoder setTexture:snapshot.texture atIndex:1];
   [encoder setBytes:&constants length:sizeof(constants) atIndex:0];
@@ -1476,16 +1578,23 @@ id<MTLTexture> MetalRenderTargetCache::TakeResolveSnapshot(uint32_t address, uin
   return snapshot.texture;
 }
 
-void MetalRenderTargetCache::NoteGuestMemoryTextureLoad(uint32_t start, uint32_t length) {
+void MetalRenderTargetCache::NoteGuestMemoryTextureLoad(uint32_t start, uint32_t length,
+                                                        uint32_t snapshot_compatible_format) {
   if (!length) {
     return;
   }
   uint32_t end = start + length;
   for (auto& entry : resolve_snapshots_) {
     ResolveSnapshot& snapshot = entry.second;
-    if (start < snapshot.extent_start + snapshot.extent_length && end > snapshot.extent_start) {
-      snapshot.memory_needed = true;
+    if (start >= snapshot.extent_start + snapshot.extent_length || end <= snapshot.extent_start) {
+      continue;
     }
+    // A texture that can use the snapshot was only loaded from memory because
+    // no resolve has happened yet.
+    if (entry.first == start && snapshot.format == snapshot_compatible_format) {
+      continue;
+    }
+    snapshot.memory_needed = true;
   }
 }
 
@@ -1528,6 +1637,7 @@ bool MetalRenderTargetCache::ResolveNative(const draw_util::ResolveInfo& resolve
                                                   resolve_info.copy_dest_extent_length);
     copied = true;
   } else if (resolve_info.copy_dest_extent_length && source) {
+    ++resolves_to_memory_;
     draw_util::ResolveCopyShaderConstants copy_shader_constants;
     uint32_t copy_group_count_x, copy_group_count_y;
     draw_util::ResolveCopyShaderIndex copy_shader =

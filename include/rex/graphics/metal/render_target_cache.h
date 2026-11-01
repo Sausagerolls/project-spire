@@ -111,9 +111,13 @@ class MetalRenderTargetCache final : public RenderTargetCache {
                                      uint32_t format, MTLPixelFormat pixel_format);
   // A texture is being loaded from this guest memory range (no snapshot for
   // it) - resolves overlapping it must keep writing to guest memory.
-  void NoteGuestMemoryTextureLoad(uint32_t start, uint32_t length);
+  // snapshot_compatible_format: the guest format if the texture can use a
+  // snapshot of this address, UINT32_MAX otherwise.
+  void NoteGuestMemoryTextureLoad(uint32_t start, uint32_t length,
+                                  uint32_t snapshot_compatible_format);
   uint64_t resolve_snapshots_taken() const { return resolve_snapshots_taken_; }
   uint64_t resolve_snapshots_made() const { return resolve_snapshots_made_; }
+  uint64_t resolves_to_memory() const { return resolves_to_memory_; }
 
   const RenderPassAttachments& last_update_attachments() const { return last_update_attachments_; }
 
@@ -258,8 +262,11 @@ class MetalRenderTargetCache final : public RenderTargetCache {
   std::unordered_map<uint32_t, ResolveSnapshot> resolve_snapshots_;
   id<MTLComputePipelineState> snapshot_pipeline_ = nil;
   id<MTLComputePipelineState> snapshot_ms_pipeline_ = nil;
+  id<MTLComputePipelineState> snapshot_depth_pipeline_ = nil;
+  id<MTLComputePipelineState> snapshot_depth_ms_pipeline_ = nil;
   uint64_t resolve_snapshots_taken_ = 0;
   uint64_t resolve_snapshots_made_ = 0;
+  uint64_t resolves_to_memory_ = 0;
   uint32_t merged_tile_height_ = 0;
   uint32_t merged_height_ = 0;
   NativeSurface native_bound_[1 + xenos::kMaxColorRenderTargets];
