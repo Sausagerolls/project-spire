@@ -1839,6 +1839,11 @@ void MetalCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fro
   constants.width = frontbuffer_width;
   constants.height = frontbuffer_height;
   constants.swizzle = fetch.swizzle;
+  // The swap reads the front buffer from guest memory, so resolves to it must
+  // keep writing there.
+  render_target_cache_->NoteGuestMemoryTextureLoad(constants.base,
+                                                   constants.pitch * frontbuffer_height * 8,
+                                                   UINT32_MAX);
   (void)frontbuffer_ptr;
 
   system::X_VIDEO_MODE video_mode;

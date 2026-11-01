@@ -1612,6 +1612,14 @@ bool MetalRenderTargetCache::ResolveNative(const draw_util::ResolveInfo& resolve
       native_bound_[source_is_depth ? 0 : 1 + source_select], source_is_depth);
 
   bool snapshot_only = false;
+  {
+    // Whatever a snapshot of this address holds is out of date now.
+    auto old_snapshot = resolve_snapshots_.find(resolve_info.copy_dest_base);
+    if (old_snapshot != resolve_snapshots_.end()) {
+      old_snapshot->second.available = false;
+      old_snapshot->second.memory_written = true;
+    }
+  }
   if (source && REXCVAR_GET(metal_resolve_snapshots)) {
     uint64_t made_before = resolve_snapshots_made_;
     MakeResolveSnapshot(resolve_info, *source);
