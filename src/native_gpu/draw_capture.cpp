@@ -167,6 +167,16 @@ void MergeTiles(uint8_t* base, uint32_t list) {
   StoreGuest32(base, list + 16, top);
   StoreGuest32(base, list + 20, right);
   StoreGuest32(base, list + 24, bottom);
+  {
+    static std::mutex mutex;
+    static std::unordered_set<uint64_t> logged;
+    uint64_t key = (uint64_t(first_right) << 40) | (uint64_t(first_bottom) << 20) | bottom;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (logged.insert(key).second) {
+      REXSYS_INFO("[native-gpu] merged tile list: {} tiles, first {}x{}, whole {}x{}", count,
+                  first_right, first_bottom, right, bottom);
+    }
+  }
   // Surfaces of the size of the first tile are really as tall as the whole
   // area (see ReportSurfaces).
   merged_tile_width.store(first_right);
