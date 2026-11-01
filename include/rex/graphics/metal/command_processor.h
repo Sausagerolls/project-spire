@@ -284,6 +284,10 @@ class MetalCommandProcessor : public CommandProcessor {
     uint64_t guest_render_passes = 0;
     uint64_t texture_loads_reordered = 0;
     double cp_wait_seconds = 0.0;
+    // Frame times (between swaps).
+    double worst_frame_ms = 0.0;
+    uint32_t frames_over_50ms = 0;
+    uint32_t frames_over_100ms = 0;
     uint64_t vertices = 0;
     std::map<std::string, uint64_t> vertices_by_type;
     std::unordered_map<uint64_t, uint64_t> vertices_by_shader;
@@ -293,11 +297,8 @@ class MetalCommandProcessor : public CommandProcessor {
   };
   Stats stats_;
   uint64_t frame_rate_draw_count_ = 0;
-  // PA_SC_WINDOW_SCISSOR_BR of the first tile of a merged tiling list and of
-  // the merged area, zero if none (reported by the game's hooks).
-  uint32_t merged_tile_scissor_br_ = 0;
-  uint32_t merged_scissor_br_ = 0;
   uint64_t total_swaps_ = 0;
+  std::chrono::steady_clock::time_point last_swap_time_{};
 };
 
 }  // namespace rex::graphics::metal

@@ -46,7 +46,7 @@ REXCVAR_DEFINE_BOOL(metal_resolve_snapshots, true, "GPU/Metal",
                     "With native surfaces, copy color resolves to whole textures directly to the "
                     "texture (host to host) instead of reloading them from guest memory")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_BOOL(metal_resolve_to_memory, false, "GPU/Metal",
+REXCVAR_DEFINE_BOOL(metal_resolve_to_memory, true, "GPU/Metal",
                     "With resolve snapshots, still write resolves to guest memory (needed if "
                     "the CPU reads them)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -646,15 +646,33 @@ bool MetalRenderTargetCache::native_surfaces_active() const {
 }
 
 MetalRenderTargetCache::MetalRenderTarget* MetalRenderTargetCache::GetNativeRenderTarget(
-    const NativeSurface& surface, bool is_depth) {
+    const NativeSurface& surface, bool is_depth, uint32_t required_height) {
   if (!surface.object) {
     return nullptr;
   }
-  auto it = native_targets_.find(surface.object);
-  if (it != native_targets_.end() && it->second.surface == surface &&
-      it->second.render_target) {
-    return it->second.render_target.get();
+  // Surfaces at the same EDRAM location with the same layout are the same memory
+  // on the guest: the game may bind a new surface object and expect the data
+  // there. So textures aren't per object.
+  uint32_t surface_width = (surface.size >> 18) + 1;
+  // The guest may use more than the size of the D3D surface object (the EDRAM
+  // has no bounds below the pitch).
+  uint32_t surface_height = std::max(((surface.size >> 3) & 0x7FFF) + 1, required_height);
+  uint64_t target_key = (uint64_t(surface.surface_info) << 32) | surface.info |
+                        (uint64_t(is_depth) << 31);
+  auto it = native_targets_.find(target_key);
+  if (it != native_targets_.end() && it->second.render_target) {
+    id<MTLTexture> existing = it->second.render_target->texture();
+    if (existing.width >= surface_width * draw_resolution_scale_x() &&
+        existing.height >= surface_height * draw_resolution_scale_y()) {
+      return it->second.render_target.get();
+    }
+    // Keep the largest size seen.
+    surface_width = std::max(surface_width, uint32_t(existing.width) / draw_resolution_scale_x());
+    surface_height = std::max(surface_height, uint32_t(existing.height) / draw_resolution_scale_y());
   }
+  id<MTLTexture> previous_texture =
+      it != native_targets_.end() && it->second.render_target ? it->second.render_target->texture()
+                                                              : nil;
   // The key describes the surface in guest terms (for resolves and clears);
   // the texture has the size of the surface, not of the EDRAM.
   auto surface_info = reg::RB_SURFACE_INFO{surface.surface_info};
@@ -677,13 +695,55 @@ MetalRenderTargetCache::MetalRenderTarget* MetalRenderTargetCache::GetNativeRend
       key.pitch_tiles_at_32bpp <<= 1;
     }
   }
-  uint32_t width = (surface.size >> 18) + 1;
-  uint32_t height = ((surface.size >> 3) & 0x7FFF) + 1;
   MetalRenderTarget* render_target = CreateMetalRenderTarget(
-      key, width * draw_resolution_scale_x(), height * draw_resolution_scale_y());
-  NativeTarget& target = native_targets_[surface.object];
+      key, surface_width * draw_resolution_scale_x(), surface_height * draw_resolution_scale_y());
+  ++native_surfaces_created_;
+  NativeTarget& target = native_targets_[target_key];
   target.surface = surface;
+  // Retired textures may still be attached to the current render pass.
+  std::unique_ptr<MetalRenderTarget> retired = std::move(target.render_target);
+  if (retired) {
+    retired_native_targets_.push_back(std::move(retired));
+  }
   target.render_target.reset(render_target);
+  // New textures hold undefined data, which must not be shown (surfaces are
+  // often drawn with loading, or partially, on their first use).
+  if (render_target) {
+    MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    id<MTLTexture> texture = render_target->texture();
+    if (is_depth) {
+      pass.depthAttachment.texture = texture;
+      pass.depthAttachment.loadAction = MTLLoadActionClear;
+      pass.depthAttachment.clearDepth = 1.0;
+      pass.depthAttachment.storeAction = MTLStoreActionStore;
+      pass.stencilAttachment.texture = texture;
+      pass.stencilAttachment.loadAction = MTLLoadActionClear;
+      pass.stencilAttachment.clearStencil = 0;
+      pass.stencilAttachment.storeAction = MTLStoreActionStore;
+    } else {
+      pass.colorAttachments[0].texture = texture;
+      pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+      pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+      pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    }
+    command_processor_.BeginUtilityRenderPass(pass, "new surface");
+    command_processor_.EndEncoding();
+    if (previous_texture) {
+      // Grown - keep the contents.
+      id<MTLBlitCommandEncoder> blit = command_processor_.GetBlitEncoder("surface growth");
+      [blit copyFromTexture:previous_texture
+                sourceSlice:0
+                sourceLevel:0
+               sourceOrigin:MTLOriginMake(0, 0, 0)
+                 sourceSize:MTLSizeMake(std::min(previous_texture.width, texture.width),
+                                        std::min(previous_texture.height, texture.height), 1)
+                  toTexture:texture
+           destinationSlice:0
+           destinationLevel:0
+          destinationOrigin:MTLOriginMake(0, 0, 0)];
+      command_processor_.EndEncoding();
+    }
+  }
   return render_target;
 }
 
@@ -712,16 +772,26 @@ bool MetalRenderTargetCache::UpdateNative(bool is_rasterization_done,
     width = width ? std::min(width, uint32_t(texture.width)) : uint32_t(texture.width);
     height = height ? std::min(height, uint32_t(texture.height)) : uint32_t(texture.height);
   };
+  // Surfaces grow to the scissor, unless it's the "whole EDRAM" default.
+  uint32_t required_height = 0;
+  {
+    draw_util::Scissor scissor;
+    draw_util::GetScissor(register_file(), scissor);
+    uint32_t scissor_bottom = scissor.offset[1] + scissor.extent[1];
+    if (scissor_bottom <= 2048) {
+      required_height = scissor_bottom;
+    }
+  }
   if (is_rasterization_done) {
     bool depth_used = normalized_depth_control.z_enable || normalized_depth_control.stencil_enable;
     if (depth_used) {
-      add(GetNativeRenderTarget(native_bound_[0], true), -1);
+      add(GetNativeRenderTarget(native_bound_[0], true, required_height), -1);
     }
     bool color_used[xenos::kMaxColorRenderTargets];
     for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
       color_used[i] = ((normalized_color_mask >> (i * 4)) & 0xF) != 0;
       if (color_used[i]) {
-        add(GetNativeRenderTarget(native_bound_[1 + i], false), int32_t(i));
+        add(GetNativeRenderTarget(native_bound_[1 + i], false, required_height), int32_t(i));
       }
     }
     // Also keep the bound surfaces this draw doesn't use attached (nothing is
@@ -1240,8 +1310,8 @@ bool MetalRenderTargetCache::Resolve(const memory::Memory& memory,
   if (!draw_util::GetResolveInfo(register_file(), memory, draw_resolution_scale_x(),
                                  draw_resolution_scale_y(), IsFixedRG16TruncatedToMinus1To1(),
                                  IsFixedRGBA16TruncatedToMinus1To1(), resolve_info,
-                                 native_surfaces_active() ? merged_tile_height_ : 0,
-                                 native_surfaces_active() ? merged_height_ : 0)) {
+                                 native_surfaces_active() ? merged_tiles_.data() : nullptr,
+                                 native_surfaces_active() ? merged_tiles_.size() : 0)) {
     return false;
   }
   if (!resolve_info.coordinate_info.width_div_8 || !resolve_info.height_div_8) {
@@ -1608,8 +1678,11 @@ bool MetalRenderTargetCache::ResolveNative(const draw_util::ResolveInfo& resolve
   auto rb_copy_control = register_file().Get<reg::RB_COPY_CONTROL>();
   uint32_t source_select = uint32_t(rb_copy_control.copy_src_select);
   bool source_is_depth = source_select >= xenos::kMaxColorRenderTargets;
+  uint32_t resolve_bottom = (uint32_t(resolve_info.coordinate_info.edram_offset_y_div_8) +
+                             resolve_info.height_div_8)
+                            << 3;
   MetalRenderTarget* source = GetNativeRenderTarget(
-      native_bound_[source_is_depth ? 0 : 1 + source_select], source_is_depth);
+      native_bound_[source_is_depth ? 0 : 1 + source_select], source_is_depth, resolve_bottom);
 
   bool snapshot_only = false;
   {

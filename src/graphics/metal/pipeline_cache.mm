@@ -219,6 +219,7 @@ void MetalPipelineCache::InitializeStorage(const std::filesystem::path& director
     return;
   }
   MetalShader::SetMslCacheDirectory(directory / "msl");
+  MetalShader::PreloadCachedLibraries(command_processor_.GetMetalProvider());
   if (!REXCVAR_GET(metal_pipeline_archive)) {
     return;
   }

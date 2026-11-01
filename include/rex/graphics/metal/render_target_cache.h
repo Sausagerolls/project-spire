@@ -95,12 +95,17 @@ class MetalRenderTargetCache final : public RenderTargetCache {
   };
   // [0] is depth / stencil, [1 + i] is color i.
   void SetNativeSurfaces(const NativeSurface* surfaces);
-  // A predicated tile merged by the game's hooks: its height and the height of
-  // the merged area.
-  void SetMergedTile(uint32_t tile_height, uint32_t merged_height) {
-    merged_tile_height_ = tile_height;
-    merged_height_ = merged_height;
+  // Predicated tiling lists merged by the game's hooks: the first tile's size
+  // and the height of the merged area.
+  void AddMergedTile(uint32_t width, uint32_t tile_height, uint32_t merged_height) {
+    for (const draw_util::MergedTile& tile : merged_tiles_) {
+      if (tile.width == width && tile.tile_height == tile_height) {
+        return;
+      }
+    }
+    merged_tiles_.push_back({width, tile_height, merged_height});
   }
+  const std::vector<draw_util::MergedTile>& merged_tiles() const { return merged_tiles_; }
   bool native_surfaces_active() const;
 
   // Native surfaces: color resolves to whole textures are also copied to host
@@ -118,6 +123,7 @@ class MetalRenderTargetCache final : public RenderTargetCache {
   uint64_t resolve_snapshots_taken() const { return resolve_snapshots_taken_; }
   uint64_t resolve_snapshots_made() const { return resolve_snapshots_made_; }
   uint64_t resolves_to_memory() const { return resolves_to_memory_; }
+  uint64_t native_surfaces_created() const { return native_surfaces_created_; }
 
   const RenderPassAttachments& last_update_attachments() const { return last_update_attachments_; }
 
@@ -236,7 +242,8 @@ class MetalRenderTargetCache final : public RenderTargetCache {
   MetalRenderTarget* CreateMetalRenderTarget(RenderTargetKey key, uint32_t width,
                                              uint32_t height);
   // Native surfaces.
-  MetalRenderTarget* GetNativeRenderTarget(const NativeSurface& surface, bool is_depth);
+  MetalRenderTarget* GetNativeRenderTarget(const NativeSurface& surface, bool is_depth,
+                                           uint32_t required_height = 0);
   bool UpdateNative(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
                     uint32_t normalized_color_mask);
   bool ResolveNative(const draw_util::ResolveInfo& resolve_info, MetalSharedMemory& shared_memory,
@@ -267,15 +274,17 @@ class MetalRenderTargetCache final : public RenderTargetCache {
   uint64_t resolve_snapshots_taken_ = 0;
   uint64_t resolve_snapshots_made_ = 0;
   uint64_t resolves_to_memory_ = 0;
-  uint32_t merged_tile_height_ = 0;
-  uint32_t merged_height_ = 0;
+  std::vector<draw_util::MergedTile> merged_tiles_;
   NativeSurface native_bound_[1 + xenos::kMaxColorRenderTargets];
   bool native_bound_valid_ = false;
   struct NativeTarget {
     NativeSurface surface;
     std::unique_ptr<MetalRenderTarget> render_target;
   };
-  std::unordered_map<uint32_t, NativeTarget> native_targets_;
+  std::unordered_map<uint64_t, NativeTarget> native_targets_;
+  uint64_t native_surfaces_created_ = 0;
+  // Grown surfaces' old textures, cleared at the next frame.
+  std::vector<std::unique_ptr<MetalRenderTarget>> retired_native_targets_;
 
   id<MTLComputePipelineState> GetDumpPipeline(DumpPipelineKey key);
   bool DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,

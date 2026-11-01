@@ -12,6 +12,8 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <unordered_map>
 
 #include <xxhash.h>
 
@@ -32,7 +34,38 @@ namespace rex::graphics::metal {
 namespace {
 std::mutex msl_cache_mutex;
 std::filesystem::path msl_cache_directory;
+// Libraries compiled in the background, by the file name of the MSL.
+std::unordered_map<std::string, id<MTLLibrary>> preloaded_libraries;
 }  // namespace
+
+void MetalShader::PreloadCachedLibraries(const ui::metal::MetalProvider& provider) {
+  std::filesystem::path directory;
+  {
+    std::lock_guard<std::mutex> lock(msl_cache_mutex);
+    directory = msl_cache_directory;
+  }
+  const ui::metal::MetalProvider* provider_pointer = &provider;
+  std::thread([directory, provider_pointer]() {
+    std::error_code error_code;
+    for (const auto& entry : std::filesystem::directory_iterator(directory, error_code)) {
+      if (entry.path().extension() != ".metal") {
+        continue;
+      }
+      std::ifstream file(entry.path(), std::ios::binary);
+      std::stringstream stream;
+      stream << file.rdbuf();
+      std::string msl = stream.str();
+      @autoreleasepool {
+        id<MTLLibrary> library = provider_pointer->CompileLibrary(
+            [NSString stringWithUTF8String:msl.c_str()], entry.path().filename().c_str());
+        if (library) {
+          std::lock_guard<std::mutex> lock(msl_cache_mutex);
+          preloaded_libraries.emplace(entry.path().filename().string(), library);
+        }
+      }
+    }
+  }).detach();
+}
 
 void MetalShader::SetMslCacheDirectory(const std::filesystem::path& directory) {
   std::lock_guard<std::mutex> lock(msl_cache_mutex);
@@ -98,7 +131,15 @@ id<MTLFunction> MetalShader::MetalTranslation::GetOrCreateFunction(
         << msl;
   }
   @autoreleasepool {
-    id<MTLLibrary> library =
+    id<MTLLibrary> library = nil;
+    if (!msl_cache_path.empty() && REXCVAR_GET(metal_vertex_math_mode).empty()) {
+      std::lock_guard<std::mutex> lock(msl_cache_mutex);
+      auto preloaded = preloaded_libraries.find(msl_cache_path.filename().string());
+      if (preloaded != preloaded_libraries.end()) {
+        library = preloaded->second;
+      }
+    }
+    if (!library) library =
         provider.CompileLibrary([NSString stringWithUTF8String:msl.c_str()], debug_name.c_str(),
                                 shader().type() == xenos::ShaderType::kVertex &&
                                         !REXCVAR_GET(metal_vertex_math_mode).empty()

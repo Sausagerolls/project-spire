@@ -28,6 +28,9 @@ class MetalShader : public SpirvShader {
  public:
   // Directory for converted MSL, keyed by the hash of the SPIR-V.
   static void SetMslCacheDirectory(const std::filesystem::path& directory);
+  // Compiles the cached MSL in the background, so shaders seen in earlier runs
+  // are ready when first drawn with.
+  static void PreloadCachedLibraries(const ui::metal::MetalProvider& provider);
 
   class MetalTranslation : public SpirvTranslation {
    public:

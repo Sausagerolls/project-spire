@@ -581,10 +581,17 @@ struct ResolveInfo {
 // color render target formats are properly emulated as -32...32, true if
 // emulated as snorm, with range limited to -1...1, but with correct blending
 // within that range.
+// The first tile of predicated tiling merged into one by the host.
+struct MergedTile {
+  uint32_t width;
+  uint32_t tile_height;
+  uint32_t merged_height;
+};
+
 bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
                     uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
                     bool fixed_rg16_truncated_to_minus_1_to_1,
                     bool fixed_rgba16_truncated_to_minus_1_to_1, ResolveInfo& info_out,
-                    uint32_t merged_tile_height = 0, uint32_t merged_height = 0);
+                    const MergedTile* merged_tiles = nullptr, size_t merged_tile_count = 0);
 
 }  // namespace rex::graphics::draw_util

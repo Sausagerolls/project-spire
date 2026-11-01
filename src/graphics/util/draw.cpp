@@ -766,7 +766,7 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
                     uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
                     bool fixed_rg16_truncated_to_minus_1_to_1,
                     bool fixed_rgba16_truncated_to_minus_1_to_1, ResolveInfo& info_out,
-                    uint32_t merged_tile_height, uint32_t merged_height) {
+                    const MergedTile* merged_tiles, size_t merged_tile_count) {
   // Don't pass uninitialized values to shaders, not to leak data to frame
   // captures. Also initialize an invalid resolve to empty.
   info_out.coordinate_info.packed = 0;
@@ -829,8 +829,11 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
 
   // A resolve of a whole predicated tile that the host has merged with the
   // following tiles: covers them too.
-  if (merged_tile_height && y1 == int32_t(merged_tile_height)) {
-    y1 = int32_t(merged_height);
+  for (size_t i = 0; i < merged_tile_count; ++i) {
+    if (x1 == int32_t(merged_tiles[i].width) && y1 == int32_t(merged_tiles[i].tile_height)) {
+      y1 = int32_t(merged_tiles[i].merged_height);
+      break;
+    }
   }
 
   // Apply the scissor and prevent negative origin (behind the EDRAM base).

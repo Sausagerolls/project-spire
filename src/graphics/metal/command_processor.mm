@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstring>
 #include <chrono>
+#include <fstream>
 #include <xxhash.h>
 #include <string>
 #include <thread>
@@ -83,6 +84,16 @@ REXCVAR_DEFINE_BOOL(metal_memexport_end_pass, true, "GPU/Metal",
                     "End the render pass between memexport draws and draws following them, so the "
                     "exported data is visible to them (vertex stage barriers don't guarantee that "
                     "on Apple GPUs)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(metal_memexport_never_culled, false, "GPU/Metal",
+                    "Run memexport draws that also rasterize when they'd be culled")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(metal_capture_frames, 0, "GPU/Metal",
+                     "Write the next N presented frames raw to metal_capture_path (debugging, "
+                     "set to a new value to start)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(metal_capture_path, "/Volumes/1TB/tmp/fc", "GPU/Metal",
+                      "Directory for metal_capture_frames")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(metal_sync_submissions, false, "GPU/Metal",
                     "Wait for the GPU after every submission (debugging CPU / GPU memory hazards)")
@@ -528,14 +539,16 @@ bool MetalCommandProcessor::ExecutePacketType3_XE_NATIVE(memory::RingBuffer* rea
     }
     remaining -= kSurfaceCount * 5;
     render_target_cache_->SetNativeSurfaces(surfaces);
-    // The first tile of a predicated tiling list merged by the game's hooks,
-    // and the height of the merged area.
+    // A predicated tiling list merged by the game's hooks.
     if (remaining >= 3) {
-      merged_tile_scissor_br_ = reader->ReadAndSwap<uint32_t>();
-      merged_scissor_br_ = reader->ReadAndSwap<uint32_t>();
-      render_target_cache_->SetMergedTile(merged_tile_scissor_br_ >> 16, merged_scissor_br_ >> 16);
+      uint32_t tile_scissor_br = reader->ReadAndSwap<uint32_t>();
+      uint32_t merged_scissor_br = reader->ReadAndSwap<uint32_t>();
       reader->ReadAndSwap<uint32_t>();
       remaining -= 3;
+      if (tile_scissor_br) {
+        render_target_cache_->AddMergedTile(tile_scissor_br & 0x7FFF, tile_scissor_br >> 16,
+                                            merged_scissor_br >> 16);
+      }
     }
   }
   reader->AdvanceRead(remaining * sizeof(uint32_t));
@@ -544,9 +557,12 @@ bool MetalCommandProcessor::ExecutePacketType3_XE_NATIVE(memory::RingBuffer* rea
 
 void MetalCommandProcessor::ApplyMergedTileScissor() {
   // The prerecorded packets of the first tile set its bounds as the scissor.
-  if (merged_tile_scissor_br_ &&
-      register_file_->values[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR] == merged_tile_scissor_br_) {
-    register_file_->values[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR] = merged_scissor_br_;
+  uint32_t& scissor_br = register_file_->values[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR];
+  for (const draw_util::MergedTile& tile : render_target_cache_->merged_tiles()) {
+    if (scissor_br == ((tile.tile_height << 16) | tile.width)) {
+      scissor_br = (tile.merged_height << 16) | tile.width;
+      return;
+    }
   }
 }
 
@@ -1228,8 +1244,10 @@ bool MetalCommandProcessor::IssueDrawImpl() {
     [encoder setDepthStencilState:depth_stencil_state];
     encoder_depth_stencil_state_ = depth_stencil_state;
   }
+  // Memexport must run even if nothing would be rasterized.
   if (!UpdateDynamicState(encoder, viewport_info, primitive_polygonal, normalized_depth_control,
-                          !is_rasterization_done)) {
+                          !is_rasterization_done ||
+                              (memexport_used_vertex && REXCVAR_GET(metal_memexport_never_culled)))) {
     // Nothing to draw (empty scissor or everything culled).
     return true;
   }
@@ -1783,10 +1801,15 @@ void MetalCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fro
       REXGPU_INFO("Metal compile totals: shaders {:.1f} s, {} pipelines {:.1f} s",
                   pipeline_cache_->shader_compile_seconds(), pipeline_cache_->pipelines_created(),
                   pipeline_cache_->pipeline_compile_seconds());
+      REXGPU_INFO("Metal frame times: worst {:.0f} ms, {} over 50 ms, {} over 100 ms",
+                  stats_.worst_frame_ms, stats_.frames_over_50ms, stats_.frames_over_100ms);
       REXGPU_INFO("Metal memory: {} MB allocated by the device, {} transient pages used, {} "
                   "free, {} deferred memory writes queued",
                   [device_ currentAllocatedSize] >> 20, transient_pages_used_.size(),
                   transient_pages_free_.size(), deferred_memory_writes_.size());
+      breaks += fmt::format(" surfaces created: {}, merged tile lists: {},",
+                            render_target_cache_->native_surfaces_created(),
+                            render_target_cache_->merged_tiles().size());
       breaks += fmt::format(" resolve snapshots: {} made, {} used, {} written to memory,",
                             render_target_cache_->resolve_snapshots_made(),
                             render_target_cache_->resolve_snapshots_taken(),
@@ -1800,6 +1823,17 @@ void MetalCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fro
       empty.last_log = now;
       stats_ = empty;
     }
+  }
+  {
+    auto swap_time = std::chrono::steady_clock::now();
+    if (last_swap_time_.time_since_epoch().count()) {
+      double frame_ms =
+          std::chrono::duration<double, std::milli>(swap_time - last_swap_time_).count();
+      stats_.worst_frame_ms = std::max(stats_.worst_frame_ms, frame_ms);
+      stats_.frames_over_50ms += frame_ms > 50.0;
+      stats_.frames_over_100ms += frame_ms > 100.0;
+    }
+    last_swap_time_ = swap_time;
   }
   if (!(total_swaps_++ % 300)) {
     pipeline_cache_->FlushStorage();
@@ -1865,6 +1899,49 @@ void MetalCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fro
         [encoder dispatchThreadgroups:MTLSizeMake((frontbuffer_width + 7) / 8,
                                                   (frontbuffer_height + 7) / 8, 1)
                 threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        {
+          // Frame-exact capture for debugging.
+          static int32_t capture_last = 0, capture_left = 0, capture_index = 0;
+          int32_t capture_requested = REXCVAR_GET(metal_capture_frames);
+          if (capture_requested != capture_last) {
+            capture_last = capture_requested;
+            capture_left = capture_requested;
+            capture_index = 0;
+          }
+          if (capture_left > 0) {
+            --capture_left;
+            id<MTLTexture> source = metal_context.texture();
+            MTLTextureDescriptor* descriptor = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:source.pixelFormat
+                                             width:frontbuffer_width
+                                            height:frontbuffer_height
+                                         mipmapped:NO];
+            descriptor.storageMode = MTLStorageModeShared;
+            id<MTLTexture> copy = [device_ newTextureWithDescriptor:descriptor];
+            id<MTLBlitCommandEncoder> blit = GetBlitEncoder();
+            [blit copyFromTexture:source
+                      sourceSlice:0
+                      sourceLevel:0
+                     sourceOrigin:MTLOriginMake(0, 0, 0)
+                       sourceSize:MTLSizeMake(frontbuffer_width, frontbuffer_height, 1)
+                        toTexture:copy
+                 destinationSlice:0
+                 destinationLevel:0
+                destinationOrigin:MTLOriginMake(0, 0, 0)];
+            std::string path = fmt::format("{}/f{:04}_{}x{}.raw", REXCVAR_GET(metal_capture_path),
+                                           capture_index++, frontbuffer_width, frontbuffer_height);
+            [GetCommandBuffer() addCompletedHandler:^(id<MTLCommandBuffer>) {
+              size_t size = size_t(copy.width) * copy.height * 4;
+              std::vector<uint8_t> data(size);
+              [copy getBytes:data.data()
+                  bytesPerRow:copy.width * 4
+                   fromRegion:MTLRegionMake2D(0, 0, copy.width, copy.height)
+                  mipmapLevel:0];
+              std::ofstream(path, std::ios::binary)
+                  .write(reinterpret_cast<const char*>(data.data()), std::streamsize(size));
+            }];
+          }
+        }
         // Committed before the presenter's command buffer reads the image.
         EndSubmission(true);
         return true;
