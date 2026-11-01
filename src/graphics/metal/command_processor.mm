@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstring>
 #include <chrono>
+#include <xxhash.h>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -244,6 +245,7 @@ void MetalCommandProcessor::ClearCaches() {
 void MetalCommandProcessor::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                                     uint32_t title_id, bool blocking) {
   CommandProcessor::InitializeShaderStorage(cache_root, title_id, blocking);
+  pipeline_cache_->InitializeStorage(cache_root / fmt::format("metal_{:08X}", title_id));
 }
 
 void MetalCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
@@ -339,7 +341,9 @@ void MetalCommandProcessor::OnPrimaryBufferEnd() {
   // Submit the work so far, so the GPU starts on it while the next primary
   // buffer is processed.
   if (command_buffer_) {
-    EndSubmission(false);
+    @autoreleasepool {
+      EndSubmission(false);
+    }
   }
 }
 
@@ -555,7 +559,9 @@ void MetalCommandProcessor::WriteMemoryFromCommandStream(uint32_t address, uint3
   }
   if (commit) {
     // The guest is likely to wait for the fence - start the GPU work now.
-    EndSubmission(false);
+    @autoreleasepool {
+      EndSubmission(false);
+    }
   }
 }
 
@@ -590,7 +596,9 @@ bool MetalCommandProcessor::AwaitCommandStreamMemoryWrites(uint32_t address) {
   // The awaited value may be written by the GPU work encoded so far (resolves,
   // memexport) or by a delayed write following it - submit it in any case.
   if (command_buffer_) {
-    EndSubmission(false);
+    @autoreleasepool {
+      EndSubmission(false);
+    }
   }
   // Only wait for the GPU if a delayed write to the polled address is pending
   // (other values, such as flags set by the guest's interrupt handlers, are
@@ -1007,7 +1015,12 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
           regs.values[XE_GPU_REG_RB_COLORCONTROL], regs.values[XE_GPU_REG_PA_SU_SC_MODE_CNTL]);
     }
   }
-  bool result = IssueDrawImpl();
+  // The worker thread has no run loop - without a pool, autoreleased Metal
+  // objects (encoders, descriptors, strings) would never be released.
+  bool result;
+  @autoreleasepool {
+    result = IssueDrawImpl();
+  }
   if (!result) {
     ++stats_.draws_failed;
   }
@@ -1552,6 +1565,8 @@ void MetalCommandProcessor::BindDrawResources(id<MTLRenderCommandEncoder> encode
     for (auto& stage_samplers : encoder_samplers_) {
       stage_samplers.fill(nullptr);
     }
+    encoder_bindings_valid_[0] = false;
+    encoder_bindings_valid_[1] = false;
   }
   uint32_t to_bind = constant_buffers_to_bind_;
   uint32_t constant_buffer;
@@ -1578,6 +1593,33 @@ void MetalCommandProcessor::BindDrawResources(id<MTLRenderCommandEncoder> encode
     }
     const std::vector<MetalShader::TextureBinding>& textures =
         shader->GetTextureBindingsAfterTranslation();
+    // Same shader and same fetch constants as the last draw of this encoder -
+    // the same textures and samplers (textures are only destroyed between
+    // frames, when the render pass has ended).
+    const std::vector<MetalShader::SamplerBinding>& stage_samplers =
+        shader->GetSamplerBindingsAfterTranslation();
+    XXH3_state_t binding_hash_state;
+    XXH3_64bits_reset(&binding_hash_state);
+    XXH3_64bits_update(&binding_hash_state, &shader, sizeof(shader));
+    const RegisterFile& regs = *register_file_;
+    for (const MetalShader::TextureBinding& binding : textures) {
+      XXH3_64bits_update(
+          &binding_hash_state,
+          &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + binding.fetch_constant * 6],
+          sizeof(uint32_t) * 6);
+    }
+    for (const MetalShader::SamplerBinding& binding : stage_samplers) {
+      XXH3_64bits_update(
+          &binding_hash_state,
+          &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + binding.fetch_constant * 6],
+          sizeof(uint32_t) * 6);
+    }
+    uint64_t binding_hash = XXH3_64bits_digest(&binding_hash_state);
+    if (encoder_bindings_valid_[stage] && encoder_binding_hash_[stage] == binding_hash) {
+      continue;
+    }
+    encoder_bindings_valid_[stage] = true;
+    encoder_binding_hash_[stage] = binding_hash;
     for (size_t i = 0; i < textures.size(); ++i) {
       const MetalShader::TextureBinding& binding = textures[i];
       id<MTLTexture> texture = texture_cache_->GetActiveTextureOrNull(
@@ -1619,8 +1661,11 @@ void MetalCommandProcessor::BindDrawResources(id<MTLRenderCommandEncoder> encode
 bool MetalCommandProcessor::IssueCopy() {
   GetCommandBuffer();
   uint32_t written_address, written_length;
-  bool result = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                              written_address, written_length);
+  bool result;
+  @autoreleasepool {
+    result = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+                                           written_address, written_length);
+  }
   ++stats_.resolves;
   if (written_length) {
     ++stats_.resolves_written;
@@ -1630,6 +1675,13 @@ bool MetalCommandProcessor::IssueCopy() {
 
 void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
+  @autoreleasepool {
+    IssueSwapImpl(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  }
+}
+
+void MetalCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                          uint32_t frontbuffer_height) {
   ++stats_.swaps;
   if (REXCVAR_GET(metal_log_frame_rate)) {
     static auto rate_start = std::chrono::steady_clock::now();
@@ -1697,6 +1749,9 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                     100.0 * stats_.cp_wait_seconds / seconds,
                     1000.0 * gpu_busy / std::max(stats_.swaps, uint64_t(1)));
       }
+      REXGPU_INFO("Metal compile totals: shaders {:.1f} s, {} pipelines {:.1f} s",
+                  pipeline_cache_->shader_compile_seconds(), pipeline_cache_->pipelines_created(),
+                  pipeline_cache_->pipeline_compile_seconds());
       REXGPU_INFO("Metal memory: {} MB allocated by the device, {} transient pages used, {} "
                   "free, {} deferred memory writes queued",
                   [device_ currentAllocatedSize] >> 20, transient_pages_used_.size(),
@@ -1713,6 +1768,9 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       empty.last_log = now;
       stats_ = empty;
     }
+  }
+  if (!(total_swaps_++ % 300)) {
+    pipeline_cache_->FlushStorage();
   }
   ui::Presenter* presenter = graphics_system_->presenter();
   if (!presenter || !frontbuffer_width || !frontbuffer_height) {

@@ -136,6 +136,8 @@ class MetalCommandProcessor : public CommandProcessor {
 
  private:
   bool IssueDrawImpl();
+  void IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                     uint32_t frontbuffer_height);
   void BeginFrameIfNeeded();
   // Commits the current command buffer if there is one, and if is_swap, ends
   // the guest frame.
@@ -233,6 +235,10 @@ class MetalCommandProcessor : public CommandProcessor {
   static constexpr uint32_t kMaxBoundSamplers = 16;
   std::array<std::array<const void*, kMaxBoundTextures>, 2> encoder_textures_{};
   std::array<std::array<const void*, kMaxBoundSamplers>, 2> encoder_samplers_{};
+  // Per stage: hash of the shader and the fetch constants of its textures and
+  // samplers bound to the current encoder, to skip the whole binding.
+  std::array<uint64_t, 2> encoder_binding_hash_{};
+  bool encoder_bindings_valid_[2] = {};
 
   // Transient memory: pages of shared buffers, reused when their frame has
   // completed.
@@ -283,6 +289,7 @@ class MetalCommandProcessor : public CommandProcessor {
   };
   Stats stats_;
   uint64_t frame_rate_draw_count_ = 0;
+  uint64_t total_swaps_ = 0;
 };
 
 }  // namespace rex::graphics::metal

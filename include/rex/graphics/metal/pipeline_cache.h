@@ -13,6 +13,8 @@
 #include <memory>
 #include <unordered_map>
 
+#include <filesystem>
+
 #import <Metal/Metal.h>
 
 #include <rex/graphics/metal/render_target_cache.h>
@@ -35,6 +37,16 @@ class MetalPipelineCache {
 
   bool Initialize();
   void Shutdown();
+
+  // Stores converted shaders and a pipeline binary archive in the directory,
+  // so later runs don't compile them again (no stutter on first use).
+  void InitializeStorage(const std::filesystem::path& directory);
+  // Writes the new pipelines to the binary archive.
+  void FlushStorage();
+  // Total time spent on the command processor thread (for statistics).
+  double shader_compile_seconds() const { return shader_compile_seconds_; }
+  double pipeline_compile_seconds() const { return pipeline_compile_seconds_; }
+  uint64_t pipelines_created() const { return pipelines_created_; }
 
   MetalShader* LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
                           uint32_t dword_count);
@@ -81,6 +93,12 @@ class MetalPipelineCache {
   string::StringBuffer ucode_disasm_buffer_;
 
   std::unordered_map<uint64_t, std::unique_ptr<MetalShader>> shaders_;
+  std::filesystem::path binary_archive_path_;
+  id<MTLBinaryArchive> binary_archive_ = nil;
+  bool binary_archive_dirty_ = false;
+  double shader_compile_seconds_ = 0.0;
+  double pipeline_compile_seconds_ = 0.0;
+  uint64_t pipelines_created_ = 0;
   std::unordered_map<uint64_t, id<MTLRenderPipelineState>> pipelines_;
   std::unordered_map<uint64_t, id<MTLDepthStencilState>> depth_stencil_states_;
 };

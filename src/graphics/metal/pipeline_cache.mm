@@ -11,6 +11,7 @@
 
 #include <rex/graphics/metal/pipeline_cache.h>
 
+#include <chrono>
 #include <cstring>
 
 #include <xxhash.h>
@@ -31,6 +32,10 @@ REXCVAR_DEFINE_BOOL(metal_sm3_multiplication_vertex, true, "GPU/Metal",
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(metal_sm3_multiplication_pixel, true, "GPU/Metal",
                     "Emulate Shader Model 3 multiplication (0 * infinity = 0) in pixel shaders")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(metal_pipeline_archive, false, "GPU/Metal",
+                    "Keep a pipeline binary archive on disk (compiles each new pipeline twice, "
+                    "Metal also caches compiled shaders by itself)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(metal_native_points, true, "GPU/Metal",
                     "Draw point sprites as Metal points (the vertex shader runs once per point) "
@@ -177,6 +182,8 @@ bool MetalPipelineCache::Initialize() {
 }
 
 void MetalPipelineCache::Shutdown() {
+  FlushStorage();
+  binary_archive_ = nil;
   pipelines_.clear();
   depth_stencil_states_.clear();
   shaders_.clear();
@@ -200,6 +207,61 @@ void MetalPipelineCache::AnalyzeShaderUcode(Shader& shader) {
   if (!shader.is_ucode_analyzed()) {
     shader.AnalyzeUcode(ucode_disasm_buffer_);
   }
+}
+
+void MetalPipelineCache::InitializeStorage(const std::filesystem::path& directory) {
+  std::error_code error_code;
+  std::filesystem::create_directories(directory / "msl", error_code);
+  if (error_code) {
+    REXGPU_WARN("MetalPipelineCache: Failed to create the shader storage directory {}",
+                directory.string());
+    return;
+  }
+  MetalShader::SetMslCacheDirectory(directory / "msl");
+  if (!REXCVAR_GET(metal_pipeline_archive)) {
+    return;
+  }
+  binary_archive_path_ = directory / "pipelines.metallib";
+  MTLBinaryArchiveDescriptor* descriptor = [[MTLBinaryArchiveDescriptor alloc] init];
+  if (std::filesystem::exists(binary_archive_path_, error_code)) {
+    descriptor.url = [NSURL fileURLWithPath:@(binary_archive_path_.c_str())];
+  }
+  NSError* error = nil;
+  binary_archive_ = [command_processor_.device() newBinaryArchiveWithDescriptor:descriptor
+                                                                         error:&error];
+  if (!binary_archive_ && descriptor.url) {
+    // Created by a different OS or GPU driver version - start over.
+    REXGPU_WARN("MetalPipelineCache: Discarding the pipeline binary archive: {}",
+                error ? [error.localizedDescription UTF8String] : "unknown error");
+    std::filesystem::remove(binary_archive_path_, error_code);
+    descriptor.url = nil;
+    error = nil;
+    binary_archive_ = [command_processor_.device() newBinaryArchiveWithDescriptor:descriptor
+                                                                           error:&error];
+  }
+  if (!binary_archive_) {
+    REXGPU_WARN("MetalPipelineCache: No pipeline binary archive: {}",
+                error ? [error.localizedDescription UTF8String] : "unknown error");
+  }
+}
+
+void MetalPipelineCache::FlushStorage() {
+  if (!binary_archive_ || !binary_archive_dirty_) {
+    return;
+  }
+  binary_archive_dirty_ = false;
+  // Written to a temporary file first, so a crash can't leave a broken archive.
+  std::filesystem::path temporary_path = binary_archive_path_;
+  temporary_path += ".tmp";
+  NSError* error = nil;
+  if (![binary_archive_ serializeToURL:[NSURL fileURLWithPath:@(temporary_path.c_str())]
+                                 error:&error]) {
+    REXGPU_WARN("MetalPipelineCache: Failed to write the pipeline binary archive: {}",
+                error ? [error.localizedDescription UTF8String] : "unknown error");
+    return;
+  }
+  std::error_code error_code;
+  std::filesystem::rename(temporary_path, binary_archive_path_, error_code);
 }
 
 bool MetalPipelineCache::UseHardwareTessellation(
@@ -311,6 +373,14 @@ SpirvShaderTranslator::Modification MetalPipelineCache::GetCurrentPixelShaderMod
 bool MetalPipelineCache::EnsureShadersTranslated(MetalShader::MetalTranslation* vertex_shader,
                                                  MetalShader::MetalTranslation* pixel_shader) {
   const ui::metal::MetalProvider& provider = command_processor_.GetMetalProvider();
+  auto start = std::chrono::steady_clock::now();
+  struct AddTime {
+    double& total;
+    std::chrono::steady_clock::time_point start;
+    ~AddTime() {
+      total += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    }
+  } add_time{shader_compile_seconds_, start};
   for (MetalShader::MetalTranslation* translation : {vertex_shader, pixel_shader}) {
     if (!translation) {
       continue;
@@ -479,15 +549,43 @@ id<MTLRenderPipelineState> MetalPipelineCache::GetPipeline(
   descriptor.depthAttachmentPixelFormat = formats.depth;
   descriptor.stencilAttachmentPixelFormat = formats.depth;
 
+  auto compile_start = std::chrono::steady_clock::now();
   NSError* error = nil;
-  id<MTLRenderPipelineState> pipeline =
-      [command_processor_.device() newRenderPipelineStateWithDescriptor:descriptor error:&error];
+  id<MTLRenderPipelineState> pipeline = nil;
+  // A binary archive can't be serialized with pipelines without a fragment
+  // function (depth-only drawing) - they're cheap to compile anyway.
+  if (binary_archive_ && descriptor.fragmentFunction) {
+    descriptor.binaryArchives = @[ binary_archive_ ];
+    // In the archive: no compilation.
+    pipeline = [command_processor_.device()
+        newRenderPipelineStateWithDescriptor:descriptor
+                                     options:MTLPipelineOptionFailOnBinaryArchiveMiss
+                                  reflection:nil
+                                       error:&error];
+    if (!pipeline) {
+      error = nil;
+      if ([binary_archive_ addRenderPipelineFunctionsWithDescriptor:descriptor error:&error]) {
+        binary_archive_dirty_ = true;
+      } else {
+        REXGPU_WARN("MetalPipelineCache: Failed to add a pipeline to the binary archive: {}",
+                    error ? [error.localizedDescription UTF8String] : "unknown error");
+      }
+      error = nil;
+    }
+  }
+  if (!pipeline) {
+    pipeline =
+        [command_processor_.device() newRenderPipelineStateWithDescriptor:descriptor error:&error];
+  }
   if (!pipeline) {
     REXGPU_ERROR("MetalPipelineCache: Failed to create a pipeline for shaders {:016X}/{:016X}: {}",
                  vertex_shader->shader().ucode_data_hash(),
                  pixel_shader ? pixel_shader->shader().ucode_data_hash() : 0,
                  error ? [error.localizedDescription UTF8String] : "unknown error");
   }
+  pipeline_compile_seconds_ +=
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - compile_start).count();
+  ++pipelines_created_;
   pipelines_.emplace(key_hash, pipeline);
   return pipeline;
 }

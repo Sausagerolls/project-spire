@@ -12,6 +12,8 @@
 #include <cstdint>
 #include <mutex>
 
+#include <filesystem>
+
 #import <Metal/Metal.h>
 
 #include <rex/graphics/pipeline/shader/spirv.h>
@@ -24,6 +26,9 @@ namespace rex::graphics::metal {
 
 class MetalShader : public SpirvShader {
  public:
+  // Directory for converted MSL, keyed by the hash of the SPIR-V.
+  static void SetMslCacheDirectory(const std::filesystem::path& directory);
+
   class MetalTranslation : public SpirvTranslation {
    public:
     explicit MetalTranslation(MetalShader& shader, uint64_t modification)

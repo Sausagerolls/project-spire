@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <memory>
 #include <unordered_map>
+#include <vector>
 
 #import <Metal/Metal.h>
 
@@ -103,6 +104,16 @@ class MetalTextureCache final : public TextureCache {
   xenos::AnisoFilter max_anisotropy_ = xenos::AnisoFilter::kMax_16_1;
 
   std::array<id<MTLComputePipelineState>, kLoadShaderCount> load_pipelines_{};
+
+  // Reused private buffers for texture loads (creating one per load is slow).
+  struct ScratchBuffer {
+    id<MTLBuffer> buffer;
+    uint64_t last_submission;
+  };
+  static constexpr size_t kMaxScratchPoolBytes = 128 * 1024 * 1024;
+  std::vector<ScratchBuffer> scratch_buffers_;
+  size_t scratch_pool_bytes_ = 0;
+  id<MTLBuffer> AcquireScratchBuffer(size_t size);
 
   id<MTLTexture> null_texture_2d_array_ = nil;
   id<MTLTexture> null_texture_3d_ = nil;

@@ -555,6 +555,32 @@ std::unique_ptr<TextureCache::Texture> MetalTextureCache::CreateTexture(TextureK
   return std::make_unique<MetalTexture>(*this, key, texture);
 }
 
+id<MTLBuffer> MetalTextureCache::AcquireScratchBuffer(size_t size) {
+  // Sizes are rounded up to powers of two, so buffers are reusable.
+  size_t rounded_size = size_t(1) << (64 - __builtin_clzll(std::max(size, size_t(4096)) - 1));
+  uint64_t completed = command_processor_.GetCompletedSubmission();
+  uint64_t current = command_processor_.GetCurrentSubmission();
+  for (ScratchBuffer& scratch : scratch_buffers_) {
+    if (scratch.buffer.length == rounded_size && scratch.last_submission <= completed) {
+      scratch.last_submission = current;
+      return scratch.buffer;
+    }
+  }
+  id<MTLBuffer> buffer =
+      [command_processor_.device() newBufferWithLength:rounded_size
+                                               options:MTLResourceStorageModePrivate];
+  if (!buffer) {
+    return nil;
+  }
+  // Keep the pool bounded - oversized and excess buffers are released with the
+  // command buffers using them.
+  if (scratch_pool_bytes_ + rounded_size <= kMaxScratchPoolBytes) {
+    scratch_buffers_.push_back({buffer, current});
+    scratch_pool_bytes_ += rounded_size;
+  }
+  return buffer;
+}
+
 bool MetalTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                               bool load_mips) {
   // Follows the Vulkan backend: decode the guest data with a compute shader
@@ -685,9 +711,7 @@ bool MetalTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
   if (!host_buffer_size) {
     return true;
   }
-  id<MTLBuffer> scratch_buffer =
-      [command_processor_.device() newBufferWithLength:host_buffer_size
-                                               options:MTLResourceStorageModePrivate];
+  id<MTLBuffer> scratch_buffer = AcquireScratchBuffer(host_buffer_size);
   if (!scratch_buffer) {
     return false;
   }
