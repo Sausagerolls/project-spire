@@ -26,6 +26,8 @@ constexpr uint32_t kMslBufferSharedMemory = 0;
 constexpr uint32_t kMslBufferConstantsFirst = 1;
 constexpr uint32_t kMslBufferEdram = 8;
 constexpr uint32_t kMslBufferPushConstants = 9;
+// Per-patch data (stage_in) of hardware-tessellated guest draws.
+constexpr uint32_t kMslBufferTessellationPatches = 30;
 // Utility (non-guest) shaders may use other sets: set S binding N - buffer
 // kMslBufferUtilityFirst + 4 * S + N for buffers, texture 4 * S + N.
 constexpr uint32_t kMslBufferUtilityFirst = 10;

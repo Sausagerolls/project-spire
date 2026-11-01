@@ -173,6 +173,10 @@ class MetalCommandProcessor : public CommandProcessor {
   };
   std::unordered_map<uint32_t, TessellationGridIndices> tessellation_grid_indices_;
   id<MTLBuffer> GetTessellationGridIndices(uint32_t factor, uint32_t patch_count);
+  // Draws a quad-domain patch draw with the Metal tessellator.
+  static constexpr uint32_t kTessellationPatchControlPoints = 0;
+  bool DrawHardwareTessellated(id<MTLRenderCommandEncoder> encoder,
+                               const PrimitiveProcessor::ProcessingResult& primitive_processing_result);
 
   // Submissions.
   id<MTLCommandBuffer> command_buffer_ = nil;
@@ -197,6 +201,8 @@ class MetalCommandProcessor : public CommandProcessor {
   std::mutex deferred_memory_writes_mutex_;
   // Notified when a submission completes.
   std::condition_variable submission_completed_cv_;
+  // GPU execution time of completed command buffers (seconds, for stats).
+  std::atomic<double> gpu_busy_seconds_{0.0};
   std::deque<DeferredMemoryWrite> deferred_memory_writes_;
   // Applies the deferred writes up to the completed submission (with the
   // mutex locked).
@@ -265,8 +271,10 @@ class MetalCommandProcessor : public CommandProcessor {
     uint64_t deferred_memory_writes = 0;
     uint64_t guest_render_passes = 0;
     uint64_t texture_loads_reordered = 0;
+    double cp_wait_seconds = 0.0;
     uint64_t vertices = 0;
     std::map<std::string, uint64_t> vertices_by_type;
+    std::unordered_map<uint64_t, uint64_t> vertices_by_shader;
     std::map<std::string, uint64_t> render_pass_breaks;
     std::map<std::string, uint64_t> utility_passes;
     std::chrono::steady_clock::time_point last_log{};

@@ -16,12 +16,19 @@
 #include <xxhash.h>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
+#include <rex/graphics/metal/msl_util.h>
 #include <rex/graphics/metal/command_processor.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/metal/metal_provider.h>
+
+REXCVAR_DEFINE_BOOL(metal_hardware_tessellation, true, "GPU/Metal",
+                    "Tessellate quad patches with the Metal tessellator and per-patch factors "
+                    "instead of drawing a grid at the maximum factor")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::metal {
 
@@ -181,9 +188,16 @@ void MetalPipelineCache::AnalyzeShaderUcode(Shader& shader) {
   }
 }
 
+bool MetalPipelineCache::UseHardwareTessellation(
+    Shader::HostVertexShaderType host_vertex_shader_type) {
+  return REXCVAR_GET(metal_hardware_tessellation) &&
+         host_vertex_shader_type == Shader::HostVertexShaderType::kQuadDomainPatchIndexed;
+}
+
 uint32_t MetalPipelineCache::GetTessellationGridFactor(
     const RegisterFile& regs, Shader::HostVertexShaderType host_vertex_shader_type) {
-  if (host_vertex_shader_type != Shader::HostVertexShaderType::kQuadDomainPatchIndexed) {
+  if (host_vertex_shader_type != Shader::HostVertexShaderType::kQuadDomainPatchIndexed ||
+      UseHardwareTessellation(host_vertex_shader_type)) {
     return 0;
   }
   xenos::TessellationMode tessellation_mode = regs.Get<reg::VGT_HOS_CNTL>().tess_mode;
@@ -308,10 +322,13 @@ id<MTLRenderPipelineState> MetalPipelineCache::GetPipeline(
     uint32_t normalized_color_mask, const MetalRenderTargetCache::RenderPassFormats& formats) {
   const RegisterFile& regs = register_file_;
 
-  bool tessellation_grid =
-      SpirvShaderTranslator::Modification(vertex_shader->modification()).vertex.tessellation_grid;
+  SpirvShaderTranslator::Modification vertex_modification(vertex_shader->modification());
+  bool tessellation_grid = vertex_modification.vertex.tessellation_grid;
+  bool tessellation_hardware =
+      !tessellation_grid && Shader::IsHostVertexShaderTypeDomain(Shader::HostVertexShaderType(
+                                vertex_modification.vertex.host_vertex_shader_type));
   MTLPrimitiveTopologyClass topology_class;
-  if (tessellation_grid) {
+  if (tessellation_grid || tessellation_hardware) {
     topology_class = MTLPrimitiveTopologyClassTriangle;
   } else {
     switch (primitive_processing_result.host_primitive_type) {
@@ -327,7 +344,8 @@ id<MTLRenderPipelineState> MetalPipelineCache::GetPipeline(
         break;
     }
   }
-  bool primitive_polygonal = tessellation_grid || draw_util::IsPrimitivePolygonal(regs);
+  bool primitive_polygonal =
+      tessellation_grid || tessellation_hardware || draw_util::IsPrimitivePolygonal(regs);
   bool rasterization_enabled = draw_util::IsRasterizationPotentiallyDone(regs, primitive_polygonal);
   bool alpha_to_coverage = pixel_shader && regs.Get<reg::RB_COLORCONTROL>().alpha_to_mask_enable;
 
@@ -355,7 +373,8 @@ id<MTLRenderPipelineState> MetalPipelineCache::GetPipeline(
   key.sample_count = formats.sample_count;
   key.write_masks = normalized_color_mask;
   key.flags = uint32_t(topology_class) | (uint32_t(rasterization_enabled) << 4) |
-              (uint32_t(alpha_to_coverage) << 5);
+              (uint32_t(alpha_to_coverage) << 5) | (uint32_t(tessellation_hardware) << 6) |
+              (vertex_modification.vertex.tessellation_mode << 7);
   uint64_t key_hash = XXH3_64bits(&key, sizeof(key));
   auto it = pipelines_.find(key_hash);
   if (it != pipelines_.end()) {
@@ -367,6 +386,29 @@ id<MTLRenderPipelineState> MetalPipelineCache::GetPipeline(
   descriptor.vertexFunction = vertex_shader->GetOrCreateFunction(provider);
   descriptor.fragmentFunction = pixel_shader ? pixel_shader->GetOrCreateFunction(provider) : nil;
   descriptor.inputPrimitiveTopology = topology_class;
+  if (tessellation_hardware) {
+    // Per-patch factors (MTLQuadTessellationFactorsHalf) and the patch index
+    // (stage_in attribute 0, a patch attribute in the translated domain
+    // shader) come from buffers the command processor fills.
+    descriptor.maxTessellationFactor = 64;
+    descriptor.tessellationFactorFormat = MTLTessellationFactorFormatHalf;
+    descriptor.tessellationFactorStepFunction = MTLTessellationFactorStepFunctionPerPatch;
+    descriptor.tessellationControlPointIndexType = MTLTessellationControlPointIndexTypeNone;
+    descriptor.tessellationPartitionMode =
+        vertex_modification.vertex.tessellation_mode == uint32_t(xenos::TessellationMode::kDiscrete)
+            ? MTLTessellationPartitionModeInteger
+            : MTLTessellationPartitionModeFractionalEven;
+    descriptor.tessellationOutputWindingOrder = MTLWindingCounterClockwise;
+    MTLVertexDescriptor* vertex_descriptor = [MTLVertexDescriptor vertexDescriptor];
+    vertex_descriptor.attributes[0].format = MTLVertexFormatFloat4;
+    vertex_descriptor.attributes[0].offset = 0;
+    vertex_descriptor.attributes[0].bufferIndex = kMslBufferTessellationPatches;
+    vertex_descriptor.layouts[kMslBufferTessellationPatches].stride = sizeof(float) * 4;
+    vertex_descriptor.layouts[kMslBufferTessellationPatches].stepFunction =
+        MTLVertexStepFunctionPerPatch;
+    vertex_descriptor.layouts[kMslBufferTessellationPatches].stepRate = 1;
+    descriptor.vertexDescriptor = vertex_descriptor;
+  }
   descriptor.rasterSampleCount = formats.sample_count;
   // Metal requires a void vertex function without rasterization. Draws not
   // rasterizing (memexport only) are drawn without a fragment shader and with

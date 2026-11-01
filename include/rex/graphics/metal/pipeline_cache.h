@@ -66,6 +66,9 @@ class MetalPipelineCache {
   // for drawing quad patches as a triangle grid in the vertex shader, or 0 if
   // the draw can't be drawn that way (Metal has no tessellation stages usable
   // by the translated shaders).
+  // Whether the draw is tessellated by the Metal tessellator (per-patch
+  // factors computed by the command processor) rather than drawn as a grid.
+  static bool UseHardwareTessellation(Shader::HostVertexShaderType host_vertex_shader_type);
   static uint32_t GetTessellationGridFactor(const RegisterFile& regs,
                                             Shader::HostVertexShaderType host_vertex_shader_type);
 

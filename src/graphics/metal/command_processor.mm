@@ -327,6 +327,115 @@ void MetalCommandProcessor::OnPrimaryBufferEnd() {
   }
 }
 
+bool MetalCommandProcessor::DrawHardwareTessellated(
+    id<MTLRenderCommandEncoder> encoder,
+    const PrimitiveProcessor::ProcessingResult& primitive_processing_result) {
+  const RegisterFile& regs = *register_file_;
+  bool adaptive =
+      primitive_processing_result.tessellation_mode == xenos::TessellationMode::kAdaptive;
+  uint32_t patch_count = adaptive ? primitive_processing_result.host_draw_vertex_count / 4
+                                  : primitive_processing_result.host_draw_vertex_count;
+  if (!patch_count) {
+    return true;
+  }
+  // Index values: the patch indices (discrete) or the bits of the edge factors
+  // (adaptive), from the guest index buffer, or auto-generated.
+  const uint8_t* guest_indices = nullptr;
+  bool indices_32bit = true;
+  if (primitive_processing_result.index_buffer_type ==
+      PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA) {
+    guest_indices = memory_->TranslatePhysical(primitive_processing_result.guest_index_base);
+    indices_32bit =
+        primitive_processing_result.host_index_format == xenos::IndexFormat::kInt32;
+  } else if (primitive_processing_result.index_buffer_type !=
+                 PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
+             adaptive) {
+    return false;
+  }
+  xenos::Endian index_endian = primitive_processing_result.host_shader_index_endian;
+  auto load_index = [&](uint32_t i) -> uint32_t {
+    if (!guest_indices) {
+      return i;
+    }
+    if (indices_32bit) {
+      uint32_t value;
+      std::memcpy(&value, guest_indices + size_t(i) * 4, sizeof(value));
+      return xenos::GpuSwap(value, index_endian);
+    }
+    uint16_t value;
+    std::memcpy(&value, guest_indices + size_t(i) * 2, sizeof(value));
+    return index_endian == xenos::Endian::kNone ? value : uint32_t(__builtin_bswap16(value));
+  };
+  float factor_min = regs.Get<float>(XE_GPU_REG_VGT_HOS_MIN_TESS_LEVEL) + 1.0f;
+  float factor_max = regs.Get<float>(XE_GPU_REG_VGT_HOS_MAX_TESS_LEVEL) + 1.0f;
+  uint32_t vertex_base = regs[XE_GPU_REG_VGT_INDX_OFFSET];
+  uint32_t vertex_min = regs[XE_GPU_REG_VGT_MIN_VTX_INDX];
+  uint32_t vertex_max = regs[XE_GPU_REG_VGT_MAX_VTX_INDX];
+  auto patch_index = [&](uint32_t value) {
+    return float(std::clamp((value + vertex_base) & 0xFFFFFF, vertex_min, vertex_max));
+  };
+
+  struct QuadFactors {
+    _Float16 edge[4];
+    _Float16 inside[2];
+  };
+  static_assert(sizeof(QuadFactors) == sizeof(MTLQuadTessellationFactorsHalf));
+  __strong id<MTLBuffer> factors_buffer = nil, patches_buffer = nil;
+  NSUInteger factors_offset = 0, patches_offset = 0;
+  void *factors_mapping = nullptr, *patches_mapping = nullptr;
+  if (!RequestTransientBuffer(sizeof(QuadFactors) * patch_count, 16, factors_buffer,
+                              factors_offset, factors_mapping) ||
+      !RequestTransientBuffer(sizeof(float) * 4 * patch_count, 16, patches_buffer,
+                              patches_offset, patches_mapping)) {
+    return false;
+  }
+  auto* factors = static_cast<QuadFactors*>(factors_mapping);
+  auto* patches = static_cast<float*>(patches_mapping);
+  for (uint32_t patch = 0; patch < patch_count; ++patch) {
+    float edge[4];
+    if (adaptive) {
+      // The index buffer holds the floating-point edge factors, like the
+      // Vulkan backend's tessellation control shader.
+      float values[4];
+      for (uint32_t i = 0; i < 4; ++i) {
+        uint32_t bits = load_index(patch * 4 + i);
+        float value;
+        std::memcpy(&value, &bits, sizeof(value));
+        values[i] = std::min(std::max(value + 1.0f, factor_min), factor_max);
+      }
+      edge[0] = values[3];
+      edge[1] = values[0];
+      edge[2] = values[1];
+      edge[3] = values[2];
+      patches[patch * 4] = patch_index(patch);
+    } else {
+      edge[0] = edge[1] = edge[2] = edge[3] = factor_max;
+      patches[patch * 4] = patch_index(load_index(patch));
+    }
+    patches[patch * 4 + 1] = 0.0f;
+    patches[patch * 4 + 2] = 0.0f;
+    patches[patch * 4 + 3] = 0.0f;
+    QuadFactors& out = factors[patch];
+    for (uint32_t i = 0; i < 4; ++i) {
+      out.edge[i] = _Float16(edge[i]);
+    }
+    out.inside[0] = _Float16(std::min(edge[3], edge[1]));
+    out.inside[1] = _Float16(std::min(edge[2], edge[0]));
+  }
+  [encoder setTessellationFactorBuffer:factors_buffer offset:factors_offset instanceStride:0];
+  [encoder setVertexBuffer:patches_buffer
+                    offset:patches_offset
+                   atIndex:kMslBufferTessellationPatches];
+  [encoder drawPatches:kTessellationPatchControlPoints
+                   patchStart:0
+                   patchCount:patch_count
+             patchIndexBuffer:nil
+       patchIndexBufferOffset:0
+                instanceCount:1
+                 baseInstance:0];
+  return true;
+}
+
 id<MTLBuffer> MetalCommandProcessor::GetTessellationGridIndices(uint32_t factor,
                                                                uint32_t patch_count) {
   TessellationGridIndices& indices = tessellation_grid_indices_[factor];
@@ -471,10 +580,15 @@ bool MetalCommandProcessor::AwaitCommandStreamMemoryWrites(uint32_t address) {
   if (!await_submission) {
     return false;
   }
-  std::unique_lock<std::mutex> lock(deferred_memory_writes_mutex_);
-  submission_completed_cv_.wait_for(lock, std::chrono::milliseconds(4), [&] {
-    return GetCompletedSubmission() >= await_submission;
-  });
+  auto wait_start = std::chrono::steady_clock::now();
+  {
+    std::unique_lock<std::mutex> lock(deferred_memory_writes_mutex_);
+    submission_completed_cv_.wait_for(lock, std::chrono::milliseconds(4), [&] {
+      return GetCompletedSubmission() >= await_submission;
+    });
+  }
+  stats_.cp_wait_seconds +=
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - wait_start).count();
   return true;
 }
 
@@ -490,6 +604,12 @@ id<MTLCommandBuffer> MetalCommandProcessor::GetCommandBuffer() {
       if (buffer.status == MTLCommandBufferStatusError) {
         REXGPU_ERROR("Metal command buffer {} failed: {}", submission,
                      buffer.error ? [buffer.error.localizedDescription UTF8String] : "unknown");
+      }
+      double gpu_time = buffer.GPUEndTime - buffer.GPUStartTime;
+      if (gpu_time > 0.0) {
+        double busy = gpu_busy_seconds_.load(std::memory_order_relaxed);
+        while (!gpu_busy_seconds_.compare_exchange_weak(busy, busy + gpu_time)) {
+        }
       }
       // The queue completes command buffers in order.
       std::lock_guard<std::mutex> lock(deferred_memory_writes_mutex_);
@@ -926,7 +1046,11 @@ bool MetalCommandProcessor::IssueDrawImpl() {
   Shader::HostVertexShaderType host_vertex_shader_type =
       primitive_processing_result.host_vertex_shader_type;
   uint32_t tessellation_grid_factor = 0;
-  if (Shader::IsHostVertexShaderTypeDomain(host_vertex_shader_type)) {
+  bool tessellation_hardware = false;
+  if (Shader::IsHostVertexShaderTypeDomain(host_vertex_shader_type) &&
+      MetalPipelineCache::UseHardwareTessellation(host_vertex_shader_type)) {
+    tessellation_hardware = true;
+  } else if (Shader::IsHostVertexShaderTypeDomain(host_vertex_shader_type)) {
     tessellation_grid_factor =
         MetalPipelineCache::GetTessellationGridFactor(regs, host_vertex_shader_type);
     if (!tessellation_grid_factor) {
@@ -1043,11 +1167,12 @@ bool MetalCommandProcessor::IssueDrawImpl() {
                                 ? "rectangles"
                                 : "vertex";
     stats_.vertices_by_type[type_name] += vertex_count;
+    stats_.vertices_by_shader[vertex_shader->ucode_data_hash()] += vertex_count;
   }
 
   // Draw.
   MTLPrimitiveType primitive_type;
-  if (tessellation_grid_factor) {
+  if (tessellation_grid_factor || tessellation_hardware) {
     primitive_type = MTLPrimitiveTypeTriangle;
   } else {
     switch (primitive_processing_result.host_primitive_type) {
@@ -1071,7 +1196,11 @@ bool MetalCommandProcessor::IssueDrawImpl() {
         return draw_fail("primitive type");
     }
   }
-  if (tessellation_grid_factor) {
+  if (tessellation_hardware) {
+    if (!DrawHardwareTessellated(encoder, primitive_processing_result)) {
+      return draw_fail("hardware tessellation");
+    }
+  } else if (tessellation_grid_factor) {
     uint32_t patch_count =
         primitive_processing_result.tessellation_mode == xenos::TessellationMode::kAdaptive
             ? primitive_processing_result.host_draw_vertex_count / 4
@@ -1485,10 +1614,31 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                               double(type.second) / 1000.0 / std::max(stats_.swaps, uint64_t(1)));
       }
       breaks += ")";
+      {
+        std::vector<std::pair<uint64_t, uint64_t>> top(stats_.vertices_by_shader.begin(),
+                                                       stats_.vertices_by_shader.end());
+        std::sort(top.begin(), top.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+        breaks += " top vertex shaders:";
+        for (size_t i = 0; i < std::min(top.size(), size_t(8)); ++i) {
+          breaks += fmt::format(" {:016X} {:.0f}k,", top[i].first,
+                                double(top[i].second) / 1000.0 /
+                                    std::max(stats_.swaps, uint64_t(1)));
+        }
+      }
       breaks += " utility passes:";
       for (const auto& reason : stats_.utility_passes) {
         breaks += fmt::format(" {}: {:.1f},", reason.first,
                               double(reason.second) / std::max(stats_.swaps, uint64_t(1)));
+      }
+      {
+        double seconds =
+            std::chrono::duration<double>(now - stats_.last_log).count();
+        double gpu_busy = gpu_busy_seconds_.exchange(0.0);
+        REXGPU_INFO("Metal timing: GPU busy {:.0f}%, command processor waiting for the GPU "
+                    "{:.0f}%, {:.1f} ms GPU per frame",
+                    100.0 * gpu_busy / seconds, 100.0 * stats_.cp_wait_seconds / seconds,
+                    1000.0 * gpu_busy / std::max(stats_.swaps, uint64_t(1)));
       }
       REXGPU_INFO("Metal memory: {} MB allocated by the device, {} transient pages used, {} "
                   "free, {} deferred memory writes queued",
