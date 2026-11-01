@@ -239,6 +239,9 @@ class MetalCommandProcessor : public CommandProcessor {
   // samplers bound to the current encoder, to skip the whole binding.
   std::array<uint64_t, 2> encoder_binding_hash_{};
   bool encoder_bindings_valid_[2] = {};
+  // Memexport wrote guest memory in the current render encoder - later draws
+  // reading it need a new encoder (ordered by hazard tracking).
+  bool encoder_memexport_written_ = false;
 
   // Transient memory: pages of shared buffers, reused when their frame has
   // completed.

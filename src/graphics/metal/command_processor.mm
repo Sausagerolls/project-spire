@@ -79,6 +79,11 @@ REXCVAR_DEFINE_BOOL(metal_tessellation_adaptive_factors, false, "GPU/Metal",
                     "Use the per-edge factors of adaptive patches with hardware tessellation "
                     "(currently leaves holes in Fable II's terrain; off uses the maximum factor)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(metal_memexport_end_pass, true, "GPU/Metal",
+                    "End the render pass between memexport draws and draws following them, so the "
+                    "exported data is visible to them (vertex stage barriers don't guarantee that "
+                    "on Apple GPUs)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(metal_sync_submissions, false, "GPU/Metal",
                     "Wait for the GPU after every submission (debugging CPU / GPU memory hazards)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -753,6 +758,7 @@ void MetalCommandProcessor::AwaitAllSubmissionsCompletion() {
 }
 
 void MetalCommandProcessor::EndEncoding() {
+  encoder_memexport_written_ = false;
   if (render_encoder_) {
     [render_encoder_ endEncoding];
     render_encoder_ = nil;
@@ -1177,6 +1183,11 @@ bool MetalCommandProcessor::IssueDrawImpl() {
   UpdateSystemConstantValues(primitive_polygonal, primitive_processing_result, viewport_info,
                              used_texture_mask, normalized_depth_control, normalized_color_mask);
 
+  if (encoder_memexport_written_ && !memexport_used_vertex && !memexport_used_pixel &&
+      REXCVAR_GET(metal_memexport_end_pass)) {
+    CountRenderPassBreak("memexport");
+    EndEncoding();
+  }
   id<MTLRenderCommandEncoder> encoder = GetRenderEncoderForCurrentRenderTargets();
   if (!encoder) {
     return draw_fail("encoder");
@@ -1343,6 +1354,7 @@ bool MetalCommandProcessor::IssueDrawImpl() {
                                                          : MTLRenderStageVertex
                        beforeStages:MTLRenderStageVertex | MTLRenderStageFragment];
     ++stats_.memexport_draws;
+    encoder_memexport_written_ = true;
   }
   return true;
 }
