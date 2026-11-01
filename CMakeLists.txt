@@ -78,6 +78,7 @@ set(FABLE2_SOURCES
     src/core/fable2_patches.cpp
     src/core/fable2_hooks.cpp
     src/core/fable2_address_scan.cpp
+    src/native_gpu/draw_capture.cpp
     ${HOTFUNC_SOURCES}
 )
 
