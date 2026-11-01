@@ -59,6 +59,16 @@ bool SDLAudioDriver::Initialize() {
   sdl_stream_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &desired_spec,
                                           SDLCallback, this);
   if (!sdl_stream_) {
+    // Some devices refuse the 5.1 stream the guest mixes to - try stereo, which
+    // the callback folds down to.
+    REXAPU_WARN("SDL_OpenAudioDeviceStream() with {} channels failed: {} - trying stereo",
+                static_cast<int>(desired_spec.channels), SDL_GetError());
+    desired_spec.channels = 2;
+    sdl_device_channels_ = 2;
+    sdl_stream_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &desired_spec,
+                                            SDLCallback, this);
+  }
+  if (!sdl_stream_) {
     REXAPU_ERROR("SDL_OpenAudioDeviceStream() failed: {} - continuing without sound",
                  SDL_GetError());
     StartSilentOutput();
