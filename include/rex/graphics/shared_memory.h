@@ -76,6 +76,10 @@ class SharedMemory {
   // Checks if the range has been updated, uploads new data if needed and
   // ensures the host GPU memory backing the range are resident. Returns true if
   // the range has been fully updated and is usable.
+  // Whether the GPU reads the guest memory directly (no uploads), so ranges
+  // that only need to be readable by the GPU don't have to be requested.
+  bool gpu_reads_guest_memory_directly() const { return gpu_reads_guest_memory_directly_; }
+
   bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
   bool RequestRange(uint32_t start, uint32_t length);
 
@@ -148,6 +152,8 @@ class SharedMemory {
   // MakeRangeValid has page granularity). upload_page_ranges are sorted in
   // ascending address order, so front and back can be used to determine the
   // overall bounds of pages to be uploaded.
+  bool gpu_reads_guest_memory_directly_ = false;
+
   virtual bool UploadRanges(
       const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) = 0;
 

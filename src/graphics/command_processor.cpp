@@ -1009,8 +1009,12 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   do {
     uint32_t value = 0;
     if (is_memory) {
-      value =
-          *reinterpret_cast<uint32_t*>(memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
+      // A write delayed until the GPU completes the preceding work is the
+      // value the GPU will see at this point of the command stream.
+      if (!GetPendingCommandStreamMemoryWrite(poll_reg_addr & ~uint32_t(0x3), value)) {
+        value = *reinterpret_cast<uint32_t*>(
+            memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
+      }
       value = xenos::GpuSwap(value, static_cast<xenos::Endian>(poll_reg_addr & 0x3));
     } else {
       value = ReadRegisterValue(poll_reg_addr);
@@ -1045,7 +1049,8 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         matched = true;
         break;
     }
-    if (!matched && AwaitCommandStreamMemoryWrites()) {
+    if (!matched && AwaitCommandStreamMemoryWrites(is_memory ? poll_reg_addr & ~uint32_t(0x3)
+                                                             : UINT32_MAX)) {
       // The value may have been written by the completed GPU work.
       if (!worker_running_) {
         return false;
@@ -1120,7 +1125,8 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
   return true;
 }
 
-void CommandProcessor::WriteMemoryFromCommandStream(uint32_t address, uint32_t value) {
+void CommandProcessor::WriteMemoryFromCommandStream(uint32_t address, uint32_t value,
+                                                    bool is_fence) {
   memory::store(memory_->TranslatePhysical(address), value);
 }
 
@@ -1245,7 +1251,7 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
     // doesn't wait for the GPU's work.
     memory::store(memory_->TranslatePhysical(address), data_value);
   } else {
-    WriteMemoryFromCommandStream(address, data_value);
+    WriteMemoryFromCommandStream(address, data_value, true);
   }
   return true;
 }

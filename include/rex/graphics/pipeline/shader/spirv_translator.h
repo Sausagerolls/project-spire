@@ -411,6 +411,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
     bool demote_to_helper_invocation;
     bool sample_rate_shading;
+
+    // Tessellation drawn as a grid: the host draws an indexed grid of
+    // (factor + 1)^2 shared vertices per patch instead of 6 vertices per quad.
+    bool tessellation_grid_indexed = false;
   };
 
   SpirvShaderTranslator(const Features& features, bool native_2x_msaa_with_attachments,

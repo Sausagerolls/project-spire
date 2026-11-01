@@ -1987,7 +1987,41 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
                                                         line_loop_closing_index),
                                   vertex_index, const_uint_0_);
       }
-      if (IsSpirvTessellationGridShader()) {
+      if (IsSpirvTessellationGridShader() && features_.tessellation_grid_indexed) {
+        // The host draws an indexed grid of (factor + 1)^2 shared vertices per
+        // patch - the vertex index is the patch and the grid point.
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(kSystemConstantTessellationFactorRangeMax));
+        spv::Id grid_factor = builder_->createUnaryOp(
+            spv::OpConvertFToU, type_uint_,
+            builder_->createLoad(builder_->createAccessChain(spv::StorageClassUniform,
+                                                             uniform_system_constants_,
+                                                             id_vector_temp_),
+                                 spv::NoPrecision));
+        spv::Id grid_points_per_row =
+            builder_->createBinOp(spv::OpIAdd, type_uint_, grid_factor, builder_->makeUintConstant(1));
+        spv::Id grid_points_per_patch =
+            builder_->createBinOp(spv::OpIMul, type_uint_, grid_points_per_row, grid_points_per_row);
+        spv::Id grid_point =
+            builder_->createBinOp(spv::OpUMod, type_uint_, vertex_index, grid_points_per_patch);
+        spv::Id grid_factor_float =
+            builder_->createUnaryOp(spv::OpConvertUToF, type_float_, grid_factor);
+        grid_domain_location_x_ = builder_->createBinOp(
+            spv::OpFDiv, type_float_,
+            builder_->createUnaryOp(
+                spv::OpConvertUToF, type_float_,
+                builder_->createBinOp(spv::OpUMod, type_uint_, grid_point, grid_points_per_row)),
+            grid_factor_float);
+        grid_domain_location_y_ = builder_->createBinOp(
+            spv::OpFDiv, type_float_,
+            builder_->createUnaryOp(
+                spv::OpConvertUToF, type_float_,
+                builder_->createBinOp(spv::OpUDiv, type_uint_, grid_point, grid_points_per_row)),
+            grid_factor_float);
+        vertex_index =
+            builder_->createBinOp(spv::OpUDiv, type_uint_, vertex_index, grid_points_per_patch);
+      } else if (IsSpirvTessellationGridShader()) {
         // The host draws factor x factor quads (two triangles, 6 vertices,
         // each) per patch. Split the host vertex index into the patch index
         // and the domain location.

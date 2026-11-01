@@ -8,11 +8,20 @@
 
 #include <rex/graphics/metal/shader.h>
 
+#include <fstream>
 #include <string>
 
+#include <rex/cvar.h>
 #include <rex/graphics/metal/msl_util.h>
 #include <rex/logging.h>
 #include <rex/ui/metal/metal_provider.h>
+
+REXCVAR_DEFINE_STRING(metal_vertex_math_mode, "", "GPU/Metal",
+                      "Math mode for guest vertex shaders ('safe', 'relaxed' or 'fast'), or empty "
+                      "for metal_math_mode")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(metal_dump_shaders_path, "", "GPU/Metal",
+                      "Directory to write the MSL of translated guest shaders to (debugging)");
 
 namespace rex::graphics::metal {
 
@@ -42,9 +51,20 @@ id<MTLFunction> MetalShader::MetalTranslation::GetOrCreateFunction(
   }
   std::string debug_name = fmt::format("shader {:016X} modification {:016X}",
                                        shader().ucode_data_hash(), modification());
+  const std::string& dump_path = REXCVAR_GET(metal_dump_shaders_path);
+  if (!dump_path.empty()) {
+    std::ofstream(fmt::format("{}/{}_{:016X}_{:016X}.metal", dump_path,
+                              shader().type() == xenos::ShaderType::kVertex ? "vs" : "ps",
+                              shader().ucode_data_hash(), modification()))
+        << msl;
+  }
   @autoreleasepool {
     id<MTLLibrary> library =
-        provider.CompileLibrary([NSString stringWithUTF8String:msl.c_str()], debug_name.c_str());
+        provider.CompileLibrary([NSString stringWithUTF8String:msl.c_str()], debug_name.c_str(),
+                                shader().type() == xenos::ShaderType::kVertex &&
+                                        !REXCVAR_GET(metal_vertex_math_mode).empty()
+                                    ? REXCVAR_GET(metal_vertex_math_mode).c_str()
+                                    : nullptr);
     if (library) {
       function_ = [library newFunctionWithName:@"main0"];
     }

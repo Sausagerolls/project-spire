@@ -52,10 +52,12 @@ std::unique_ptr<ImmediateDrawer> MetalProvider::CreateImmediateDrawer() {
   return MetalImmediateDrawer::Create(this);
 }
 
-id<MTLLibrary> MetalProvider::CompileLibrary(NSString* source, const char* debug_name) const {
+id<MTLLibrary> MetalProvider::CompileLibrary(NSString* source, const char* debug_name,
+                                             const char* math_mode_override) const {
   MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
   // Guest shaders rely on IEEE behavior (NaN and infinity handling).
-  std::string math_mode = REXCVAR_GET(metal_math_mode);
+  std::string math_mode =
+      math_mode_override ? std::string(math_mode_override) : REXCVAR_GET(metal_math_mode);
   if (@available(macOS 15.0, *)) {
     options.mathMode = math_mode == "fast"      ? MTLMathModeFast
                        : math_mode == "relaxed" ? MTLMathModeRelaxed

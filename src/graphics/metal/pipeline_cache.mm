@@ -149,6 +149,7 @@ bool MetalPipelineCache::Initialize() {
   features.clip_distance = true;
   features.image_view_format_swizzle = true;
   features.demote_to_helper_invocation = true;
+  features.tessellation_grid_indexed = true;
   // Metal supports 2x MSAA natively.
   shader_translator_ = std::make_unique<SpirvShaderTranslator>(features, true, true, false);
   return true;

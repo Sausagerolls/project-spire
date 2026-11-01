@@ -174,11 +174,19 @@ class CommandProcessor {
   // backend whose GPU accesses guest memory directly may delay the write until
   // the GPU has completed the preceding work, so the guest doesn't reuse memory
   // that the GPU is still reading.
-  virtual void WriteMemoryFromCommandStream(uint32_t address, uint32_t value);
+  // is_fence: an end-of-work event value (EVENT_WRITE_SHD) rather than data.
+  virtual void WriteMemoryFromCommandStream(uint32_t address, uint32_t value,
+                                            bool is_fence = false);
   // Called when WAIT_REG_MEM polls a value that doesn't match yet. Returns
   // true if it waited for delayed command stream memory writes (so the value
   // should be polled again right away), false to wait as usual.
-  virtual bool AwaitCommandStreamMemoryWrites() { return false; }
+  // address: the polled guest physical address, or UINT32_MAX for a register.
+  virtual bool AwaitCommandStreamMemoryWrites(uint32_t address) { return false; }
+  // The latest command stream fence write to the address (guest byte order)
+  // that is still delayed, if any.
+  virtual bool GetPendingCommandStreamMemoryWrite(uint32_t address, uint32_t& value_out) {
+    return false;
+  }
 
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
   virtual void OnPrimaryBufferEnd() {}

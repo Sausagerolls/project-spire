@@ -18,6 +18,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <mutex>
 #include <vector>
 
@@ -115,10 +116,12 @@ class MetalCommandProcessor : public CommandProcessor {
 
   void OnPrimaryBufferEnd() override;
 
-  void WriteMemoryFromCommandStream(uint32_t address, uint32_t value) override;
+  void WriteMemoryFromCommandStream(uint32_t address, uint32_t value,
+                                    bool is_fence = false) override;
   bool ExecutePacketType3_XE_NATIVE(memory::RingBuffer* reader, uint32_t packet,
                                     uint32_t count) override;
-  bool AwaitCommandStreamMemoryWrites() override;
+  bool AwaitCommandStreamMemoryWrites(uint32_t address) override;
+  bool GetPendingCommandStreamMemoryWrite(uint32_t address, uint32_t& value_out) override;
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
@@ -162,6 +165,15 @@ class MetalCommandProcessor : public CommandProcessor {
 
   id<MTLComputePipelineState> swap_pipeline_ = nil;
 
+  // Index buffers for tessellation drawn as an indexed grid, per grid factor:
+  // (factor + 1)^2 vertices per patch, factor^2 quads of 2 triangles.
+  struct TessellationGridIndices {
+    id<MTLBuffer> buffer = nil;
+    uint32_t patch_capacity = 0;
+  };
+  std::unordered_map<uint32_t, TessellationGridIndices> tessellation_grid_indices_;
+  id<MTLBuffer> GetTessellationGridIndices(uint32_t factor, uint32_t patch_count);
+
   // Submissions.
   id<MTLCommandBuffer> command_buffer_ = nil;
   uint64_t submission_current_ = 1;
@@ -180,6 +192,7 @@ class MetalCommandProcessor : public CommandProcessor {
     uint64_t submission;
     uint32_t address;
     uint32_t value;
+    bool is_fence;
   };
   std::mutex deferred_memory_writes_mutex_;
   // Notified when a submission completes.
@@ -206,6 +219,12 @@ class MetalCommandProcessor : public CommandProcessor {
   id<MTLRenderPipelineState> encoder_pipeline_ = nil;
   id<MTLDepthStencilState> encoder_depth_stencil_state_ = nil;
   id<MTLRenderCommandEncoder> encoder_shared_memory_bound_ = nil;
+  // Textures and samplers bound to the current render encoder (per stage, per
+  // slot; not retained - only compared), to skip redundant bindings.
+  static constexpr uint32_t kMaxBoundTextures = 32;
+  static constexpr uint32_t kMaxBoundSamplers = 16;
+  std::array<std::array<const void*, kMaxBoundTextures>, 2> encoder_textures_{};
+  std::array<std::array<const void*, kMaxBoundSamplers>, 2> encoder_samplers_{};
 
   // Transient memory: pages of shared buffers, reused when their frame has
   // completed.
@@ -246,6 +265,8 @@ class MetalCommandProcessor : public CommandProcessor {
     uint64_t deferred_memory_writes = 0;
     uint64_t guest_render_passes = 0;
     uint64_t texture_loads_reordered = 0;
+    uint64_t vertices = 0;
+    std::map<std::string, uint64_t> vertices_by_type;
     std::map<std::string, uint64_t> render_pass_breaks;
     std::map<std::string, uint64_t> utility_passes;
     std::chrono::steady_clock::time_point last_log{};

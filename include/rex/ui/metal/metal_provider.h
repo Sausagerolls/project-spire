@@ -33,7 +33,9 @@ class MetalProvider : public GraphicsProvider {
   std::unique_ptr<ImmediateDrawer> CreateImmediateDrawer() override;
 
   // Compiles MSL source. Logs and returns nil on failure.
-  id<MTLLibrary> CompileLibrary(NSString* source, const char* debug_name) const;
+  // math_mode: "safe", "relaxed" or "fast", or null for metal_math_mode.
+  id<MTLLibrary> CompileLibrary(NSString* source, const char* debug_name,
+                                const char* math_mode = nullptr) const;
 
  private:
   MetalProvider() = default;

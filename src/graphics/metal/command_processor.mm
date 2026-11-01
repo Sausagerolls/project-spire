@@ -45,6 +45,11 @@ REXCVAR_DEFINE_BOOL(metal_defer_fence_writes, true, "GPU/Metal",
                     "preceding work, so the guest doesn't reuse memory the GPU still reads or writes "
                     "(required: resolves landing in freed memory corrupt the guest heap)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(metal_wait_on_pending_writes, false, "GPU/Metal",
+                    "Let WAIT_REG_MEM in the command stream see delayed fence writes as already "
+                    "done (the GPU executes the commands in order anyway), instead of waiting for "
+                    "the GPU to complete")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(metal_commit_on_fence, true, "GPU/Metal",
                     "Submit the GPU work when the command stream writes a fence, so the fence "
                     "is signaled as early as possible (with metal_defer_fence_writes)")
@@ -322,6 +327,48 @@ void MetalCommandProcessor::OnPrimaryBufferEnd() {
   }
 }
 
+id<MTLBuffer> MetalCommandProcessor::GetTessellationGridIndices(uint32_t factor,
+                                                               uint32_t patch_count) {
+  TessellationGridIndices& indices = tessellation_grid_indices_[factor];
+  if (indices.buffer && indices.patch_capacity >= patch_count) {
+    return indices.buffer;
+  }
+  uint32_t capacity = std::max(patch_count, std::max(indices.patch_capacity * 2, uint32_t(64)));
+  uint32_t points_per_row = factor + 1;
+  uint32_t points_per_patch = points_per_row * points_per_row;
+  size_t indices_per_patch = size_t(factor) * factor * 6;
+  std::vector<uint32_t> data(indices_per_patch * capacity);
+  // The same triangulation as the non-indexed grid: quad diagonals pointing to
+  // the center of the patch, clockwise in the domain.
+  uint32_t half_factor = factor >> 1;
+  uint32_t* out = data.data();
+  for (uint32_t patch = 0; patch < capacity; ++patch) {
+    uint32_t patch_base = patch * points_per_patch;
+    for (uint32_t y = 0; y < factor; ++y) {
+      for (uint32_t x = 0; x < factor; ++x) {
+        bool main_diagonal = (x < half_factor) == (y < half_factor);
+        uint32_t offsets_x = main_diagonal ? 0b010110 : 0b011010;
+        uint32_t offsets_y = 0b110100;
+        for (uint32_t vertex = 0; vertex < 6; ++vertex) {
+          uint32_t point_x = x + ((offsets_x >> vertex) & 1);
+          uint32_t point_y = y + ((offsets_y >> vertex) & 1);
+          *(out++) = patch_base + point_y * points_per_row + point_x;
+        }
+      }
+    }
+  }
+  id<MTLBuffer> buffer = [device_ newBufferWithBytes:data.data()
+                                              length:data.size() * sizeof(uint32_t)
+                                             options:MTLResourceStorageModeShared];
+  if (!buffer) {
+    return nil;
+  }
+  // The old buffer may still be used by submitted work - retained by it.
+  indices.buffer = buffer;
+  indices.patch_capacity = capacity;
+  return buffer;
+}
+
 bool MetalCommandProcessor::ExecutePacketType3_XE_NATIVE(memory::RingBuffer* reader,
                                                          uint32_t packet, uint32_t count) {
   if (!count) {
@@ -349,7 +396,8 @@ bool MetalCommandProcessor::ExecutePacketType3_XE_NATIVE(memory::RingBuffer* rea
   return true;
 }
 
-void MetalCommandProcessor::WriteMemoryFromCommandStream(uint32_t address, uint32_t value) {
+void MetalCommandProcessor::WriteMemoryFromCommandStream(uint32_t address, uint32_t value,
+                                                         bool is_fence) {
   // The write must become visible to the guest only after the GPU work
   // encoded so far: the current command buffer if there is one, otherwise the
   // last committed one.
@@ -365,7 +413,7 @@ void MetalCommandProcessor::WriteMemoryFromCommandStream(uint32_t address, uint3
       CommandProcessor::WriteMemoryFromCommandStream(address, value);
       return;
     }
-    deferred_memory_writes_.push_back({after_submission, address, value});
+    deferred_memory_writes_.push_back({after_submission, address, value, is_fence});
     ++stats_.deferred_memory_writes;
   }
   if (commit) {
@@ -383,19 +431,45 @@ void MetalCommandProcessor::ApplyDeferredMemoryWrites(uint64_t completed_submiss
   }
 }
 
-bool MetalCommandProcessor::AwaitCommandStreamMemoryWrites() {
+bool MetalCommandProcessor::GetPendingCommandStreamMemoryWrite(uint32_t address,
+                                                               uint32_t& value_out) {
+  if (!REXCVAR_GET(metal_wait_on_pending_writes)) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(deferred_memory_writes_mutex_);
+  for (auto it = deferred_memory_writes_.rbegin(); it != deferred_memory_writes_.rend(); ++it) {
+    if (it->address == address) {
+      if (!it->is_fence) {
+        return false;
+      }
+      value_out = it->value;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool MetalCommandProcessor::AwaitCommandStreamMemoryWrites(uint32_t address) {
   // The awaited value may be written by the GPU work encoded so far (resolves,
   // memexport) or by a delayed write following it - submit it in any case.
   if (command_buffer_) {
     EndSubmission(false);
   }
-  uint64_t await_submission;
+  // Only wait for the GPU if a delayed write to the polled address is pending
+  // (other values, such as flags set by the guest's interrupt handlers, are
+  // polled as usual).
+  uint64_t await_submission = 0;
   {
     std::lock_guard<std::mutex> lock(deferred_memory_writes_mutex_);
-    if (deferred_memory_writes_.empty()) {
-      return false;
+    for (const DeferredMemoryWrite& write : deferred_memory_writes_) {
+      if (write.address == address) {
+        await_submission = write.submission;
+        break;
+      }
     }
-    await_submission = deferred_memory_writes_.front().submission;
+  }
+  if (!await_submission) {
+    return false;
   }
   std::unique_lock<std::mutex> lock(deferred_memory_writes_mutex_);
   submission_completed_cv_.wait_for(lock, std::chrono::milliseconds(4), [&] {
@@ -661,7 +735,22 @@ id<MTLRenderCommandEncoder> MetalCommandProcessor::GetRenderEncoderForCurrentRen
     pass.defaultRasterSampleCount = render_target_cache_->last_update_formats().sample_count;
   }
   render_encoder_ = [GetCommandBuffer() renderCommandEncoderWithDescriptor:pass];
-  render_encoder_.label = @"guest";
+  if (REXCVAR_GET(metal_log_stats)) {
+    // Identify passes in GPU traces by their attachments.
+    id<MTLTexture> first = attachments.color[0] ? attachments.color[0] : attachments.depth;
+    render_encoder_.label = first ? [NSString stringWithFormat:@"guest %lux%lu x%lu c%d%d%d%d d%d",
+                                                               (unsigned long)first.width,
+                                                               (unsigned long)first.height,
+                                                               (unsigned long)first.sampleCount,
+                                                               attachments.color[0] != nil,
+                                                               attachments.color[1] != nil,
+                                                               attachments.color[2] != nil,
+                                                               attachments.color[3] != nil,
+                                                               attachments.depth != nil]
+                                  : @"guest none";
+  } else {
+    render_encoder_.label = @"guest";
+  }
   render_encoder_is_utility_ = false;
   render_encoder_attachments_ = attachments;
   encoder_pipeline_ = nil;
@@ -935,6 +1024,26 @@ bool MetalCommandProcessor::IssueDrawImpl() {
   }
   BindDrawResources(encoder, vertex_shader, pixel_shader);
   ++stats_.draws_encoded;
+  if (REXCVAR_GET(metal_log_stats)) {
+    uint64_t vertex_count = primitive_processing_result.host_draw_vertex_count;
+    if (tessellation_grid_factor) {
+      vertex_count = (primitive_processing_result.tessellation_mode ==
+                              xenos::TessellationMode::kAdaptive
+                          ? vertex_count / 4
+                          : vertex_count) *
+                     tessellation_grid_factor * tessellation_grid_factor * 6;
+    }
+    stats_.vertices += vertex_count;
+    const char* type_name = tessellation_grid_factor ? "tessellated"
+                            : host_vertex_shader_type ==
+                                    Shader::HostVertexShaderType::kPointListAsTriangleStrip
+                                ? "points"
+                            : host_vertex_shader_type ==
+                                    Shader::HostVertexShaderType::kRectangleListAsTriangleStrip
+                                ? "rectangles"
+                                : "vertex";
+    stats_.vertices_by_type[type_name] += vertex_count;
+  }
 
   // Draw.
   MTLPrimitiveType primitive_type;
@@ -967,10 +1076,16 @@ bool MetalCommandProcessor::IssueDrawImpl() {
         primitive_processing_result.tessellation_mode == xenos::TessellationMode::kAdaptive
             ? primitive_processing_result.host_draw_vertex_count / 4
             : primitive_processing_result.host_draw_vertex_count;
-    [encoder drawPrimitives:primitive_type
-                vertexStart:0
-                vertexCount:NSUInteger(patch_count) * tessellation_grid_factor *
-                            tessellation_grid_factor * 6];
+    id<MTLBuffer> grid_indices = GetTessellationGridIndices(tessellation_grid_factor, patch_count);
+    if (!grid_indices) {
+      return draw_fail("tessellation grid indices");
+    }
+    [encoder drawIndexedPrimitives:primitive_type
+                        indexCount:NSUInteger(patch_count) * tessellation_grid_factor *
+                                   tessellation_grid_factor * 6
+                         indexType:MTLIndexTypeUInt32
+                       indexBuffer:grid_indices
+                 indexBufferOffset:0];
   } else if (primitive_processing_result.index_buffer_type ==
              PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
     [encoder drawPrimitives:primitive_type
@@ -1247,6 +1362,12 @@ void MetalCommandProcessor::BindDrawResources(id<MTLRenderCommandEncoder> encode
     [encoder setFragmentBuffer:shared_memory_->buffer() offset:0 atIndex:kMslBufferSharedMemory];
     encoder_shared_memory_bound_ = encoder;
     constant_buffers_to_bind_ = (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferCount) - 1;
+    for (auto& stage_textures : encoder_textures_) {
+      stage_textures.fill(nullptr);
+    }
+    for (auto& stage_samplers : encoder_samplers_) {
+      stage_samplers.fill(nullptr);
+    }
   }
   uint32_t to_bind = constant_buffers_to_bind_;
   uint32_t constant_buffer;
@@ -1277,6 +1398,13 @@ void MetalCommandProcessor::BindDrawResources(id<MTLRenderCommandEncoder> encode
       const MetalShader::TextureBinding& binding = textures[i];
       id<MTLTexture> texture = texture_cache_->GetActiveTextureOrNull(
           binding.fetch_constant, binding.dimension, bool(binding.is_signed));
+      if (i < kMaxBoundTextures) {
+        const void*& bound = encoder_textures_[stage][i];
+        if (bound == (__bridge const void*)texture) {
+          continue;
+        }
+        bound = (__bridge const void*)texture;
+      }
       if (stage) {
         [encoder setFragmentTexture:texture atIndex:i];
       } else {
@@ -1288,6 +1416,11 @@ void MetalCommandProcessor::BindDrawResources(id<MTLRenderCommandEncoder> encode
     for (size_t i = 0; i < samplers.size() && i < 16; ++i) {
       id<MTLSamplerState> sampler =
           texture_cache_->GetSampler(texture_cache_->GetSamplerParameters(samplers[i]));
+      const void*& bound_sampler = encoder_samplers_[stage][i];
+      if (bound_sampler == (__bridge const void*)sampler) {
+        continue;
+      }
+      bound_sampler = (__bridge const void*)sampler;
       if (stage) {
         [encoder setFragmentSamplerState:sampler atIndex:i];
       } else {
@@ -1345,6 +1478,13 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         breaks += fmt::format(" {}: {:.1f},", reason.first,
                               double(reason.second) / std::max(stats_.swaps, uint64_t(1)));
       }
+      breaks += fmt::format(" vertices: {:.0f}k (", double(stats_.vertices) / 1000.0 /
+                                                      std::max(stats_.swaps, uint64_t(1)));
+      for (const auto& type : stats_.vertices_by_type) {
+        breaks += fmt::format("{} {:.0f}k ", type.first,
+                              double(type.second) / 1000.0 / std::max(stats_.swaps, uint64_t(1)));
+      }
+      breaks += ")";
       breaks += " utility passes:";
       for (const auto& reason : stats_.utility_passes) {
         breaks += fmt::format(" {}: {:.1f},", reason.first,

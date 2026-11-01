@@ -20,6 +20,7 @@ MetalSharedMemory::~MetalSharedMemory() {
 
 bool MetalSharedMemory::Initialize() {
   InitializeCommon();
+  gpu_reads_guest_memory_directly_ = true;
   uint8_t* physical_membase = memory().TranslatePhysical(0);
   // The guest physical memory mapping is host-page aligned, and its size is a
   // multiple of the host page size, as newBufferWithBytesNoCopy requires.

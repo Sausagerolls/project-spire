@@ -907,8 +907,9 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
 
   // Request the indices in the shared memory if they need to be accessed from
   // there on the GPU.
-  if (cacheable.index_buffer_type == ProcessedIndexBufferType::kGuestDMA ||
-      cacheable.index_buffer_type == ProcessedIndexBufferType::kHostBuiltinForDMA) {
+  if ((cacheable.index_buffer_type == ProcessedIndexBufferType::kGuestDMA ||
+       cacheable.index_buffer_type == ProcessedIndexBufferType::kHostBuiltinForDMA) &&
+      !shared_memory_.gpu_reads_guest_memory_directly()) {
     // Request the index buffer memory.
     // TODO(Triang3l): Shared memory request cache.
     if (!shared_memory_.RequestRange(guest_index_base, guest_index_buffer_needed_bytes)) {
