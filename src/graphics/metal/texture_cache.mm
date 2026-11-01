@@ -595,6 +595,14 @@ bool MetalTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
       return true;
     }
   }
+  if (load_base) {
+    command_processor_.render_target_cache().NoteGuestMemoryTextureLoad(
+        texture_key.base_page << 12, metal_texture.GetGuestBaseSize());
+  }
+  if (load_mips && texture_key.mip_max_level) {
+    command_processor_.render_target_cache().NoteGuestMemoryTextureLoad(
+        texture_key.mip_page << 12, metal_texture.GetGuestMipsSize());
+  }
   id<MTLComputePipelineState> pipeline = load_pipelines_[load_shader];
   const LoadShaderInfo& load_shader_info = GetLoadShaderInfo(load_shader);
 

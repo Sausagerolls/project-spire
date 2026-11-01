@@ -50,6 +50,10 @@ REXCVAR_DEFINE_BOOL(metal_wait_on_pending_writes, false, "GPU/Metal",
                     "done (the GPU executes the commands in order anyway), instead of waiting for "
                     "the GPU to complete")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(metal_defer_all_stream_writes, false, "GPU/Metal",
+                    "Also delay scratch register, MEM_WRITE, COND_WRITE and REG_TO_MEM writes "
+                    "until the GPU completes the preceding work")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(metal_commit_on_fence, true, "GPU/Metal",
                     "Submit the GPU work when the command stream writes a fence, so the fence "
                     "is signaled as early as possible (with metal_defer_fence_writes)")
@@ -525,13 +529,22 @@ void MetalCommandProcessor::WriteMemoryFromCommandStream(uint32_t address, uint3
   // The write must become visible to the guest only after the GPU work
   // encoded so far: the current command buffer if there is one, otherwise the
   // last committed one.
-  bool defer = REXCVAR_GET(metal_defer_fence_writes);
-  bool commit = defer && command_buffer_ && REXCVAR_GET(metal_commit_on_fence);
+  // Like on the real GPU, only end-of-pipe events complete after the preceding
+  // draws. Scratch registers and MEM_WRITE take effect when the command
+  // processor reaches them (interrupt handlers read scratch registers right
+  // after the packets writing them, for instance).
+  bool defer = REXCVAR_GET(metal_defer_fence_writes) &&
+               (is_fence || REXCVAR_GET(metal_defer_all_stream_writes));
+  if (!defer) {
+    CommandProcessor::WriteMemoryFromCommandStream(address, value);
+    return;
+  }
+  bool commit = command_buffer_ && REXCVAR_GET(metal_commit_on_fence);
   uint64_t after_submission = submission_current_ - (command_buffer_ ? 0 : 1);
   {
     std::lock_guard<std::mutex> lock(deferred_memory_writes_mutex_);
     uint64_t completed_submission = GetCompletedSubmission();
-    if (!defer || completed_submission >= after_submission) {
+    if (completed_submission >= after_submission) {
       // Earlier deferred writes follow earlier submissions, so they're due too.
       ApplyDeferredMemoryWrites(UINT64_MAX);
       CommandProcessor::WriteMemoryFromCommandStream(address, value);
@@ -691,6 +704,13 @@ void MetalCommandProcessor::EndSubmission(bool is_swap) {
         [upload_blit_encoder_ endEncoding];
         upload_blit_encoder_ = nil;
       }
+      std::atomic<double>* upload_busy = &gpu_upload_busy_seconds_;
+      [upload_command_buffer_ addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
+        double gpu_time = buffer.GPUEndTime - buffer.GPUStartTime;
+        double busy = upload_busy->load(std::memory_order_relaxed);
+        while (gpu_time > 0.0 && !upload_busy->compare_exchange_weak(busy, busy + gpu_time)) {
+        }
+      }];
       [upload_command_buffer_ commit];
       upload_command_buffer_ = nil;
     }
@@ -1670,9 +1690,11 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         double seconds =
             std::chrono::duration<double>(now - stats_.last_log).count();
         double gpu_busy = gpu_busy_seconds_.exchange(0.0);
-        REXGPU_INFO("Metal timing: GPU busy {:.0f}%, command processor waiting for the GPU "
-                    "{:.0f}%, {:.1f} ms GPU per frame",
-                    100.0 * gpu_busy / seconds, 100.0 * stats_.cp_wait_seconds / seconds,
+        double upload_busy = gpu_upload_busy_seconds_.exchange(0.0);
+        REXGPU_INFO("Metal timing: GPU busy {:.0f}% (uploads {:.0f}%), command processor "
+                    "waiting for the GPU {:.0f}%, {:.1f} ms GPU per frame",
+                    100.0 * gpu_busy / seconds, 100.0 * upload_busy / seconds,
+                    100.0 * stats_.cp_wait_seconds / seconds,
                     1000.0 * gpu_busy / std::max(stats_.swaps, uint64_t(1)));
       }
       REXGPU_INFO("Metal memory: {} MB allocated by the device, {} transient pages used, {} "

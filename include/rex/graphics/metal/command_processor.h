@@ -204,6 +204,7 @@ class MetalCommandProcessor : public CommandProcessor {
   std::condition_variable submission_completed_cv_;
   // GPU execution time of completed command buffers (seconds, for stats).
   std::atomic<double> gpu_busy_seconds_{0.0};
+  std::atomic<double> gpu_upload_busy_seconds_{0.0};
   std::deque<DeferredMemoryWrite> deferred_memory_writes_;
   // Applies the deferred writes up to the completed submission (with the
   // mutex locked).

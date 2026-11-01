@@ -1280,6 +1280,9 @@ bool MetalRenderTargetCache::Resolve(const memory::Memory& memory,
                   atIndex:kMslBufferPushConstants];
         [encoder dispatchThreadgroups:MTLSizeMake(copy_group_count_x, copy_group_count_y, 1)
                 threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        // Textures in the range must be reloaded.
+        shared_memory.RangeWrittenByGpu(resolve_info.copy_dest_extent_start,
+                                        resolve_info.copy_dest_extent_length);
         texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
                                           resolve_info.copy_dest_extent_length);
         command_processor_.MarkGpuWrittenInSubmission(resolve_info.copy_dest_extent_start,
@@ -1427,6 +1430,9 @@ void MetalRenderTargetCache::MakeResolveSnapshot(const draw_util::ResolveInfo& r
   snapshot.width = width;
   snapshot.height = height;
   snapshot.format = uint32_t(dest_format);
+  snapshot.extent_start = resolve_info.copy_dest_extent_start;
+  snapshot.extent_length = resolve_info.copy_dest_extent_length;
+  snapshot.available = true;
   struct {
     uint32_t source_offset[2];
     uint32_t swap_red_blue;
@@ -1453,17 +1459,32 @@ id<MTLTexture> MetalRenderTargetCache::TakeResolveSnapshot(uint32_t address, uin
     return nil;
   }
   ResolveSnapshot& snapshot = it->second;
-  if (!snapshot.texture || snapshot.format != format ||
+  if (!snapshot.available || !snapshot.texture || snapshot.format != format ||
       snapshot.texture.pixelFormat != pixel_format || width > snapshot.width ||
       height > snapshot.height) {
     return nil;
   }
-  id<MTLTexture> texture = snapshot.texture;
-  // Once - later loads (after CPU writes) come from guest memory. The texture
-  // object stays for reuse by the next resolve to this address.
-  snapshot.format = UINT32_MAX;
+  snapshot.used_by_texture = true;
+  // If guest memory has the data too, later loads (after CPU writes) come from
+  // it. Otherwise the snapshot is the only copy.
+  if (snapshot.memory_written) {
+    snapshot.available = false;
+  }
   ++resolve_snapshots_taken_;
-  return texture;
+  return snapshot.texture;
+}
+
+void MetalRenderTargetCache::NoteGuestMemoryTextureLoad(uint32_t start, uint32_t length) {
+  if (!length) {
+    return;
+  }
+  uint32_t end = start + length;
+  for (auto& entry : resolve_snapshots_) {
+    ResolveSnapshot& snapshot = entry.second;
+    if (start < snapshot.extent_start + snapshot.extent_length && end > snapshot.extent_start) {
+      snapshot.memory_needed = true;
+    }
+  }
 }
 
 bool MetalRenderTargetCache::ResolveNative(const draw_util::ResolveInfo& resolve_info,
@@ -1479,16 +1500,26 @@ bool MetalRenderTargetCache::ResolveNative(const draw_util::ResolveInfo& resolve
   MetalRenderTarget* source = GetNativeRenderTarget(
       native_bound_[source_is_depth ? 0 : 1 + source_select], source_is_depth);
 
-  bool snapshot_made = false;
+  bool snapshot_only = false;
   if (source && REXCVAR_GET(metal_resolve_snapshots)) {
     uint64_t made_before = resolve_snapshots_made_;
     MakeResolveSnapshot(resolve_info, *source);
-    snapshot_made = resolve_snapshots_made_ != made_before;
+    if (resolve_snapshots_made_ != made_before) {
+      ResolveSnapshot& snapshot = resolve_snapshots_[resolve_info.copy_dest_base];
+      // Guest memory is skipped only if it's known not to be read: an exact
+      // texture load has used the snapshot, and nothing else was loaded from
+      // the range.
+      snapshot_only = !REXCVAR_GET(metal_resolve_to_memory) && snapshot.used_by_texture &&
+                      !snapshot.memory_needed;
+      snapshot.memory_written = !snapshot_only;
+    }
   }
   bool copied = false;
-  if (snapshot_made && !REXCVAR_GET(metal_resolve_to_memory)) {
+  if (snapshot_only) {
     // The texture cache gets the data from the snapshot - just invalidate
     // the textures there.
+    shared_memory.RangeWrittenByGpu(resolve_info.copy_dest_extent_start,
+                                    resolve_info.copy_dest_extent_length);
     texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
                                       resolve_info.copy_dest_extent_length);
     command_processor_.MarkGpuWrittenInSubmission(resolve_info.copy_dest_extent_start,
@@ -1526,6 +1557,9 @@ bool MetalRenderTargetCache::ResolveNative(const draw_util::ResolveInfo& resolve
                   atIndex:kMslBufferPushConstants];
         [encoder dispatchThreadgroups:MTLSizeMake(copy_group_count_x, copy_group_count_y, 1)
                 threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        // Textures in the range must be reloaded.
+        shared_memory.RangeWrittenByGpu(resolve_info.copy_dest_extent_start,
+                                        resolve_info.copy_dest_extent_length);
         texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
                                           resolve_info.copy_dest_extent_length);
         command_processor_.MarkGpuWrittenInSubmission(resolve_info.copy_dest_extent_start,

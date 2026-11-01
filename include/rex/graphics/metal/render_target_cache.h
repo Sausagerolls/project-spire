@@ -103,6 +103,9 @@ class MetalRenderTargetCache final : public RenderTargetCache {
   // the address with the format and at least the size, once.
   id<MTLTexture> TakeResolveSnapshot(uint32_t address, uint32_t width, uint32_t height,
                                      uint32_t format, MTLPixelFormat pixel_format);
+  // A texture is being loaded from this guest memory range (no snapshot for
+  // it) - resolves overlapping it must keep writing to guest memory.
+  void NoteGuestMemoryTextureLoad(uint32_t start, uint32_t length);
   uint64_t resolve_snapshots_taken() const { return resolve_snapshots_taken_; }
   uint64_t resolve_snapshots_made() const { return resolve_snapshots_made_; }
 
@@ -235,6 +238,16 @@ class MetalRenderTargetCache final : public RenderTargetCache {
     uint32_t height;
     uint32_t format;
     id<MTLTexture> texture;
+    uint32_t extent_start = 0;
+    uint32_t extent_length = 0;
+    // An exact texture load has used a snapshot of this address.
+    bool used_by_texture = false;
+    // Something else reads the range from guest memory.
+    bool memory_needed = false;
+    // The last resolve to the address was written to guest memory too, so the
+    // snapshot is only for the first load after it.
+    bool memory_written = true;
+    bool available = false;
   };
   std::unordered_map<uint32_t, ResolveSnapshot> resolve_snapshots_;
   id<MTLComputePipelineState> snapshot_pipeline_ = nil;

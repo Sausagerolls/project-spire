@@ -1006,6 +1006,8 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   bool is_memory = (wait_info & 0x10) != 0;
 
   bool matched = false;
+  auto wait_start = std::chrono::steady_clock::now();
+  uint32_t last_value = 0;
   do {
     uint32_t value = 0;
     if (is_memory) {
@@ -1076,8 +1078,18 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         rex::thread::MaybeYield();
       }
     }
+    last_value = value;
   } while (!matched);
 
+  auto wait_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                           wait_start)
+                     .count();
+  if (wait_ms > 50.0) {
+    REXGPU_WARN("Long WAIT_REG_MEM: {:.0f} ms on {} {:08X} (function {}, reference {:08X}, mask "
+                "{:08X}, value before the match {:08X})",
+                wait_ms, is_memory ? "memory" : "register", poll_reg_addr, wait_info & 0x7, ref,
+                mask, last_value);
+  }
   return true;
 }
 
