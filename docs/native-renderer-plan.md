@@ -134,10 +134,13 @@ Tile 0 is 1120x576 with window offset 0; tile 1 uses window offset -576 and scis
 so every predicated draw passes in both tiles: about 900 draws run twice per frame,
 and draws executed are about 2x the calls to the D3D draw functions.
 
-Skipping tile 1 (bottom 144 lines missing) gives 36 -> 41 fps uncapped. Merging needs:
-taller surfaces (known only after seeing tile 1), scissor extended in tile 0, tile 1
-draws skipped, and resolves extended to the whole surface, since later passes in
-tile 0 sample textures that tile 1 would only resolve afterwards. Not done yet.
+Merged (native_gpu_merge_tiles, Metal with native surfaces only): the hook on the
+interpreter rewrites the token 0x80000000 header (flags, tile count, then rectangles
+left/top/right/bottom) to one tile covering all of them. Surfaces of the first tile's
+size are reported as tall as the merged area, and the backend widens a scissor equal
+to the first tile's bounds and resolve rectangles ending at its bottom, because
+prerecorded packets and guest resolve vertices still hold the first tile's values.
+Draws per frame 4000 -> 2300-2900, uncapped 36 -> 41 fps.
 
 Replacing PM4 entirely must also handle this replay: the D3D draw hooks record into
 command buffers that the interpreter replays, so a hook-only renderer would see each

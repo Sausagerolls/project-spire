@@ -3,6 +3,7 @@
 // command buffer. First milestone of the native Metal renderer: it validates the
 // device layout against what the GPU emulator receives.
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -19,6 +20,10 @@
 // D3D command buffer make-space (kicks the buffer to the GPU).
 extern "C" void FastHelper_821E8D20(PPCContext& ctx, uint8_t* base);
 
+REXCVAR_DEFINE_BOOL(native_gpu_merge_tiles, true, "NativeGPU",
+                    "Draw predicated tiling lists as one tile (needs the Metal backend's native "
+                    "surfaces, which have no EDRAM size limit)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(native_gpu_report_surfaces, true, "NativeGPU",
                     "Report the D3D surfaces bound for each draw and resolve to the GPU backend "
                     "(PM4_XE_NATIVE packets in the command buffer)")
@@ -123,6 +128,52 @@ void OnDraw(const char* function, const uint8_t* base, uint32_t device_address,
 
 }  // namespace
 
+namespace {
+std::atomic<uint32_t> merged_tile_width{0};
+std::atomic<uint32_t> merged_tile_height{0};
+std::atomic<uint32_t> merged_full_height{0};
+
+inline void StoreGuest32(uint8_t* base, uint32_t address, uint32_t value) {
+  *reinterpret_cast<uint32_t*>(const_cast<uint8_t*>(GuestPointer(base, address))) =
+      __builtin_bswap32(value);
+}
+}  // namespace
+
+void MergeTiles(uint8_t* base, uint32_t list) {
+  // Other backends and the EDRAM emulation still have the EDRAM size limit.
+  static const bool enabled = REXCVAR_GET(native_gpu_merge_tiles) &&
+                              rex::cvar::GetFlagByName("gpu_backend") == "metal" &&
+                              rex::cvar::GetFlagByName("metal_native_surfaces") == "true";
+  if (!enabled || LoadGuest32(base, list) != 0x80000000u) {
+    return;
+  }
+  uint32_t count = LoadGuest32(base, list + 8);
+  if (count < 2 || count > 15) {
+    return;
+  }
+  // Merge the rectangles into the first.
+  uint32_t left = LoadGuest32(base, list + 12), top = LoadGuest32(base, list + 16);
+  uint32_t right = LoadGuest32(base, list + 20), bottom = LoadGuest32(base, list + 24);
+  uint32_t first_right = right, first_bottom = bottom;
+  for (uint32_t i = 1; i < count; ++i) {
+    uint32_t rect = list + 12 + i * 16;
+    left = std::min(left, LoadGuest32(base, rect));
+    top = std::min(top, LoadGuest32(base, rect + 4));
+    right = std::max(right, LoadGuest32(base, rect + 8));
+    bottom = std::max(bottom, LoadGuest32(base, rect + 12));
+  }
+  StoreGuest32(base, list + 8, 1);
+  StoreGuest32(base, list + 12, left);
+  StoreGuest32(base, list + 16, top);
+  StoreGuest32(base, list + 20, right);
+  StoreGuest32(base, list + 24, bottom);
+  // Surfaces of the size of the first tile are really as tall as the whole
+  // area (see ReportSurfaces).
+  merged_tile_width.store(first_right);
+  merged_tile_height.store(first_bottom);
+  merged_full_height.store(bottom);
+}
+
 // Writes a PM4_XE_NATIVE packet with the bound surfaces into the device's
 // command buffer if they changed since the last one, before the device writes
 // the packets of a draw or a resolve.
@@ -132,7 +183,7 @@ void ReportSurfaces(PPCContext& ctx, uint8_t* base, uint32_t device_address) {
   }
   D3DDevice device(base, device_address);
   constexpr uint32_t kSurfaceCount = 5;
-  constexpr uint32_t kPayload = 1 + kSurfaceCount * 5;
+  constexpr uint32_t kPayload = 1 + kSurfaceCount * 5 + 3;
   uint32_t payload[kPayload];
   payload[0] = 1;  // Subcommand: surfaces.
   for (uint32_t i = 0; i < kSurfaceCount; ++i) {
@@ -142,8 +193,22 @@ void ReportSurfaces(PPCContext& ctx, uint8_t* base, uint32_t device_address) {
     out[1] = object ? LoadGuest32(base, object + 24) : 0;
     out[2] = object ? LoadGuest32(base, object + 28) : 0;
     out[3] = object ? LoadGuest32(base, object + 36) : 0;
+    // size: (width - 1) << 18 | (height - 1) << 3.
+    if (object && merged_full_height.load()) {
+      uint32_t width = (out[3] >> 18) + 1;
+      uint32_t height = ((out[3] >> 3) & 0x7FFF) + 1;
+      if (width == merged_tile_width.load() && height == merged_tile_height.load()) {
+        out[3] = (out[3] & ~(uint32_t(0x7FFF) << 3)) | ((merged_full_height.load() - 1) << 3);
+      }
+    }
     out[4] = object ? LoadGuest32(base, object + 40) : 0;
   }
+  // PA_SC_WINDOW_SCISSOR_BR of the merged first tile and of the merged area.
+  uint32_t merged_height = merged_full_height.load();
+  uint32_t* merged_out = payload + 1 + kSurfaceCount * 5;
+  merged_out[0] = merged_height ? (merged_tile_height.load() << 16) | merged_tile_width.load() : 0;
+  merged_out[1] = merged_height ? (merged_height << 16) | merged_tile_width.load() : 0;
+  merged_out[2] = 0;
   static uint32_t last_device = 0;
   static uint32_t last_payload[kPayload] = {};
   if (last_device == device_address && !std::memcmp(last_payload, payload, sizeof(payload))) {
@@ -203,4 +268,16 @@ extern "C" void __imp__ProcessAndProcessAndProcess806_822069C0(PPCContext& __res
 extern "C" void ProcessAndProcessAndProcess806_822069C0(PPCContext& __restrict ctx, uint8_t* base) {
   fable2::native_gpu::ReportSurfaces(ctx, base, ctx.r3.u32);
   __imp__ProcessAndProcessAndProcess806_822069C0(ctx, base);
+}
+
+// The D3D runtime's tiling token list: the main scene doesn't fit the Xbox 360
+// EDRAM, so it's replayed once per tile. Host render targets have no such limit,
+// so the game is told there's a single tile covering all of them.
+// Token 0x80000000 is followed by flags, the tile count and the rectangles
+// (left, top, right, bottom).
+extern "C" void __imp__ProcessAndProcessAndProcess1079_82B9ED28(PPCContext& __restrict ctx,
+                                                               uint8_t* base);
+extern "C" void ProcessAndProcessAndProcess1079_82B9ED28(PPCContext& __restrict ctx, uint8_t* base) {
+  fable2::native_gpu::MergeTiles(base, ctx.r3.u32);
+  __imp__ProcessAndProcessAndProcess1079_82B9ED28(ctx, base);
 }
