@@ -23,6 +23,10 @@
 REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
                       "Path to SDL gamecontroller mappings file");
 
+REXCVAR_DEFINE_BOOL(hid_poll_on_read, true, "HID",
+                    "Read the controller when the game asks for its state, for less input latency")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::input::sdl {
 
 namespace {
@@ -198,6 +202,11 @@ X_RESULT SDLInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
 
   if (is_active) {
     QueueControllerUpdate();
+    // The UI thread may be waiting for a drawable for a whole display refresh, so
+    // read the controller here too. Events are queued safely from any thread.
+    if (REXCVAR_GET(hid_poll_on_read)) {
+      SDL_UpdateGamepads();
+    }
   }
 
   auto guard = DrainAndLock();

@@ -6,6 +6,9 @@
  *              See LICENSE file in the project root for full license text.
  */
 
+#include <rex/cvar.h>
+#include <rex/logging.h>
+#include <atomic>
 #include <rex/ui/metal/metal_presenter.h>
 
 #include <cstring>
@@ -15,6 +18,13 @@
 #include <rex/ui/metal/metal_immediate_drawer.h>
 #include <rex/ui/metal/metal_provider.h>
 #include <rex/ui/surface_mac.h>
+
+REXCVAR_DEFINE_BOOL(metal_display_sync, true, "GPU/Metal",
+                    "Present the window's frames in step with the display")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(metal_max_drawables, 2, "GPU/Metal",
+                     "Drawables of the window's Metal layer, 2 or 3. 2 can show frames sooner")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex {
 namespace ui {
@@ -199,6 +209,13 @@ Presenter::PaintResult MetalPresenter::PaintAndPresentImpl(bool execute_ui_drawe
     return PaintResult::kNotPresented;
   }
   @autoreleasepool {
+    int32_t max_drawables = REXCVAR_GET(metal_max_drawables);
+    if (layer_.maximumDrawableCount != NSUInteger(max_drawables)) {
+      layer_.maximumDrawableCount = NSUInteger(max_drawables);
+    }
+    if (layer_.displaySyncEnabled != REXCVAR_GET(metal_display_sync)) {
+      layer_.displaySyncEnabled = REXCVAR_GET(metal_display_sync);
+    }
     id<CAMetalDrawable> drawable = [layer_ nextDrawable];
     if (!drawable) {
       return PaintResult::kNotPresented;
