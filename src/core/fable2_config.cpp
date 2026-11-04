@@ -238,6 +238,15 @@ hero_dog_texture_readback = false
 # Default: true
 dog_fur_depth_bias = true
 
+[video]
+# Uncap the frame rate. The game normally holds 30 fps by waiting for vertical
+# blanks of the console's 60 Hz display; with this on, the vertical blank signal
+# runs much faster, so the frame rate is only limited by the machine. false = the
+# original 30 fps. F6 toggles it while playing. Command line --vsync wins over
+# this. Note that some effects tied to the frame rate may run faster.
+# Default: false
+uncap_frame_rate = false
+
 [perf]
 # NtYieldExecution batching for the hot-function overrides (see
 # src/core/hotfunc/hotfunc_yield.h): every Nth guest yield does the real
@@ -389,6 +398,12 @@ bool Load(const std::filesystem::path& path) {
     values.mouse_look_camera_dump =
         Read<bool>(input_table, "input", "mouse_look_camera_dump", "boolean",
                    values.mouse_look_camera_dump);
+  }
+  const toml::path video_path{"video"};
+  if (const toml::node_view video = root.at_path(video_path);
+      video && video.is_table()) {
+    values.uncap_frame_rate = Read<bool>(*video.as_table(), "video", "uncap_frame_rate", "boolean",
+                                         values.uncap_frame_rate);
   }
   const toml::path patches_path{"patches"};
   const auto patches = root[patches_path];

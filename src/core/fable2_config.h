@@ -200,6 +200,9 @@ struct Values {
   // at random, which shows as flickering patches on the dog. Seeds the SDK
   // cvars depth_bias_shader(_units) in Fable2App. false = no bias.
   bool dog_fur_depth_bias = true;
+  // [video] uncap_frame_rate: run the vertical blank signal the game paces itself
+  // by much faster (SDK cvar vsync = false), lifting the 30 fps cap.
+  bool uncap_frame_rate = false;
   // [perf] - hot-function override tuning.
   // hotfunc_yield_every: NtYieldExecution batching factor for the hotfunc
   // overrides (see src/core/hotfunc/hotfunc_yield.h). Every Nth call does

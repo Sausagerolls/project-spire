@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <rex/ui/keybinds.h>
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
 
@@ -178,6 +179,18 @@ class Fable2App : public rex::ReXApp {
                     "(SDK without depth_bias_shader?)");
       }
     }
+
+    // Frame rate cap. vsync is an SDK cvar; the command line wins over the config.
+    if (fable2::config::Get().uncap_frame_rate &&
+        rex::cvar::GetFlagSource("vsync") == rex::cvar::Source::kDefault) {
+      rex::cvar::SetFlagByName("vsync", "false");
+      REXSYS_INFO("[fable2-config] frame rate uncapped (uncap_frame_rate=true)");
+    }
+    rex::ui::RegisterBind("bind_uncap_frame_rate", "F6", "Toggle the 30 fps cap", [] {
+      bool capped = rex::cvar::GetFlagByName("vsync") == "true";
+      rex::cvar::SetFlagByName("vsync", capped ? "false" : "true");
+      REXSYS_INFO("[fable2-config] frame rate {}", capped ? "uncapped" : "capped at 30 fps");
+    });
 
     // Feed the F3 debug overlay with guest FPS (below). The GPU plugin
     // records per-guest-swap frame timing into the shared perf registry
