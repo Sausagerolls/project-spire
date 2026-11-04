@@ -151,6 +151,8 @@ id<MTLFunction> MetalShader::MetalTranslation::GetOrCreateFunction(
   }
   if (!function_) {
     MakeInvalid();
+  } else {
+    function_ready_.store(true, std::memory_order_release);
   }
   return function_;
 }

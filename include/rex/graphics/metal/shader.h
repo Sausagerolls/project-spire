@@ -9,6 +9,7 @@
 
 // Objective-C++ only.
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 
@@ -40,11 +41,14 @@ class MetalShader : public SpirvShader {
     // Converts the translated SPIR-V to MSL and compiles it on the first call
     // (thread-safe). Returns nil if the translation is invalid or fails.
     id<MTLFunction> GetOrCreateFunction(const ui::metal::MetalProvider& provider);
+    // Translated and with its function created (never goes back to false).
+    bool is_function_ready() const { return function_ready_.load(std::memory_order_acquire); }
 
    private:
     std::mutex function_mutex_;
     bool function_attempted_ = false;
     id<MTLFunction> function_ = nil;
+    std::atomic<bool> function_ready_{false};
   };
 
   MetalShader(xenos::ShaderType shader_type, uint64_t ucode_data_hash,

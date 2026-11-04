@@ -379,6 +379,10 @@ SpirvShaderTranslator::Modification MetalPipelineCache::GetCurrentPixelShaderMod
 
 bool MetalPipelineCache::EnsureShadersTranslated(MetalShader::MetalTranslation* vertex_shader,
                                                  MetalShader::MetalTranslation* pixel_shader) {
+  if ((!vertex_shader || vertex_shader->is_function_ready()) &&
+      (!pixel_shader || pixel_shader->is_function_ready())) {
+    return true;
+  }
   const ui::metal::MetalProvider& provider = command_processor_.GetMetalProvider();
   auto start = std::chrono::steady_clock::now();
   struct AddTime {

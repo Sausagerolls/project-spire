@@ -1683,23 +1683,21 @@ void MetalCommandProcessor::BindDrawResources(id<MTLRenderCommandEncoder> encode
     // frames, when the render pass has ended).
     const std::vector<MetalShader::SamplerBinding>& stage_samplers =
         shader->GetSamplerBindingsAfterTranslation();
-    XXH3_state_t binding_hash_state;
-    XXH3_64bits_reset(&binding_hash_state);
-    XXH3_64bits_update(&binding_hash_state, &shader, sizeof(shader));
     const RegisterFile& regs = *register_file_;
+    uint64_t binding_hash = uint64_t(uintptr_t(shader));
+    auto hash_fetch_constant = [&](uint32_t fetch_constant) {
+      const uint32_t* words = &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + fetch_constant * 6];
+      for (uint32_t i = 0; i < 6; ++i) {
+        binding_hash = (binding_hash ^ words[i]) * UINT64_C(0x9E3779B97F4A7C15);
+        binding_hash ^= binding_hash >> 29;
+      }
+    };
     for (const MetalShader::TextureBinding& binding : textures) {
-      XXH3_64bits_update(
-          &binding_hash_state,
-          &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + binding.fetch_constant * 6],
-          sizeof(uint32_t) * 6);
+      hash_fetch_constant(binding.fetch_constant);
     }
     for (const MetalShader::SamplerBinding& binding : stage_samplers) {
-      XXH3_64bits_update(
-          &binding_hash_state,
-          &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + binding.fetch_constant * 6],
-          sizeof(uint32_t) * 6);
+      hash_fetch_constant(binding.fetch_constant);
     }
-    uint64_t binding_hash = XXH3_64bits_digest(&binding_hash_state);
     if (encoder_bindings_valid_[stage] && encoder_binding_hash_[stage] == binding_hash) {
       continue;
     }
