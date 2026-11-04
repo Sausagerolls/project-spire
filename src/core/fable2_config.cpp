@@ -279,7 +279,42 @@ T Read(const toml::table& section, std::string_view section_name,
 
 }  // namespace
 
+namespace {
+std::filesystem::path loaded_path;
+}  // namespace
+
+void SaveUncapFrameRate(bool uncapped) {
+  if (loaded_path.empty()) {
+    return;
+  }
+  std::ifstream in(loaded_path);
+  std::string line, text;
+  bool found = false;
+  const std::string value = std::string("uncap_frame_rate = ") + (uncapped ? "true" : "false");
+  while (std::getline(in, line)) {
+    if (line.rfind("uncap_frame_rate", 0) == 0) {
+      line = value;
+      found = true;
+    }
+    text += line + "\n";
+  }
+  in.close();
+  if (!found) {
+    text += "\n[video]\n" + value + "\n";
+  }
+  // Via a temporary file, so a crash can't leave a broken config.
+  std::filesystem::path temporary = loaded_path;
+  temporary += ".tmp";
+  {
+    std::ofstream out(temporary, std::ios::binary);
+    out << text;
+  }
+  std::error_code error_code;
+  std::filesystem::rename(temporary, loaded_path, error_code);
+}
+
 bool Load(const std::filesystem::path& path) {
+  loaded_path = path;
   if (!std::filesystem::exists(path)) {
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     if (!out) {
@@ -313,8 +348,8 @@ bool Load(const std::filesystem::path& path) {
 
   // Warn about unknown top-level sections (usually a typo or a file written
   // for a newer build).
-  static constexpr std::array<std::string_view, 4> kKnownSections = {
-      "general", "input", "patches", "perf"};
+  static constexpr std::array<std::string_view, 5> kKnownSections = {
+      "general", "input", "patches", "perf", "video"};
   for (const auto& [key, value] : root) {
     const bool known =
         std::ranges::find(kKnownSections, key.str()) != kKnownSections.end();

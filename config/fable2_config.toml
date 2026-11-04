@@ -189,6 +189,12 @@ hero_dog_texture_readback = false
 # Default: true
 dog_fur_depth_bias = true
 
+[video]
+# Uncap the frame rate. false = the original 30 fps. Also in the main menu under
+# Options > Frame Rate, and F6 toggles it while playing. Command line --vsync wins.
+# Default: false
+uncap_frame_rate = false
+
 [perf]
 # NtYieldExecution batching for the hot-function overrides (see
 # src/core/hotfunc/hotfunc_yield.h): every Nth guest yield does the real

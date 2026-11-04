@@ -220,6 +220,8 @@ struct Values {
 // Unknown top-level sections log a warning; everything is otherwise ignored.
 // Safe to call only after the SDK logging is initialized (OnPostInitLogging).
 bool Load(const std::filesystem::path& path);
+// Writes [video] uncap_frame_rate to the loaded config file.
+void SaveUncapFrameRate(bool uncapped);
 
 // Parsed values (in-memory defaults until Load() succeeds).
 const Values& Get();
