@@ -88,6 +88,9 @@ REXCVAR_DEFINE_BOOL(metal_memexport_end_pass, true, "GPU/Metal",
 REXCVAR_DEFINE_BOOL(metal_memexport_never_culled, false, "GPU/Metal",
                     "Run memexport draws that also rasterize when they'd be culled")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(metal_aliased_clears, true, "GPU/Metal",
+                    "Apply clears made through an MSAA layout of a surface's EDRAM to the surface")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(metal_capture_frames, 0, "GPU/Metal",
                      "Write the next N presented frames raw to metal_capture_path (debugging, "
                      "set to a new value to start)")
@@ -1086,6 +1089,40 @@ bool MetalCommandProcessor::IssueDrawImpl() {
   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
 
   auto vertex_shader = static_cast<MetalShader*>(active_vertex_shader());
+  // A clear through an MSAA layout of a surface's EDRAM (see ClearAliasedSurfaces).
+  {
+    auto initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+    if (REXCVAR_GET(metal_aliased_clears) && vertex_shader && !surface_pitch_is_zero &&
+        render_target_cache_->native_surfaces_active() &&
+        regs.Get<reg::RB_SURFACE_INFO>().msaa_samples != xenos::MsaaSamples::k1X &&
+        initiator.prim_type == xenos::PrimitiveType::kRectangleList && initiator.num_indices == 3 &&
+        vertex_shader->vertex_bindings().size() == 1) {
+      const auto& binding = vertex_shader->vertex_bindings()[0];
+      auto fetch = regs.GetVertexFetch(binding.fetch_constant);
+      if (binding.stride_words >= 7 && fetch.size >= binding.stride_words * 3) {
+        const uint32_t* words = memory_->TranslatePhysical<const uint32_t*>(fetch.address << 2);
+        auto read = [&](uint32_t index) {
+          float value;
+          uint32_t word = xenos::GpuSwap(words[index], fetch.endian);
+          std::memcpy(&value, &word, sizeof(value));
+          return value;
+        };
+        float rectangle[4] = {FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX};
+        for (uint32_t i = 0; i < 3; ++i) {
+          float x = read(i * binding.stride_words), y = read(i * binding.stride_words + 1);
+          rectangle[0] = std::min(rectangle[0], x);
+          rectangle[1] = std::min(rectangle[1], y);
+          rectangle[2] = std::max(rectangle[2], x);
+          rectangle[3] = std::max(rectangle[3], y);
+        }
+        float color[4] = {read(3), read(4), read(5), read(6)};
+        uint32_t color_mask = regs.values[XE_GPU_REG_RB_COLOR_MASK] & 0xF;
+        if (render_target_cache_->ClearAliasedSurfaces(rectangle, read(2), color, color_mask)) {
+          return true;
+        }
+      }
+    }
+  }
   if (!vertex_shader) {
     return draw_fail("no vertex shader");
   }

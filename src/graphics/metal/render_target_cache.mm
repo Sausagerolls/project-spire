@@ -645,6 +645,53 @@ bool MetalRenderTargetCache::native_surfaces_active() const {
   return native_bound_valid_ && REXCVAR_GET(metal_native_surfaces);
 }
 
+MetalRenderTargetCache::NativeSurface MetalRenderTargetCache::GetRegisterNativeSurface(
+    uint32_t slot) const {
+  // The hooks report surfaces at the game's D3D draws, but the runtime's own
+  // utility draws (clears) and prerecorded lists set the registers directly, so
+  // the registers decide. Surfaces the game aliases by format name only (the
+  // same storage at the same place) stay one texture.
+  const NativeSurface& bound = native_bound_[slot];
+  bool is_depth = !slot;
+  auto rb_surface_info = register_file().Get<reg::RB_SURFACE_INFO>();
+  uint32_t info = is_depth
+                      ? register_file().values[XE_GPU_REG_RB_DEPTH_INFO]
+                      : register_file().values[reg::RB_COLOR_INFO::rt_register_indices[slot - 1]];
+  if (!rb_surface_info.surface_pitch) {
+    return bound;
+  }
+  auto matches = [&](const NativeSurface& surface) {
+    auto surface_info = reg::RB_SURFACE_INFO{surface.surface_info};
+    if (surface_info.surface_pitch != rb_surface_info.surface_pitch ||
+        surface_info.msaa_samples != rb_surface_info.msaa_samples) {
+      return false;
+    }
+    if (is_depth) {
+      auto a = reg::RB_DEPTH_INFO{surface.info}, b = reg::RB_DEPTH_INFO{info};
+      return a.depth_base == b.depth_base && a.depth_format == b.depth_format;
+    }
+    auto a = reg::RB_COLOR_INFO{surface.info}, b = reg::RB_COLOR_INFO{info};
+    return a.color_base == b.color_base && xenos::GetStorageColorFormat(a.color_format) ==
+                                               xenos::GetStorageColorFormat(b.color_format);
+  };
+  if (bound.object && matches(bound)) {
+    return bound;
+  }
+  for (const auto& entry : native_targets_) {
+    if (((entry.first >> 31) & 1) == uint64_t(is_depth) && entry.second.render_target &&
+        matches(entry.second.surface)) {
+      return entry.second.surface;
+    }
+  }
+  // Not seen yet: the pitch is known, and the height grows as draws require it.
+  NativeSurface surface;
+  surface.object = UINT32_MAX;
+  surface.surface_info = rb_surface_info.value;
+  surface.info = info;
+  surface.size = (uint32_t(rb_surface_info.surface_pitch) - 1) << 18;
+  return surface;
+}
+
 MetalRenderTargetCache::MetalRenderTarget* MetalRenderTargetCache::GetNativeRenderTarget(
     const NativeSurface& surface, bool is_depth, uint32_t required_height) {
   if (!surface.object) {
@@ -785,13 +832,13 @@ bool MetalRenderTargetCache::UpdateNative(bool is_rasterization_done,
   if (is_rasterization_done) {
     bool depth_used = normalized_depth_control.z_enable || normalized_depth_control.stencil_enable;
     if (depth_used) {
-      add(GetNativeRenderTarget(native_bound_[0], true, required_height), -1);
+      add(GetNativeRenderTarget(GetRegisterNativeSurface(0), true, required_height), -1);
     }
     bool color_used[xenos::kMaxColorRenderTargets];
     for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
       color_used[i] = ((normalized_color_mask >> (i * 4)) & 0xF) != 0;
       if (color_used[i]) {
-        add(GetNativeRenderTarget(native_bound_[1 + i], false, required_height), int32_t(i));
+        add(GetNativeRenderTarget(GetRegisterNativeSurface(1 + i), false, required_height), int32_t(i));
       }
     }
     // Also keep the bound surfaces this draw doesn't use attached (nothing is
@@ -1217,6 +1264,99 @@ void MetalRenderTargetCache::ClearRenderTarget(RenderTarget* render_target, uint
     }
   }
 
+  ClearRenderTargetValues(render_target, clear_values, stencil, rectangle);
+}
+
+bool MetalRenderTargetCache::ClearAliasedSurfaces(const float rectangle[4], float z,
+                                                  const float color[4],
+                                                  uint32_t normalized_color_mask) {
+  auto rb_surface_info = register_file().Get<reg::RB_SURFACE_INFO>();
+  uint32_t scale_x = rb_surface_info.msaa_samples >= xenos::MsaaSamples::k4X ? 2 : 1;
+  uint32_t scale_y = rb_surface_info.msaa_samples >= xenos::MsaaSamples::k2X ? 2 : 1;
+  uint32_t pitch = uint32_t(rb_surface_info.surface_pitch) * scale_x;
+  auto rb_depthcontrol = register_file().Get<reg::RB_DEPTHCONTROL>();
+  bool writes_depth = rb_depthcontrol.z_enable && rb_depthcontrol.z_write_enable &&
+                      rb_depthcontrol.zfunc == xenos::CompareFunction::kAlways;
+  bool writes_color = (normalized_color_mask & 0xF) != 0;
+  auto depth_info = register_file().Get<reg::RB_DEPTH_INFO>();
+  auto color_info = reg::RB_COLOR_INFO{
+      register_file().values[reg::RB_COLOR_INFO::rt_register_indices[0]]};
+  MetalRenderTarget* depth_target = nullptr;
+  MetalRenderTarget* color_target = nullptr;
+  for (auto& entry : native_targets_) {
+    if (!entry.second.render_target) {
+      continue;
+    }
+    auto surface_info = reg::RB_SURFACE_INFO{entry.second.surface.surface_info};
+    if (surface_info.msaa_samples != xenos::MsaaSamples::k1X ||
+        surface_info.surface_pitch != pitch) {
+      continue;
+    }
+    if ((entry.first >> 31) & 1) {
+      auto info = reg::RB_DEPTH_INFO{entry.second.surface.info};
+      if (info.depth_base == depth_info.depth_base && info.depth_format == depth_info.depth_format) {
+        depth_target = entry.second.render_target.get();
+      }
+    } else {
+      auto info = reg::RB_COLOR_INFO{entry.second.surface.info};
+      if (info.color_base == color_info.color_base &&
+          xenos::GetStorageColorFormat(info.color_format) ==
+              xenos::GetStorageColorFormat(color_info.color_format)) {
+        color_target = entry.second.render_target.get();
+      }
+    }
+  }
+  // Every target written must have its counterpart, otherwise the normal path
+  // handles the draw.
+  if ((!writes_depth && !writes_color) || (writes_color && !color_target) ||
+      (writes_depth && !depth_target && !writes_color)) {
+    return false;
+  }
+  // The vertices usually cover everything - the scissor limits the clear.
+  draw_util::Scissor scissor;
+  draw_util::GetScissor(register_file(), scissor);
+  auto pixel = [](float value) { return uint32_t(std::max(std::floor(value + 0.5f), 0.0f)); };
+  uint32_t area_left = std::max(pixel(rectangle[0]), scissor.offset[0]);
+  uint32_t area_top = std::max(pixel(rectangle[1]), scissor.offset[1]);
+  uint32_t area_right = std::min(pixel(rectangle[2]), scissor.offset[0] + scissor.extent[0]);
+  uint32_t area_bottom = std::min(pixel(rectangle[3]), scissor.offset[1] + scissor.extent[1]);
+  auto clear = [&](MetalRenderTarget* target, const float* values, uint32_t stencil) {
+    id<MTLTexture> texture = target->texture();
+    uint32_t left = std::min(area_left * scale_x, uint32_t(texture.width));
+    uint32_t top = std::min(area_top * scale_y, uint32_t(texture.height));
+    uint32_t right = std::min(area_right * scale_x, uint32_t(texture.width));
+    uint32_t bottom = std::min(area_bottom * scale_y, uint32_t(texture.height));
+    if (right <= left || bottom <= top) {
+      return;
+    }
+    Transfer::Rectangle pixels;
+    pixels.x_pixels = left;
+    pixels.y_pixels = top;
+    pixels.width_pixels = right - left;
+    pixels.height_pixels = bottom - top;
+    ClearRenderTargetValues(target, values, stencil, pixels);
+  };
+  if (writes_color && color_target) {
+    // Depth written to the same EDRAM as the color replaces it: the runtime clears
+    // color this way, and with a depth and stencil of 0 the result is 0.
+    bool depth_replaces_color = writes_depth && depth_info.depth_base == color_info.color_base;
+    static const float kZero[4] = {};
+    clear(color_target, depth_replaces_color ? kZero : color, 0);
+  }
+  if (writes_depth && depth_target) {
+    float depth_values[4] = {
+        depth_info.depth_format == xenos::DepthRenderTargetFormat::kD24FS8 ? z * 0.5f : z, 0, 0, 0};
+    clear(depth_target, depth_values, register_file().Get<reg::RB_STENCILREFMASK>().stencilref);
+  }
+  return true;
+}
+
+void MetalRenderTargetCache::ClearRenderTargetValues(RenderTarget* render_target,
+                                                     const float clear_values[4], uint32_t stencil,
+                                                     const Transfer::Rectangle& rectangle) {
+  auto& metal_rt = *static_cast<MetalRenderTarget*>(render_target);
+  RenderTargetKey key = metal_rt.key();
+  id<MTLTexture> texture = metal_rt.texture();
   uint32_t clear_pipeline_key = uint32_t(texture.pixelFormat) | (uint32_t(texture.sampleCount) << 16);
   id<MTLRenderPipelineState> pipeline = nil;
   auto pipeline_it = clear_pipelines_.find(clear_pipeline_key);
@@ -1293,7 +1433,7 @@ void MetalRenderTargetCache::ClearRenderTarget(RenderTarget* render_target, uint
     return;
   }
   [encoder setScissorRect:scissor];
-  [encoder setFragmentBytes:clear_values length:sizeof(clear_values) atIndex:0];
+  [encoder setFragmentBytes:clear_values length:sizeof(float) * 4 atIndex:0];
   [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 }
 
@@ -1682,7 +1822,8 @@ bool MetalRenderTargetCache::ResolveNative(const draw_util::ResolveInfo& resolve
                              resolve_info.height_div_8)
                             << 3;
   MetalRenderTarget* source = GetNativeRenderTarget(
-      native_bound_[source_is_depth ? 0 : 1 + source_select], source_is_depth, resolve_bottom);
+      GetRegisterNativeSurface(source_is_depth ? 0 : 1 + source_select), source_is_depth,
+      resolve_bottom);
 
   bool snapshot_only = false;
   {
@@ -1773,14 +1914,14 @@ bool MetalRenderTargetCache::ResolveNative(const draw_util::ResolveInfo& resolve
   clear_rectangle.width_pixels = uint32_t(resolve_info.coordinate_info.width_div_8) << 3;
   clear_rectangle.height_pixels = uint32_t(resolve_info.height_div_8) << 3;
   if (resolve_info.IsClearingDepth()) {
-    if (MetalRenderTarget* depth = GetNativeRenderTarget(native_bound_[0], true)) {
+    if (MetalRenderTarget* depth = GetNativeRenderTarget(GetRegisterNativeSurface(0), true)) {
       ClearRenderTarget(depth, resolve_info.rb_depth_clear, clear_rectangle);
     }
   }
   if (resolve_info.IsClearingColor()) {
     uint32_t color_index = source_is_depth ? 0 : source_select;
     if (MetalRenderTarget* color =
-            GetNativeRenderTarget(native_bound_[1 + color_index], false)) {
+            GetNativeRenderTarget(GetRegisterNativeSurface(1 + color_index), false)) {
       ClearRenderTarget(color,
                         resolve_info.rb_color_clear |
                             (uint64_t(resolve_info.rb_color_clear_lo) << 32),

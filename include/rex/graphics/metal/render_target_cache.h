@@ -95,6 +95,12 @@ class MetalRenderTargetCache final : public RenderTargetCache {
   };
   // [0] is depth / stencil, [1 + i] is color i.
   void SetNativeSurfaces(const NativeSurface* surfaces);
+  // The runtime clears part of a surface through an MSAA layout of the same EDRAM
+  // (half the pitch at 4x covers the same samples). Native surfaces are separate
+  // textures, so such a clear is applied to the 1x surface directly. rectangle is
+  // left, top, right, bottom in the MSAA layout's pixels. Returns whether handled.
+  bool ClearAliasedSurfaces(const float rectangle[4], float z, const float color[4],
+                            uint32_t normalized_color_mask);
   // Predicated tiling lists merged by the game's hooks: the first tile's size
   // and the height of the merged area.
   void AddMergedTile(uint32_t width, uint32_t tile_height, uint32_t merged_height) {
@@ -242,6 +248,8 @@ class MetalRenderTargetCache final : public RenderTargetCache {
   MetalRenderTarget* CreateMetalRenderTarget(RenderTargetKey key, uint32_t width,
                                              uint32_t height);
   // Native surfaces.
+  // The surface the registers select for a slot ([0] is depth, [1 + i] is color i).
+  NativeSurface GetRegisterNativeSurface(uint32_t slot) const;
   MetalRenderTarget* GetNativeRenderTarget(const NativeSurface& surface, bool is_depth,
                                            uint32_t required_height = 0);
   bool UpdateNative(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
@@ -302,6 +310,8 @@ class MetalRenderTargetCache final : public RenderTargetCache {
                                                  const RenderPassFormats* pass_formats = nullptr,
                                                  uint32_t pass_color_index = 0);
   // Clears a rectangle of a render target to a guest clear value.
+  void ClearRenderTargetValues(RenderTarget* render_target, const float clear_values[4],
+                               uint32_t stencil, const Transfer::Rectangle& rectangle);
   void ClearRenderTarget(RenderTarget* render_target, uint64_t clear_value,
                          const Transfer::Rectangle& rectangle);
 

@@ -362,7 +362,12 @@ SpirvShaderTranslator::Modification MetalPipelineCache::GetCurrentPixelShaderMod
   }
 
   using DepthStencilMode = SpirvShaderTranslator::Modification::DepthStencilMode;
-  if (shader.implicit_early_z_write_allowed() &&
+  if (shader.writes_depth() &&
+      regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {
+    // oDepth is in the guest's range, and host D24FS8 surfaces hold it multiplied
+    // by 0.5 (the viewport does that for interpolated depth, not for oDepth).
+    modification.pixel.depth_stencil_mode = DepthStencilMode::kFloat24Rounding;
+  } else if (shader.implicit_early_z_write_allowed() &&
       (!shader.writes_color_target(0) ||
        !draw_util::DoesCoverageDependOnAlpha(regs.Get<reg::RB_COLORCONTROL>()))) {
     modification.pixel.depth_stencil_mode = DepthStencilMode::kEarlyHint;
