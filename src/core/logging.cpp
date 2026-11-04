@@ -44,7 +44,7 @@ REXCVAR_DEFINE_BOOL(log_verbose, false, "Log", "Enable verbose logging (sets lev
 
 REXCVAR_DEFINE_BOOL(log_noisy, false, "Log", "Enable noisy/high-frequency log macros");
 
-REXCVAR_DEFINE_INT32(log_flush_interval, 0, "Log", "Periodic flush interval in seconds (0 = off)")
+REXCVAR_DEFINE_INT32(log_flush_interval, 1, "Log", "Periodic flush interval in seconds (0 = off)")
     .range(0, 60)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
