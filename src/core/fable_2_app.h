@@ -180,16 +180,15 @@ class Fable2App : public rex::ReXApp {
       }
     }
 
-    // Frame rate cap. vsync is an SDK cvar; the command line wins over the config.
-    if (fable2::config::Get().uncap_frame_rate &&
-        rex::cvar::GetFlagSource("vsync") == rex::cvar::Source::kDefault) {
-      rex::cvar::SetFlagByName("vsync", "false");
-      REXSYS_INFO("[fable2-config] frame rate uncapped (uncap_frame_rate=true)");
+    // Frame rate limit. vsync is an SDK cvar; the command line wins over the config.
+    if (rex::cvar::GetFlagSource("vsync") == rex::cvar::Source::kDefault) {
+      fable2::config::ApplyFrameRateLimit(fable2::config::Get().frame_rate_limit);
+      REXSYS_INFO("[fable2-config] frame rate limit {}", fable2::config::Get().frame_rate_limit);
     }
-    rex::ui::RegisterBind("bind_uncap_frame_rate", "F6", "Toggle the 30 fps cap", [] {
+    rex::ui::RegisterBind("bind_uncap_frame_rate", "F6", "Toggle the frame rate limit", [] {
       bool capped = rex::cvar::GetFlagByName("vsync") == "true";
       rex::cvar::SetFlagByName("vsync", capped ? "false" : "true");
-      REXSYS_INFO("[fable2-config] frame rate {}", capped ? "uncapped" : "capped at 30 fps");
+      REXSYS_INFO("[fable2-config] frame rate {}", capped ? "unlimited" : "limited");
     });
 
     // Feed the F3 debug overlay with guest FPS (below). The GPU plugin

@@ -190,10 +190,11 @@ hero_dog_texture_readback = false
 dog_fur_depth_bias = true
 
 [video]
-# Uncap the frame rate. false = the original 30 fps. Also in the main menu under
-# Options > Frame Rate, and F6 toggles it while playing. Command line --vsync wins.
-# Default: false
-uncap_frame_rate = false
+# Frames per second: 30 (the original), 40, 60, 90, or 0 for no limit. Also in the main
+# menu under Options. F6 toggles the limit while playing. Command line --vsync wins.
+# Note that some effects tied to the frame rate may run faster.
+# Default: 30
+frame_rate_limit = 30
 
 [perf]
 # NtYieldExecution batching for the hot-function overrides (see

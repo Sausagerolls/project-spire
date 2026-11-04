@@ -200,9 +200,10 @@ struct Values {
   // at random, which shows as flickering patches on the dog. Seeds the SDK
   // cvars depth_bias_shader(_units) in Fable2App. false = no bias.
   bool dog_fur_depth_bias = true;
-  // [video] uncap_frame_rate: run the vertical blank signal the game paces itself
-  // by much faster (SDK cvar vsync = false), lifting the 30 fps cap.
-  bool uncap_frame_rate = false;
+  // [video] frame_rate_limit: frames per second, 0 for no limit. The game shows a
+  // frame every 2 vertical blanks, so the blank signal runs at twice the limit (SDK
+  // cvar guest_vblank_hz), or as fast as possible without one (vsync = false).
+  int32_t frame_rate_limit = 30;
   // [perf] - hot-function override tuning.
   // hotfunc_yield_every: NtYieldExecution batching factor for the hotfunc
   // overrides (see src/core/hotfunc/hotfunc_yield.h). Every Nth call does
@@ -220,8 +221,10 @@ struct Values {
 // Unknown top-level sections log a warning; everything is otherwise ignored.
 // Safe to call only after the SDK logging is initialized (OnPostInitLogging).
 bool Load(const std::filesystem::path& path);
-// Writes [video] uncap_frame_rate to the loaded config file.
-void SaveUncapFrameRate(bool uncapped);
+// Sets the frame rate limit in the SDK cvars (0 for no limit).
+void ApplyFrameRateLimit(int32_t limit);
+// Writes [video] frame_rate_limit to the loaded config file.
+void SaveFrameRateLimit(int32_t limit);
 
 // Parsed values (in-memory defaults until Load() succeeds).
 const Values& Get();

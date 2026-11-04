@@ -5,7 +5,7 @@
 // functions and look like any other. A label that isn't a text tag is shown as is.
 // To add a setting, add its items in AddOptionsItems and handle them in OnSelect.
 // Keep settings directly under Options: a third level of this menu opens to a blank
-// row that can't be selected, so each value is one item ("Frame Rate: 30 FPS").
+// row that can't be selected, so each value is one item .
 
 #include <cstdint>
 #include <cstring>
@@ -33,8 +33,20 @@ void __imp__ProcessAndProcessAndProcess2446_826C81A0(PPCContext& __restrict ctx,
 namespace {
 
 const char kOptions[] = "MacOptions";
-const char kFrameRate30[] = "MacFrameRate30";
-const char kFrameRateUncapped[] = "MacFrameRateUncapped";
+struct FrameRateItem {
+  const char* name;
+  const char* label;
+  int32_t limit;  // 0 for no limit.
+};
+const FrameRateItem kFrameRates[] = {
+    {"MacFrameRate30", "Frame Rate: 30 FPS", 30},
+    {"MacFrameRate40", "Frame Rate: 40 FPS", 40},
+    {"MacFrameRate60", "Frame Rate: 60 FPS", 60},
+    {"MacFrameRate90", "Frame Rate: 90 FPS", 90},
+    {"MacFrameRateUncapped", "Frame Rate: Uncapped", 0},
+};
+// The limit of this run, as last chosen.
+int32_t current_frame_rate_limit = -1;
 const char kOptionsIcon[] = "Art\\GUI\\icon_options.tga";
 
 // Guest copies of host strings, kept for the whole run.
@@ -110,30 +122,37 @@ void SetSelected(PPCContext& ctx, uint8_t* base, uint32_t menu, const char* name
   DestructString(ctx, base, frame + kName);
 }
 
-bool IsUncapped() { return rex::cvar::GetFlagByName("vsync") != "true"; }
-
 void AddOptionsItems(PPCContext& ctx, uint8_t* base, uint32_t menu) {
+  if (current_frame_rate_limit < 0) {
+    current_frame_rate_limit = fable2::config::Get().frame_rate_limit;
+  }
   AddItem(ctx, base, menu, kOptions, "Options", "Root");
-  AddItem(ctx, base, menu, kFrameRate30, "Frame Rate: 30 FPS", kOptions);
-  AddItem(ctx, base, menu, kFrameRateUncapped, "Frame Rate: Uncapped", kOptions);
-  SetSelected(ctx, base, menu, IsUncapped() ? kFrameRateUncapped : kFrameRate30, true);
+  for (const FrameRateItem& item : kFrameRates) {
+    AddItem(ctx, base, menu, item.name, item.label, kOptions);
+    if (item.limit == current_frame_rate_limit) {
+      SetSelected(ctx, base, menu, item.name, true);
+    }
+  }
 }
 
 // Returns whether the name was one of the added items.
 bool OnSelect(PPCContext& ctx, uint8_t* base, uint32_t menu, const char* name) {
-  bool uncap;
-  if (!std::strcmp(name, kFrameRate30)) {
-    uncap = false;
-  } else if (!std::strcmp(name, kFrameRateUncapped)) {
-    uncap = true;
-  } else {
+  const FrameRateItem* chosen = nullptr;
+  for (const FrameRateItem& item : kFrameRates) {
+    if (!std::strcmp(name, item.name)) {
+      chosen = &item;
+    }
+  }
+  if (!chosen) {
     return false;
   }
-  rex::cvar::SetFlagByName("vsync", uncap ? "false" : "true");
-  fable2::config::SaveUncapFrameRate(uncap);
-  REXSYS_INFO("[options] frame rate {}", uncap ? "uncapped" : "capped at 30 fps");
-  SetSelected(ctx, base, menu, uncap ? kFrameRate30 : kFrameRateUncapped, false);
-  SetSelected(ctx, base, menu, uncap ? kFrameRateUncapped : kFrameRate30, true);
+  current_frame_rate_limit = chosen->limit;
+  fable2::config::ApplyFrameRateLimit(chosen->limit);
+  fable2::config::SaveFrameRateLimit(chosen->limit);
+  REXSYS_INFO("[options] frame rate limit {}", chosen->limit);
+  for (const FrameRateItem& item : kFrameRates) {
+    SetSelected(ctx, base, menu, item.name, &item == chosen);
+  }
   // Refresh the menu, like the game's Subtitles items.
   ctx.r3.u64 = REX_LOAD_U32(menu + 20);
   ctx.ctr.u64 = REX_LOAD_U32(REX_LOAD_U32(ctx.r3.u32) + 12);

@@ -10,6 +10,7 @@
 // sections -> warning. A broken file -> error + dialog + defaults (the game
 // still runs), so a hand edit can never wedge the launch.
 
+#include <rex/cvar.h>
 #include "fable2_config.h"
 
 #include <array>
@@ -239,13 +240,11 @@ hero_dog_texture_readback = false
 dog_fur_depth_bias = true
 
 [video]
-# Uncap the frame rate. The game normally holds 30 fps by waiting for vertical
-# blanks of the console's 60 Hz display; with this on, the vertical blank signal
-# runs much faster, so the frame rate is only limited by the machine. false = the
-# original 30 fps. F6 toggles it while playing. Command line --vsync wins over
-# this. Note that some effects tied to the frame rate may run faster.
-# Default: false
-uncap_frame_rate = false
+# Frames per second: 30 (the original), 40, 60, 90, or 0 for no limit. Also in the main
+# menu under Options. F6 toggles the limit while playing. Command line --vsync wins.
+# Note that some effects tied to the frame rate may run faster.
+# Default: 30
+frame_rate_limit = 30
 
 [perf]
 # NtYieldExecution batching for the hot-function overrides (see
@@ -283,16 +282,22 @@ namespace {
 std::filesystem::path loaded_path;
 }  // namespace
 
-void SaveUncapFrameRate(bool uncapped) {
+void ApplyFrameRateLimit(int32_t limit) {
+  rex::cvar::SetFlagByName("guest_vblank_hz", std::to_string(limit > 0 ? limit * 2 : 0));
+  rex::cvar::SetFlagByName("vsync", limit > 0 ? "true" : "false");
+}
+
+void SaveFrameRateLimit(int32_t limit) {
   if (loaded_path.empty()) {
     return;
   }
   std::ifstream in(loaded_path);
   std::string line, text;
   bool found = false;
-  const std::string value = std::string("uncap_frame_rate = ") + (uncapped ? "true" : "false");
+  const std::string value = "frame_rate_limit = " + std::to_string(limit);
   while (std::getline(in, line)) {
-    if (line.rfind("uncap_frame_rate", 0) == 0) {
+    // uncap_frame_rate is the setting's old name.
+    if (line.rfind("frame_rate_limit", 0) == 0 || line.rfind("uncap_frame_rate", 0) == 0) {
       line = value;
       found = true;
     }
@@ -437,8 +442,12 @@ bool Load(const std::filesystem::path& path) {
   const toml::path video_path{"video"};
   if (const toml::node_view video = root.at_path(video_path);
       video && video.is_table()) {
-    values.uncap_frame_rate = Read<bool>(*video.as_table(), "video", "uncap_frame_rate", "boolean",
-                                         values.uncap_frame_rate);
+    // The setting's old name, in configs written before there were several limits.
+    if (Read<bool>(*video.as_table(), "video", "uncap_frame_rate", "boolean", false)) {
+      values.frame_rate_limit = 0;
+    }
+    values.frame_rate_limit = int32_t(Read<int64_t>(*video.as_table(), "video", "frame_rate_limit",
+                                                    "integer", values.frame_rate_limit));
   }
   const toml::path patches_path{"patches"};
   const auto patches = root[patches_path];
