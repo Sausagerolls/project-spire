@@ -39,6 +39,11 @@ REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
                     "Store shaders persistently and load them when loading games to avoid "
                     "runtime spikes and freezes when playing the game not for the first time.");
 
+REXCVAR_DEFINE_INT32(guest_vblank_hz, 0, "GPU",
+                     "Vertical blank rate given to the game with vsync on, 0 for the video mode's. "
+                     "Games pacing themselves by it run faster or slower")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace {
 
 rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
@@ -160,8 +165,13 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
         while (vsync_worker_running_) {
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
-          uint64_t interval_ticks =
-              REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
+          uint64_t interval_ticks = no_vsync_interval_ticks;
+          if (REXCVAR_GET(vsync)) {
+            int32_t vblank_hz = REXCVAR_GET(guest_vblank_hz);
+            interval_ticks = vblank_hz > 0
+                                 ? std::max(uint64_t(1), guest_tick_frequency / uint64_t(vblank_hz))
+                                 : vsync_interval_ticks;
+          }
           while (current_time - last_frame_time >= interval_ticks) {
             MarkVblank();
             last_frame_time += interval_ticks;
