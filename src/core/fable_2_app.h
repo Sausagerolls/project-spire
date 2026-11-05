@@ -310,6 +310,25 @@ class Fable2App : public rex::ReXApp {
     });
   }
 
+  // Project Spire installs the game as <install>/Project Spire Game.app, with the disc
+  // files in <install>/game. Settings, saves, cache and logs then live in <install>/user,
+  // so a rebuild can replace the whole bundle without touching them. Elsewhere
+  // everything stays next to the exe, as before.
+  static std::filesystem::path SpireInstallFolder() {
+    const std::filesystem::path exe_dir = rex::filesystem::GetExecutableFolder();
+    const std::filesystem::path contents = exe_dir.parent_path();
+    const std::filesystem::path bundle = contents.parent_path();
+    if (exe_dir.filename() == "MacOS" && contents.filename() == "Contents" &&
+        bundle.extension() == ".app") {
+      return bundle.parent_path();
+    }
+    return {};
+  }
+  static std::filesystem::path HomeFolder() {
+    const std::filesystem::path install = SpireInstallFolder();
+    return install.empty() ? rex::filesystem::GetExecutableFolder() : install / "user";
+  }
+
   // Load the recomp's own user config (fable2_config.toml) next to the exe,
   // creating it with defaults on first launch. Runs after the SDK's logging
   // init so load/create/parse problems land in logs/ (see src/core/fable2_config.h).
@@ -319,9 +338,7 @@ class Fable2App : public rex::ReXApp {
     // This describes the linked build, not a guarantee about DLLs replaced later.
     REXSYS_INFO("[native-build] configuration={} linked_sdk={}",
                 FABLE2_NATIVE_CONFIGURATION, FABLE2_NATIVE_SDK);
-    const std::filesystem::path exe_dir =
-        rex::filesystem::GetExecutableFolder();
-    fable2::config::Load(exe_dir / "fable2_config.toml");
+    fable2::config::Load(HomeFolder() / "fable2_config.toml");
 
     // Seed cvars from the config. Only when the cvar is still at its
     // compiled default (source kDefault), so higher-priority sources --
@@ -542,6 +559,11 @@ class Fable2App : public rex::ReXApp {
     const std::filesystem::path exe_dir =
         rex::filesystem::GetExecutableFolder();
 
+    const std::filesystem::path install = SpireInstallFolder();
+    if (paths.game_data_root.empty() && !install.empty() &&
+        std::filesystem::is_regular_file(install / "game" / "default.xex")) {
+      paths.game_data_root = install / "game";
+    }
     if (paths.game_data_root.empty()) {
       if (std::filesystem::is_regular_file(exe_dir / "default.xex")) {
         paths.game_data_root = exe_dir;
@@ -580,10 +602,14 @@ class Fable2App : public rex::ReXApp {
     // defaults are non-empty, so empty-checks would never trigger (this
     // also overrides the cvar/CLI defaults).
     std::error_code ec;
-    paths.user_data_root = exe_dir / "saves";
+    const std::filesystem::path home = HomeFolder();
+    paths.user_data_root = home / "saves";
     std::filesystem::create_directories(paths.user_data_root, ec);
-    paths.cache_root = exe_dir / "cache";
+    paths.cache_root = home / "cache";
     std::filesystem::create_directories(paths.cache_root, ec);
+
+    // The SDK's own config (and the logs, which go next to it).
+    paths.config_path = home / paths.config_path.filename();
 
     // Mount the $SystemUpdate folder (inside the content root) as update:\
     // so VdSetGraphicsInterruptCallback-era update partition lookups resolve
