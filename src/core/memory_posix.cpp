@@ -483,6 +483,10 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
     shm_unlink(full_path.c_str());
     return kFileMappingHandleInvalid;
   }
+  // Callers map the object only through the descriptor, so remove the name now. A named object
+  // outlives a process that is killed or crashes, keeping its pages (gigabytes of guest memory)
+  // in RAM or swap until the Mac restarts. Unnamed, it is freed when the last mapping goes.
+  shm_unlink(full_path.c_str());
   return static_cast<FileMappingHandle>(ret);
 #endif
 }
