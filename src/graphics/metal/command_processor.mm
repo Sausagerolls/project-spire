@@ -894,7 +894,9 @@ id<MTLComputeCommandEncoder> MetalCommandProcessor::GetComputeEncoder(const char
   }
   CountRenderPassBreak(reason);
   EndEncoding();
-  FlushDeferredClears();
+  if (ReadsRenderTargets(reason)) {
+    FlushDeferredClears();
+  }
   compute_encoder_ = [GetCommandBuffer() computeCommandEncoder];
   compute_encoder_.label = split ? [NSString stringWithFormat:@"compute %s", reason] : @"compute";
   encoder_reason_ = reason;
@@ -908,77 +910,103 @@ id<MTLBlitCommandEncoder> MetalCommandProcessor::GetBlitEncoder(const char* reas
   }
   CountRenderPassBreak(reason);
   EndEncoding();
-  FlushDeferredClears();
+  if (ReadsRenderTargets(reason)) {
+    FlushDeferredClears();
+  }
   blit_encoder_ = [GetCommandBuffer() blitCommandEncoder];
   blit_encoder_.label = split ? [NSString stringWithFormat:@"blit %s", reason] : @"blit";
   encoder_reason_ = reason;
   return blit_encoder_;
 }
 
+void MetalCommandProcessor::CountStatsEvent(const char* name) {
+  if (REXCVAR_GET(metal_log_stats)) {
+    ++stats_.utility_passes[name];
+  }
+}
+
 void MetalCommandProcessor::DeferClear(id<MTLTexture> texture, bool is_depth,
-                                      const float values[4], uint32_t stencil) {
+                                      const float values[4], uint32_t stencil,
+                                      const MTLScissorRect& rect) {
   // A compute, blit or utility encoder may read the target next without starting a new
   // encoder, and an open pass that draws to it must not see it cleared early: end those so
   // that the next encoder applies or flushes the clear.
-  bool in_open_pass = false;
-  if (render_encoder_ && !render_encoder_is_utility_) {
-    in_open_pass = render_encoder_attachments_.depth == texture;
-    for (id<MTLTexture> color : render_encoder_attachments_.color) {
-      in_open_pass |= color == texture;
-    }
-  }
   if (compute_encoder_ || blit_encoder_ || (render_encoder_ && render_encoder_is_utility_) ||
-      in_open_pass) {
+      IsOpenPassAttachment(texture)) {
     CountRenderPassBreak("clear");
     EndEncoding();
   }
-  if (REXCVAR_GET(metal_log_stats)) {
-    ++stats_.utility_passes["deferred clear"];
-  }
   DeferredClear clear;
+  clear.texture = texture;
   clear.is_depth = is_depth;
+  clear.full = !rect.x && !rect.y && rect.width == texture.width && rect.height == texture.height;
   std::copy(values, values + 4, clear.values);
   clear.stencil = stencil;
-  for (auto& entry : deferred_clears_) {
-    if (entry.first == texture) {
-      entry.second = clear;
-      return;
+  clear.rect = rect;
+  CountStatsEvent(clear.full ? "deferred clear" : "deferred partial clear");
+  if (clear.full) {
+    // Replaces earlier clears of the texture.
+    deferred_clears_.erase(std::remove_if(deferred_clears_.begin(), deferred_clears_.end(),
+                                          [&](const DeferredClear& other) {
+                                            return other.texture == texture;
+                                          }),
+                           deferred_clears_.end());
+  }
+  deferred_clears_.push_back(clear);
+}
+
+bool MetalCommandProcessor::ReadsRenderTargets(const char* reason) {
+  // These read guest memory or textures only. A resolve flushes the clears of its source
+  // itself (FlushDeferredClearsFor).
+  for (const char* other : {"texture load", "swap", "snapshot copy", "texture copy", "resolve"}) {
+    if (!std::strcmp(reason, other)) {
+      return false;
     }
   }
-  deferred_clears_.emplace_back(texture, clear);
+  return true;
+}
+
+void MetalCommandProcessor::FlushDeferredClearsFor(id<MTLTexture> texture) {
+  if (std::none_of(deferred_clears_.begin(), deferred_clears_.end(),
+                   [&](const DeferredClear& clear) { return clear.texture == texture; })) {
+    return;
+  }
+  EndEncoding();
+  std::vector<DeferredClear> clears;
+  for (auto it = deferred_clears_.begin(); it != deferred_clears_.end();) {
+    if (it->texture == texture) {
+      clears.push_back(*it);
+      it = deferred_clears_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  for (const DeferredClear& clear : clears) {
+    CountStatsEvent("deferred clear flushed for a resolve");
+    // ClearTextureNow's utility pass flushes the rest otherwise.
+    std::vector<DeferredClear> others;
+    others.swap(deferred_clears_);
+    render_target_cache_->ClearTextureNow(clear.texture, clear.is_depth, clear.values,
+                                          clear.stencil, clear.rect);
+    EndEncoding();
+    deferred_clears_.swap(others);
+  }
 }
 
 void MetalCommandProcessor::FlushDeferredClears() {
   if (deferred_clears_.empty()) {
     return;
   }
-  // Called with no encoder open.
-  for (const auto& [texture, clear] : deferred_clears_) {
-    MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
-    if (clear.is_depth) {
-      pass.depthAttachment.texture = texture;
-      pass.depthAttachment.loadAction = MTLLoadActionClear;
-      pass.depthAttachment.storeAction = MTLStoreActionStore;
-      pass.depthAttachment.clearDepth = clear.values[0];
-      pass.stencilAttachment.texture = texture;
-      pass.stencilAttachment.loadAction = MTLLoadActionClear;
-      pass.stencilAttachment.storeAction = MTLStoreActionStore;
-      pass.stencilAttachment.clearStencil = clear.stencil;
-    } else {
-      pass.colorAttachments[0].texture = texture;
-      pass.colorAttachments[0].loadAction = MTLLoadActionClear;
-      pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-      pass.colorAttachments[0].clearColor =
-          MTLClearColorMake(clear.values[0], clear.values[1], clear.values[2], clear.values[3]);
-    }
-    id<MTLRenderCommandEncoder> encoder = [GetCommandBuffer() renderCommandEncoderWithDescriptor:pass];
-    encoder.label = @"deferred clear";
-    [encoder endEncoding];
-    if (REXCVAR_GET(metal_log_stats)) {
-      ++stats_.utility_passes["deferred clear flushed"];
-    }
+  // Called with no encoder open. The clears below open passes of their own, which flush
+  // again, so take the list first.
+  std::vector<DeferredClear> clears;
+  clears.swap(deferred_clears_);
+  for (const DeferredClear& clear : clears) {
+    CountStatsEvent("deferred clear flushed");
+    render_target_cache_->ClearTextureNow(clear.texture, clear.is_depth, clear.values,
+                                          clear.stencil, clear.rect);
+    EndEncoding();
   }
-  deferred_clears_.clear();
 }
 
 id<MTLRenderCommandEncoder> MetalCommandProcessor::BeginUtilityRenderPass(
@@ -1020,30 +1048,67 @@ id<MTLRenderCommandEncoder> MetalCommandProcessor::GetRenderEncoderForCurrentRen
     pass.stencilAttachment.loadAction = MTLLoadActionLoad;
     pass.stencilAttachment.storeAction = MTLStoreActionStore;
   }
-  // Whole-target clears waiting for this pass.
-  for (auto it = deferred_clears_.begin(); it != deferred_clears_.end();) {
-    id<MTLTexture> texture = it->first;
-    const DeferredClear& clear = it->second;
-    bool used = false;
-    if (clear.is_depth) {
-      if (attachments.depth == texture) {
-        pass.depthAttachment.loadAction = MTLLoadActionClear;
-        pass.depthAttachment.clearDepth = clear.values[0];
-        pass.stencilAttachment.loadAction = MTLLoadActionClear;
-        pass.stencilAttachment.clearStencil = clear.stencil;
-        used = true;
+  // Clears waiting for this pass: whole-target ones as load actions, others drawn first.
+  std::vector<DeferredClear> pass_clears;
+  if (!deferred_clears_.empty()) {
+    auto attachment_index = [&](const DeferredClear& clear) -> int32_t {
+      if (clear.is_depth) {
+        return attachments.depth == clear.texture ? -1 : -2;
       }
-    } else {
       for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
-        if (attachments.color[i] == texture) {
-          pass.colorAttachments[i].loadAction = MTLLoadActionClear;
-          pass.colorAttachments[i].clearColor = MTLClearColorMake(
-              clear.values[0], clear.values[1], clear.values[2], clear.values[3]);
-          used = true;
+        if (attachments.color[i] == clear.texture) {
+          return int32_t(i);
         }
       }
+      return -2;
+    };
+    std::vector<DeferredClear> remaining;
+    for (const DeferredClear& clear : deferred_clears_) {
+      (attachment_index(clear) == -2 ? remaining : pass_clears).push_back(clear);
     }
-    it = used ? deferred_clears_.erase(it) : it + 1;
+    deferred_clears_.swap(remaining);
+    for (auto it = pass_clears.begin(); it != pass_clears.end();) {
+      if (!it->full) {
+        ++it;
+        continue;
+      }
+      int32_t index = attachment_index(*it);
+      if (index < 0) {
+        pass.depthAttachment.loadAction = MTLLoadActionClear;
+        pass.depthAttachment.clearDepth = it->values[0];
+        pass.stencilAttachment.loadAction = MTLLoadActionClear;
+        pass.stencilAttachment.clearStencil = it->stencil;
+      } else {
+        pass.colorAttachments[index].loadAction = MTLLoadActionClear;
+        pass.colorAttachments[index].clearColor =
+            MTLClearColorMake(it->values[0], it->values[1], it->values[2], it->values[3]);
+      }
+      it = pass_clears.erase(it);
+    }
+    // Partial clears are drawn into the pass if a pipeline for its attachments exists and
+    // the rectangle fits all of them; the rest are done now, in passes of their own.
+    for (auto it = pass_clears.begin(); it != pass_clears.end();) {
+      bool fits = true;
+      auto check = [&](id<MTLTexture> texture) {
+        if (texture && (it->rect.x + it->rect.width > texture.width ||
+                        it->rect.y + it->rect.height > texture.height)) {
+          fits = false;
+        }
+      };
+      check(attachments.depth);
+      for (id<MTLTexture> color : attachments.color) {
+        check(color);
+      }
+      if (fits && render_target_cache_->GetInPassClearPipeline(pass, attachment_index(*it))) {
+        ++it;
+        continue;
+      }
+      CountStatsEvent("deferred clear flushed");
+      render_target_cache_->ClearTextureNow(it->texture, it->is_depth, it->values, it->stencil,
+                                            it->rect);
+      EndEncoding();
+      it = pass_clears.erase(it);
+    }
   }
   if (attachments.empty()) {
     // Rasterization without attachments (for instance, memexport only).
@@ -1073,6 +1138,29 @@ id<MTLRenderCommandEncoder> MetalCommandProcessor::GetRenderEncoderForCurrentRen
   encoder_pipeline_ = nil;
   encoder_depth_stencil_state_ = nil;
   encoder_shared_memory_bound_ = nil;
+  // Guest draws set all of the state these change (the pipeline and depth / stencil state
+  // are reset above, and the shared memory at buffer 0 is bound again).
+  for (const DeferredClear& clear : pass_clears) {
+    int32_t index = -1;
+    if (!clear.is_depth) {
+      for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+        if (attachments.color[i] == clear.texture) {
+          index = int32_t(i);
+        }
+      }
+    }
+    CountStatsEvent("deferred clear drawn in pass");
+    [render_encoder_ setRenderPipelineState:render_target_cache_->GetInPassClearPipeline(pass,
+                                                                                       index)];
+    [render_encoder_ setDepthStencilState:render_target_cache_->GetClearDepthStencilState(
+                                              clear.is_depth)];
+    if (clear.is_depth) {
+      [render_encoder_ setStencilReferenceValue:clear.stencil];
+    }
+    [render_encoder_ setScissorRect:clear.rect];
+    [render_encoder_ setFragmentBytes:clear.values length:sizeof(float) * 4 atIndex:0];
+    [render_encoder_ drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+  }
   return render_encoder_;
 }
 

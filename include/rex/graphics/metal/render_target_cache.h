@@ -125,6 +125,15 @@ class MetalRenderTargetCache final : public RenderTargetCache {
   id<MTLTexture> TakeResolveSnapshot(uint32_t address, uint32_t width, uint32_t height,
                                      uint32_t format, MTLPixelFormat pixel_format,
                                      id<MTLTexture> swap_in = nil, bool* swapped = nullptr);
+  // A clear in a render pass of its own.
+  void ClearTextureNow(id<MTLTexture> texture, bool is_depth, const float clear_values[4],
+                       uint32_t stencil, const MTLScissorRect& scissor);
+  // For clears drawn at the start of a guest render pass: a pipeline matching the pass's
+  // attachments that writes only one of them (color_index, or -1 for depth and stencil),
+  // or nil, and the depth / stencil state for it.
+  id<MTLRenderPipelineState> GetInPassClearPipeline(MTLRenderPassDescriptor* pass,
+                                                    int32_t color_index);
+  id<MTLDepthStencilState> GetClearDepthStencilState(bool writes_depth);
   // A texture is being loaded from this guest memory range (no snapshot for
   // it) - resolves overlapping it must keep writing to guest memory.
   // snapshot_compatible_format: the guest format if the texture can use a
@@ -339,10 +348,13 @@ class MetalRenderTargetCache final : public RenderTargetCache {
 
   id<MTLFunction> clear_vs_ = nil;
   id<MTLFunction> clear_color_ps_ = nil;
+  id<MTLFunction> clear_color4_ps_ = nil;
   id<MTLFunction> clear_depth_ps_ = nil;
   // Keyed by the pixel format and the sample count.
   std::unordered_map<uint32_t, id<MTLRenderPipelineState>> clear_pipelines_;
   id<MTLDepthStencilState> clear_depth_stencil_state_ = nil;
+  id<MTLDepthStencilState> clear_no_depth_stencil_state_ = nil;
+  std::unordered_map<std::string, id<MTLRenderPipelineState>> in_pass_clear_pipelines_;
   std::vector<Transfer> clear_transfers_[2];
 
   // EDRAM ownership transfers between render targets.

@@ -60,6 +60,7 @@ REXCVAR_DEFINE_BOOL(metal_render_target_transfers, true, "GPU/Metal",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DECLARE(bool, metal_defer_clears);
+REXCVAR_DECLARE(bool, metal_log_stats);
 REXCVAR_DEFINE_BOOL(metal_swap_snapshots, true, "GPU/Metal",
                     "Give a resolve snapshot's texture to the texture that loads it, instead of "
                     "copying it")
@@ -123,6 +124,20 @@ vertex VertexOut clear_vs(uint vertex_id [[vertex_id]]) {
 }
 fragment float4 clear_color_ps(constant float4& color [[buffer(0)]]) {
   return color;
+}
+struct Color4Out {
+  float4 color0 [[color(0)]];
+  float4 color1 [[color(1)]];
+  float4 color2 [[color(2)]];
+  float4 color3 [[color(3)]];
+};
+fragment Color4Out clear_color4_ps(constant float4& color [[buffer(0)]]) {
+  Color4Out out;
+  out.color0 = color;
+  out.color1 = color;
+  out.color2 = color;
+  out.color3 = color;
+  return out;
 }
 struct DepthOut {
   float depth [[depth(any)]];
@@ -522,6 +537,7 @@ bool MetalRenderTargetCache::Initialize() {
   clear_vs_ = [clear_library newFunctionWithName:@"clear_vs"];
   clear_color_ps_ = [clear_library newFunctionWithName:@"clear_color_ps"];
   clear_depth_ps_ = [clear_library newFunctionWithName:@"clear_depth_ps"];
+  clear_color4_ps_ = [clear_library newFunctionWithName:@"clear_color4_ps"];
 
   transfer_library_ = command_processor_.GetMetalProvider().CompileLibrary(
       kTransferShaderSource, "render target transfer");
@@ -1365,8 +1381,27 @@ void MetalRenderTargetCache::ClearRenderTargetValues(RenderTarget* render_target
                                                      const float clear_values[4], uint32_t stencil,
                                                      const Transfer::Rectangle& rectangle) {
   auto& metal_rt = *static_cast<MetalRenderTarget*>(render_target);
-  RenderTargetKey key = metal_rt.key();
   id<MTLTexture> texture = metal_rt.texture();
+  uint32_t scale_x = draw_resolution_scale_x(), scale_y = draw_resolution_scale_y();
+  MTLScissorRect scissor;
+  scissor.x = std::min(NSUInteger(rectangle.x_pixels * scale_x), texture.width);
+  scissor.y = std::min(NSUInteger(rectangle.y_pixels * scale_y), texture.height);
+  scissor.width = std::min(NSUInteger(rectangle.width_pixels * scale_x), texture.width - scissor.x);
+  scissor.height =
+      std::min(NSUInteger(rectangle.height_pixels * scale_y), texture.height - scissor.y);
+  if (!scissor.width || !scissor.height) {
+    return;
+  }
+  if (REXCVAR_GET(metal_defer_clears)) {
+    command_processor_.DeferClear(texture, metal_rt.key().is_depth, clear_values, stencil, scissor);
+    return;
+  }
+  ClearTextureNow(texture, metal_rt.key().is_depth, clear_values, stencil, scissor);
+}
+
+void MetalRenderTargetCache::ClearTextureNow(id<MTLTexture> texture, bool is_depth,
+                                             const float clear_values[4], uint32_t stencil,
+                                             const MTLScissorRect& scissor) {
   uint32_t clear_pipeline_key = uint32_t(texture.pixelFormat) | (uint32_t(texture.sampleCount) << 16);
   id<MTLRenderPipelineState> pipeline = nil;
   auto pipeline_it = clear_pipelines_.find(clear_pipeline_key);
@@ -1376,9 +1411,9 @@ void MetalRenderTargetCache::ClearRenderTargetValues(RenderTarget* render_target
     MTLRenderPipelineDescriptor* descriptor = [[MTLRenderPipelineDescriptor alloc] init];
     descriptor.label = @"render target clear";
     descriptor.vertexFunction = clear_vs_;
-    descriptor.fragmentFunction = key.is_depth ? clear_depth_ps_ : clear_color_ps_;
+    descriptor.fragmentFunction = is_depth ? clear_depth_ps_ : clear_color_ps_;
     descriptor.rasterSampleCount = texture.sampleCount;
-    if (key.is_depth) {
+    if (is_depth) {
       descriptor.depthAttachmentPixelFormat = texture.pixelFormat;
       descriptor.stencilAttachmentPixelFormat = texture.pixelFormat;
     } else {
@@ -1396,34 +1431,20 @@ void MetalRenderTargetCache::ClearRenderTargetValues(RenderTarget* render_target
   if (!pipeline) {
     return;
   }
-
-  uint32_t scale_x = draw_resolution_scale_x(), scale_y = draw_resolution_scale_y();
-  MTLScissorRect scissor;
-  scissor.x = std::min(NSUInteger(rectangle.x_pixels * scale_x), texture.width);
-  scissor.y = std::min(NSUInteger(rectangle.y_pixels * scale_y), texture.height);
-  scissor.width = std::min(NSUInteger(rectangle.width_pixels * scale_x), texture.width - scissor.x);
-  scissor.height =
-      std::min(NSUInteger(rectangle.height_pixels * scale_y), texture.height - scissor.y);
-  if (!scissor.width || !scissor.height) {
-    return;
-  }
-  if (REXCVAR_GET(metal_defer_clears) && !scissor.x && !scissor.y &&
-      scissor.width == texture.width && scissor.height == texture.height) {
-    command_processor_.DeferClear(texture, key.is_depth, clear_values, stencil);
-    return;
-  }
-
   MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
-  if (key.is_depth) {
+  bool full = !scissor.x && !scissor.y && scissor.width == texture.width &&
+              scissor.height == texture.height;
+  MTLLoadAction load = full ? MTLLoadActionDontCare : MTLLoadActionLoad;
+  if (is_depth) {
     pass.depthAttachment.texture = texture;
-    pass.depthAttachment.loadAction = MTLLoadActionLoad;
+    pass.depthAttachment.loadAction = load;
     pass.depthAttachment.storeAction = MTLStoreActionStore;
     pass.stencilAttachment.texture = texture;
-    pass.stencilAttachment.loadAction = MTLLoadActionLoad;
+    pass.stencilAttachment.loadAction = load;
     pass.stencilAttachment.storeAction = MTLStoreActionStore;
   } else {
     pass.colorAttachments[0].texture = texture;
-    pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    pass.colorAttachments[0].loadAction = load;
     pass.colorAttachments[0].storeAction = MTLStoreActionStore;
   }
   id<MTLRenderCommandEncoder> encoder = command_processor_.BeginUtilityRenderPass(pass, "clear");
@@ -1432,25 +1453,85 @@ void MetalRenderTargetCache::ClearRenderTargetValues(RenderTarget* render_target
   }
   encoder.label = @"clear";
   [encoder setRenderPipelineState:pipeline];
-  if (key.is_depth) {
-    if (!clear_depth_stencil_state_) {
-      MTLDepthStencilDescriptor* ds = [[MTLDepthStencilDescriptor alloc] init];
-      ds.depthCompareFunction = MTLCompareFunctionAlways;
-      ds.depthWriteEnabled = YES;
+  if (is_depth) {
+    [encoder setDepthStencilState:GetClearDepthStencilState(true)];
+    [encoder setStencilReferenceValue:stencil];
+  }
+  [encoder setScissorRect:scissor];
+  [encoder setFragmentBytes:clear_values length:sizeof(float) * 4 atIndex:0];
+  [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+}
+
+id<MTLDepthStencilState> MetalRenderTargetCache::GetClearDepthStencilState(bool writes_depth) {
+  __strong id<MTLDepthStencilState>& state =
+      writes_depth ? clear_depth_stencil_state_ : clear_no_depth_stencil_state_;
+  if (!state) {
+    MTLDepthStencilDescriptor* ds = [[MTLDepthStencilDescriptor alloc] init];
+    ds.depthCompareFunction = MTLCompareFunctionAlways;
+    ds.depthWriteEnabled = writes_depth;
+    if (writes_depth) {
       MTLStencilDescriptor* stencil_descriptor = [[MTLStencilDescriptor alloc] init];
       stencil_descriptor.stencilCompareFunction = MTLCompareFunctionAlways;
       stencil_descriptor.depthStencilPassOperation = MTLStencilOperationReplace;
       stencil_descriptor.writeMask = 0xFF;
       ds.frontFaceStencil = stencil_descriptor;
       ds.backFaceStencil = stencil_descriptor;
-      clear_depth_stencil_state_ = [command_processor_.device() newDepthStencilStateWithDescriptor:ds];
     }
-    [encoder setDepthStencilState:clear_depth_stencil_state_];
-    [encoder setStencilReferenceValue:stencil];
+    state = [command_processor_.device() newDepthStencilStateWithDescriptor:ds];
   }
-  [encoder setScissorRect:scissor];
-  [encoder setFragmentBytes:clear_values length:sizeof(float) * 4 atIndex:0];
-  [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+  return state;
+}
+
+id<MTLRenderPipelineState> MetalRenderTargetCache::GetInPassClearPipeline(
+    MTLRenderPassDescriptor* pass, int32_t color_index) {
+  // Keyed by the attachment formats, the sample count and the cleared attachment
+  // (color_index, or -1 for depth and stencil).
+  std::string key;
+  NSUInteger sample_count = 1;
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    id<MTLTexture> texture = pass.colorAttachments[i].texture;
+    key += std::to_string(texture ? uint32_t(texture.pixelFormat) : 0) + ",";
+    if (texture) {
+      sample_count = texture.sampleCount;
+    }
+  }
+  id<MTLTexture> depth = pass.depthAttachment.texture;
+  if (depth) {
+    sample_count = depth.sampleCount;
+  }
+  key += std::to_string(depth ? uint32_t(depth.pixelFormat) : 0) + "," +
+         std::to_string(sample_count) + "," + std::to_string(color_index);
+  auto it = in_pass_clear_pipelines_.find(key);
+  if (it != in_pass_clear_pipelines_.end()) {
+    return it->second;
+  }
+  MTLRenderPipelineDescriptor* descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+  descriptor.label = @"in-pass clear";
+  descriptor.vertexFunction = clear_vs_;
+  descriptor.fragmentFunction = color_index < 0 ? clear_depth_ps_ : clear_color4_ps_;
+  descriptor.rasterSampleCount = sample_count;
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    id<MTLTexture> texture = pass.colorAttachments[i].texture;
+    if (!texture) {
+      continue;
+    }
+    descriptor.colorAttachments[i].pixelFormat = texture.pixelFormat;
+    descriptor.colorAttachments[i].writeMask =
+        int32_t(i) == color_index ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
+  }
+  if (depth) {
+    descriptor.depthAttachmentPixelFormat = depth.pixelFormat;
+    descriptor.stencilAttachmentPixelFormat = pass.stencilAttachment.texture.pixelFormat;
+  }
+  NSError* error = nil;
+  id<MTLRenderPipelineState> pipeline =
+      [command_processor_.device() newRenderPipelineStateWithDescriptor:descriptor error:&error];
+  if (!pipeline) {
+    REXGPU_WARN("MetalRenderTargetCache: No in-pass clear pipeline ({}): {}", key,
+                error ? [error.localizedDescription UTF8String] : "unknown error");
+  }
+  in_pass_clear_pipelines_.emplace(key, pipeline);
+  return pipeline;
 }
 
 bool MetalRenderTargetCache::Resolve(const memory::Memory& memory,
@@ -1877,6 +1958,15 @@ bool MetalRenderTargetCache::ResolveNative(const draw_util::ResolveInfo& resolve
       GetRegisterNativeSurface(source_is_depth ? 0 : 1 + source_select), source_is_depth,
       resolve_bottom);
 
+  if (source) {
+    command_processor_.FlushDeferredClearsFor(source->texture());
+  }
+  if (command_processor_.IsGuestRenderPassOpen()) {
+    command_processor_.CountStatsEvent(
+        source && command_processor_.IsOpenPassAttachment(source->texture())
+            ? "resolve from the open pass"
+            : "resolve from another surface");
+  }
   bool snapshot_only = false;
   {
     // Whatever a snapshot of this address holds is out of date now.

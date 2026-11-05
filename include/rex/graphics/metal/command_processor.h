@@ -95,11 +95,32 @@ class MetalCommandProcessor : public CommandProcessor {
   bool IsGpuWrittenInSubmission(uint32_t start, uint32_t length) const;
   // Whether a render pass for guest drawing is open.
   bool IsGuestRenderPassOpen() const { return render_encoder_ && !render_encoder_is_utility_; }
-  // Clears a whole render target at the start of the next render pass that uses it (as its
-  // load action), or in its own pass before any other GPU work, which may read it.
+  // Whether the open guest render pass draws to the texture.
+  bool IsOpenPassAttachment(id<MTLTexture> texture) const {
+    if (!IsGuestRenderPassOpen() || !texture) {
+      return false;
+    }
+    if (render_encoder_attachments_.depth == texture) {
+      return true;
+    }
+    for (id<MTLTexture> color : render_encoder_attachments_.color) {
+      if (color == texture) {
+        return true;
+      }
+    }
+    return false;
+  }
+  // Counts an event for the metal_log_stats report.
+  void CountStatsEvent(const char* name);
+  // Clears a render target at the start of the next render pass that uses it (as its load
+  // action if the whole target is cleared, else as a draw), or in its own pass before any
+  // other GPU work, which may read it.
   void DeferClear(id<MTLTexture> texture, bool is_depth, const float values[4],
-                  uint32_t stencil);
+                  uint32_t stencil, const MTLScissorRect& rect);
   void FlushDeferredClears();
+  // Before a resolve reads the texture.
+  void FlushDeferredClearsFor(id<MTLTexture> texture);
+  static bool ReadsRenderTargets(const char* reason);
 
   // Per-frame transient GPU memory (constants and other small data), valid
   // until the frame completes on the GPU.
@@ -234,11 +255,15 @@ class MetalCommandProcessor : public CommandProcessor {
   // The render encoder is for utility drawing, not the guest render targets.
   bool render_encoder_is_utility_ = false;
   struct DeferredClear {
+    id<MTLTexture> texture;
     bool is_depth;
+    bool full;
     float values[4];
     uint32_t stencil;
+    MTLScissorRect rect;
   };
-  std::vector<std::pair<id<MTLTexture>, DeferredClear>> deferred_clears_;
+  // In order: a full clear first for a texture, then partial ones.
+  std::vector<DeferredClear> deferred_clears_;
   // State bound to the current render encoder.
   id<MTLRenderPipelineState> encoder_pipeline_ = nil;
   id<MTLDepthStencilState> encoder_depth_stencil_state_ = nil;
