@@ -37,10 +37,9 @@ REXCVAR_DEFINE_BOOL(metal_pipeline_archive, false, "GPU/Metal",
                     "Keep a pipeline binary archive on disk (compiles each new pipeline twice, "
                     "Metal also caches compiled shaders by itself)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
-REXCVAR_DEFINE_BOOL(metal_native_points, false, "GPU/Metal",
+REXCVAR_DEFINE_BOOL(metal_native_points, true, "GPU/Metal",
                     "Draw point sprites as Metal points (the vertex shader runs once per point) "
-                    "instead of expanding each to 4 vertices in the vertex shader. Breaks Fable "
-                    "II's objective trail: Metal points are square and clipped by their center")
+                    "instead of expanding each in the vertex shader. Read at startup.")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(metal_hardware_tessellation, true, "GPU/Metal",
                     "Tessellate quad patches with the Metal tessellator and per-patch factors "
