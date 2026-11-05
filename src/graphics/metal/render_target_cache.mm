@@ -1937,6 +1937,19 @@ void MetalRenderTargetCache::NoteGuestMemoryTextureLoad(uint32_t start, uint32_t
     if (entry.first == start && snapshot.format == snapshot_compatible_format) {
       continue;
     }
+    command_processor_.CountStatsEvent("texture load overlapping a snapshot");
+    if (!snapshot.memory_needed && REXCVAR_GET(metal_log_stats)) {
+      static int logged = 0;
+      if (logged < 30) {
+        ++logged;
+        REXGPU_INFO("Metal snapshot {:08X} ({}x{} format {}, extent {:08X}+{:X}) needs memory: "
+                    "load {:08X}+{:X} format {}",
+                    entry.first, snapshot.width, snapshot.height, snapshot.format,
+                    snapshot.extent_start, snapshot.extent_length, start, length,
+                    snapshot_compatible_format == UINT32_MAX ? -1
+                                                             : int32_t(snapshot_compatible_format));
+      }
+    }
     snapshot.memory_needed = true;
   }
 }
@@ -1979,6 +1992,9 @@ bool MetalRenderTargetCache::ResolveNative(const draw_util::ResolveInfo& resolve
   if (source && REXCVAR_GET(metal_resolve_snapshots)) {
     uint64_t made_before = resolve_snapshots_made_;
     MakeResolveSnapshot(resolve_info, *source);
+    if (resolve_snapshots_made_ == made_before) {
+      command_processor_.CountStatsEvent("resolve to memory: no snapshot possible");
+    }
     if (resolve_snapshots_made_ != made_before) {
       ResolveSnapshot& snapshot = resolve_snapshots_[resolve_info.copy_dest_base];
       // Guest memory is skipped only if it's known not to be read: an exact
@@ -1986,6 +2002,11 @@ bool MetalRenderTargetCache::ResolveNative(const draw_util::ResolveInfo& resolve
       // the range.
       snapshot_only = !REXCVAR_GET(metal_resolve_to_memory) && snapshot.used_by_texture &&
                       !snapshot.memory_needed;
+      if (!snapshot_only) {
+        command_processor_.CountStatsEvent(!snapshot.used_by_texture ? "resolve to memory: snapshot unused"
+                                           : snapshot.memory_needed ? "resolve to memory: range loaded otherwise"
+                                                                    : "resolve to memory: forced");
+      }
       snapshot.memory_written = !snapshot_only;
     }
   }
