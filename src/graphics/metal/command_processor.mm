@@ -101,6 +101,10 @@ REXCVAR_DEFINE_STRING(metal_capture_path, "/Volumes/1TB/tmp/fc", "GPU/Metal",
 REXCVAR_DEFINE_BOOL(metal_sync_submissions, false, "GPU/Metal",
                     "Wait for the GPU after every submission (debugging CPU / GPU memory hazards)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(metal_debug_draw_delay_us, 0, "GPU/Metal",
+                     "Busy-wait this many microseconds per draw on the command processor thread "
+                     "(debugging timing races)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(metal_log_stats, false, "GPU/Metal",
                     "Log Metal backend draw and resolve statistics about every 5 seconds")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -874,24 +878,30 @@ void MetalCommandProcessor::CountRenderPassBreak(const char* reason) {
 }
 
 id<MTLComputeCommandEncoder> MetalCommandProcessor::GetComputeEncoder(const char* reason) {
-  if (compute_encoder_) {
+  // With metal_log_stats, each reason gets its own encoder, labelled with it, so GPU
+  // traces show the time per reason.
+  bool split = REXCVAR_GET(metal_log_stats);
+  if (compute_encoder_ && (!split || encoder_reason_ == reason)) {
     return compute_encoder_;
   }
   CountRenderPassBreak(reason);
   EndEncoding();
   compute_encoder_ = [GetCommandBuffer() computeCommandEncoder];
-  compute_encoder_.label = @"compute";
+  compute_encoder_.label = split ? [NSString stringWithFormat:@"compute %s", reason] : @"compute";
+  encoder_reason_ = reason;
   return compute_encoder_;
 }
 
 id<MTLBlitCommandEncoder> MetalCommandProcessor::GetBlitEncoder(const char* reason) {
-  if (blit_encoder_) {
+  bool split = REXCVAR_GET(metal_log_stats);
+  if (blit_encoder_ && (!split || encoder_reason_ == reason)) {
     return blit_encoder_;
   }
   CountRenderPassBreak(reason);
   EndEncoding();
   blit_encoder_ = [GetCommandBuffer() blitCommandEncoder];
-  blit_encoder_.label = @"blit";
+  blit_encoder_.label = split ? [NSString stringWithFormat:@"blit %s", reason] : @"blit";
+  encoder_reason_ = reason;
   return blit_encoder_;
 }
 
@@ -1035,6 +1045,11 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
                                       bool major_mode_explicit) {
   ++stats_.draws_requested;
   ++frame_rate_draw_count_;
+  if (int32_t delay_us = REXCVAR_GET(metal_debug_draw_delay_us); delay_us > 0) {
+    auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(delay_us);
+    while (std::chrono::steady_clock::now() < until) {
+    }
+  }
   {
     static int32_t last_requested = 0, remaining = 0;
     int32_t requested = REXCVAR_GET(metal_log_draws);
@@ -1926,7 +1941,7 @@ void MetalCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fro
         auto& metal_context =
             static_cast<ui::metal::MetalPresenter::MetalGuestOutputRefreshContext&>(context);
         context.SetIs8bpc(constants.format == 0);
-        id<MTLComputeCommandEncoder> encoder = GetComputeEncoder();
+        id<MTLComputeCommandEncoder> encoder = GetComputeEncoder("swap");
         [encoder setComputePipelineState:swap_pipeline_];
         [encoder setBuffer:shared_memory_->buffer() offset:0 atIndex:0];
         [encoder setBytes:&constants length:sizeof(constants) atIndex:1];

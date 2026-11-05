@@ -223,6 +223,8 @@ class MetalCommandProcessor : public CommandProcessor {
   id<MTLRenderCommandEncoder> render_encoder_ = nil;
   id<MTLComputeCommandEncoder> compute_encoder_ = nil;
   id<MTLBlitCommandEncoder> blit_encoder_ = nil;
+  // Reason the open compute or blit encoder was started for (labels, with metal_log_stats).
+  const char* encoder_reason_ = nullptr;
   MetalRenderTargetCache::RenderPassAttachments render_encoder_attachments_;
   // The render encoder is for utility drawing, not the guest render targets.
   bool render_encoder_is_utility_ = false;

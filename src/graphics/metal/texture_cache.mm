@@ -608,7 +608,7 @@ bool MetalTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
         texture_key.base_page << 12, texture_key.GetWidth(), texture_key.GetHeight(),
         uint32_t(texture_key.format), host_format.format);
     if (snapshot) {
-      id<MTLBlitCommandEncoder> blit = command_processor_.GetBlitEncoder("texture copy");
+      id<MTLBlitCommandEncoder> blit = command_processor_.GetBlitEncoder("snapshot copy");
       [blit copyFromTexture:snapshot
                 sourceSlice:0
                 sourceLevel:0

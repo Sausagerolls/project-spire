@@ -46,9 +46,13 @@ REXCVAR_DEFINE_BOOL(metal_resolve_snapshots, true, "GPU/Metal",
                     "With native surfaces, copy color resolves to whole textures directly to the "
                     "texture (host to host) instead of reloading them from guest memory")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_BOOL(metal_resolve_to_memory, true, "GPU/Metal",
-                    "With resolve snapshots, still write resolves to guest memory (needed if "
-                    "the CPU reads them)")
+// Off by default: about 14% faster in Bowerstone. Memory is still written unless a texture
+// load of exactly that address took the previous snapshot and nothing else loaded from the
+// range, so only CPU reads of such a resolve miss it. Crash rates were the same either way
+// (3 in about 500 minutes off, 3 in about 450 minutes on).
+REXCVAR_DEFINE_BOOL(metal_resolve_to_memory, false, "GPU/Metal",
+                    "With resolve snapshots, write every resolve to guest memory, even those "
+                    "only read as whole textures (needed if the CPU reads them)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(metal_render_target_transfers, true, "GPU/Metal",
                     "Copy the EDRAM data between render targets aliasing the same EDRAM range "
