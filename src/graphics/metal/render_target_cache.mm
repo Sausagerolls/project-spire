@@ -59,6 +59,12 @@ REXCVAR_DEFINE_BOOL(metal_render_target_transfers, true, "GPU/Metal",
                     "(disable only for debugging - causes artefacts)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DECLARE(bool, metal_defer_clears);
+REXCVAR_DEFINE_BOOL(metal_swap_snapshots, true, "GPU/Metal",
+                    "Give a resolve snapshot's texture to the texture that loads it, instead of "
+                    "copying it")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics::metal {
 
 namespace shaders {
@@ -1391,6 +1397,22 @@ void MetalRenderTargetCache::ClearRenderTargetValues(RenderTarget* render_target
     return;
   }
 
+  uint32_t scale_x = draw_resolution_scale_x(), scale_y = draw_resolution_scale_y();
+  MTLScissorRect scissor;
+  scissor.x = std::min(NSUInteger(rectangle.x_pixels * scale_x), texture.width);
+  scissor.y = std::min(NSUInteger(rectangle.y_pixels * scale_y), texture.height);
+  scissor.width = std::min(NSUInteger(rectangle.width_pixels * scale_x), texture.width - scissor.x);
+  scissor.height =
+      std::min(NSUInteger(rectangle.height_pixels * scale_y), texture.height - scissor.y);
+  if (!scissor.width || !scissor.height) {
+    return;
+  }
+  if (REXCVAR_GET(metal_defer_clears) && !scissor.x && !scissor.y &&
+      scissor.width == texture.width && scissor.height == texture.height) {
+    command_processor_.DeferClear(texture, key.is_depth, clear_values, stencil);
+    return;
+  }
+
   MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
   if (key.is_depth) {
     pass.depthAttachment.texture = texture;
@@ -1425,16 +1447,6 @@ void MetalRenderTargetCache::ClearRenderTargetValues(RenderTarget* render_target
     }
     [encoder setDepthStencilState:clear_depth_stencil_state_];
     [encoder setStencilReferenceValue:stencil];
-  }
-  uint32_t scale_x = draw_resolution_scale_x(), scale_y = draw_resolution_scale_y();
-  MTLScissorRect scissor;
-  scissor.x = std::min(NSUInteger(rectangle.x_pixels * scale_x), texture.width);
-  scissor.y = std::min(NSUInteger(rectangle.y_pixels * scale_y), texture.height);
-  scissor.width = std::min(NSUInteger(rectangle.width_pixels * scale_x), texture.width - scissor.x);
-  scissor.height =
-      std::min(NSUInteger(rectangle.height_pixels * scale_y), texture.height - scissor.y);
-  if (!scissor.width || !scissor.height) {
-    return;
   }
   [encoder setScissorRect:scissor];
   [encoder setFragmentBytes:clear_values length:sizeof(float) * 4 atIndex:0];
@@ -1721,22 +1733,38 @@ void MetalRenderTargetCache::MakeResolveSnapshot(const draw_util::ResolveInfo& r
     }
   }
   ResolveSnapshot& snapshot = resolve_snapshots_[resolve_info.copy_dest_base];
+  // Laid out like the texture cache's 2D textures, so it can be swapped into one. A
+  // texture swapped back in from the cache may not be writable.
   if (!snapshot.texture || snapshot.texture.width != width || snapshot.texture.height != height ||
-      snapshot.texture.pixelFormat != pixel_format) {
-    MTLTextureDescriptor* descriptor =
-        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixel_format
-                                                           width:width
-                                                          height:height
-                                                       mipmapped:NO];
-    descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+      snapshot.texture.pixelFormat != pixel_format ||
+      snapshot.texture.textureType != MTLTextureType2DArray ||
+      snapshot.texture.mipmapLevelCount != 1 ||
+      !(snapshot.texture.usage & MTLTextureUsageShaderWrite)) {
+    MTLTextureDescriptor* descriptor = [[MTLTextureDescriptor alloc] init];
+    descriptor.textureType = MTLTextureType2DArray;
+    descriptor.pixelFormat = pixel_format;
+    descriptor.width = width;
+    descriptor.height = height;
+    descriptor.arrayLength = 1;
+    descriptor.mipmapLevelCount = 1;
+    descriptor.usage =
+        MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
     descriptor.storageMode = MTLStorageModePrivate;
     snapshot.texture = [command_processor_.device() newTextureWithDescriptor:descriptor];
+    snapshot.write_view = nil;
     if (!snapshot.texture) {
       resolve_snapshots_.erase(resolve_info.copy_dest_base);
       return;
     }
     snapshot.texture.label = @"resolve snapshot";
   }
+  if (!snapshot.write_view) {
+    snapshot.write_view = [snapshot.texture newTextureViewWithPixelFormat:pixel_format
+                                                              textureType:MTLTextureType2D
+                                                                   levels:NSMakeRange(0, 1)
+                                                                   slices:NSMakeRange(0, 1)];
+  }
+  snapshot.holder = nil;
   snapshot.width = width;
   snapshot.height = height;
   snapshot.format = uint32_t(dest_format);
@@ -1762,7 +1790,7 @@ void MetalRenderTargetCache::MakeResolveSnapshot(const draw_util::ResolveInfo& r
                                        : (multisampled ? snapshot_ms_pipeline_
                                                        : snapshot_pipeline_)];
   [encoder setTexture:source_texture atIndex:0];
-  [encoder setTexture:snapshot.texture atIndex:1];
+  [encoder setTexture:snapshot.write_view atIndex:1];
   [encoder setBytes:&constants length:sizeof(constants) atIndex:0];
   [encoder dispatchThreadgroups:MTLSizeMake((width + 7) / 8, (height + 7) / 8, 1)
           threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
@@ -1771,7 +1799,12 @@ void MetalRenderTargetCache::MakeResolveSnapshot(const draw_util::ResolveInfo& r
 
 id<MTLTexture> MetalRenderTargetCache::TakeResolveSnapshot(uint32_t address, uint32_t width,
                                                            uint32_t height, uint32_t format,
-                                                           MTLPixelFormat pixel_format) {
+                                                           MTLPixelFormat pixel_format,
+                                                           id<MTLTexture> swap_in,
+                                                           bool* swapped) {
+  if (swapped) {
+    *swapped = false;
+  }
   auto it = resolve_snapshots_.find(address);
   if (it == resolve_snapshots_.end()) {
     return nil;
@@ -1783,13 +1816,28 @@ id<MTLTexture> MetalRenderTargetCache::TakeResolveSnapshot(uint32_t address, uin
     return nil;
   }
   snapshot.used_by_texture = true;
+  ++resolve_snapshots_taken_;
+  if (snapshot.holder) {
+    // Swapped into an earlier texture already: copy from that one.
+    return snapshot.holder;
+  }
+  id<MTLTexture> result = snapshot.texture;
+  if (swapped && swap_in && REXCVAR_GET(metal_swap_snapshots) && swap_in != result &&
+      swap_in.textureType == MTLTextureType2DArray && swap_in.arrayLength == 1 &&
+      swap_in.mipmapLevelCount == 1 && swap_in.pixelFormat == pixel_format &&
+      swap_in.width == result.width && swap_in.height == result.height &&
+      (result.usage & MTLTextureUsagePixelFormatView)) {
+    *swapped = true;
+    snapshot.texture = swap_in;
+    snapshot.write_view = nil;
+    snapshot.holder = result;
+  }
   // If guest memory has the data too, later loads (after CPU writes) come from
-  // it. Otherwise the snapshot is the only copy.
+  // it. Otherwise the snapshot (or the texture it was swapped into) is the only copy.
   if (snapshot.memory_written) {
     snapshot.available = false;
   }
-  ++resolve_snapshots_taken_;
-  return snapshot.texture;
+  return result;
 }
 
 void MetalRenderTargetCache::NoteGuestMemoryTextureLoad(uint32_t start, uint32_t length,

@@ -118,8 +118,13 @@ class MetalRenderTargetCache final : public RenderTargetCache {
   // textures (snapshots), which the texture cache copies from instead of
   // loading the resolved guest memory. Returns the snapshot of a resolve to
   // the address with the format and at least the size, once.
+  // If swap_in (the texture being loaded, 2D array, one slice and level) has exactly the
+  // snapshot's size, the snapshot texture itself is returned with swapped set, and swap_in
+  // becomes the snapshot's storage: the caller uses the result as its texture instead of
+  // copying from it.
   id<MTLTexture> TakeResolveSnapshot(uint32_t address, uint32_t width, uint32_t height,
-                                     uint32_t format, MTLPixelFormat pixel_format);
+                                     uint32_t format, MTLPixelFormat pixel_format,
+                                     id<MTLTexture> swap_in = nil, bool* swapped = nullptr);
   // A texture is being loaded from this guest memory range (no snapshot for
   // it) - resolves overlapping it must keep writing to guest memory.
   // snapshot_compatible_format: the guest format if the texture can use a
@@ -263,6 +268,11 @@ class MetalRenderTargetCache final : public RenderTargetCache {
     uint32_t height;
     uint32_t format;
     id<MTLTexture> texture;
+    // A 2D view of the 2D array texture for the snapshot shaders to write.
+    id<MTLTexture> write_view;
+    // After the snapshot texture was swapped into a guest texture, that texture holds the
+    // data for further loads.
+    id<MTLTexture> holder;
     uint32_t extent_start = 0;
     uint32_t extent_length = 0;
     // An exact texture load has used a snapshot of this address.

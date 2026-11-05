@@ -488,6 +488,11 @@ MetalTextureCache::MetalTexture::MetalTexture(MetalTextureCache& texture_cache,
   SetHostMemoryUsage(uint64_t(texture.allocatedSize));
 }
 
+void MetalTextureCache::MetalTexture::ReplaceTexture(id<MTLTexture> texture) {
+  texture_ = texture;
+  views_.clear();
+}
+
 id<MTLTexture> MetalTextureCache::MetalTexture::GetView(bool is_signed, uint32_t host_swizzle) {
   uint32_t view_key = (host_swizzle & 0xFFF) | (uint32_t(is_signed) << 12);
   auto it = views_.find(view_key);
@@ -604,9 +609,15 @@ bool MetalTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
       texture_key.dimension == xenos::DataDimension::k2DOrStacked &&
       texture_key.GetDepthOrArraySize() == 1) {
     MetalRenderTargetCache& render_target_cache = command_processor_.render_target_cache();
+    bool swapped = false;
     id<MTLTexture> snapshot = render_target_cache.TakeResolveSnapshot(
         texture_key.base_page << 12, texture_key.GetWidth(), texture_key.GetHeight(),
-        uint32_t(texture_key.format), host_format.format);
+        uint32_t(texture_key.format), host_format.format,
+        texture_key.mip_max_level ? nil : metal_texture.texture(), &swapped);
+    if (swapped) {
+      metal_texture.ReplaceTexture(snapshot);
+      return true;
+    }
     if (snapshot) {
       id<MTLBlitCommandEncoder> blit = command_processor_.GetBlitEncoder("snapshot copy");
       [blit copyFromTexture:snapshot

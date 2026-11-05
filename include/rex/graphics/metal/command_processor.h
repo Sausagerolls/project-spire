@@ -95,6 +95,11 @@ class MetalCommandProcessor : public CommandProcessor {
   bool IsGpuWrittenInSubmission(uint32_t start, uint32_t length) const;
   // Whether a render pass for guest drawing is open.
   bool IsGuestRenderPassOpen() const { return render_encoder_ && !render_encoder_is_utility_; }
+  // Clears a whole render target at the start of the next render pass that uses it (as its
+  // load action), or in its own pass before any other GPU work, which may read it.
+  void DeferClear(id<MTLTexture> texture, bool is_depth, const float values[4],
+                  uint32_t stencil);
+  void FlushDeferredClears();
 
   // Per-frame transient GPU memory (constants and other small data), valid
   // until the frame completes on the GPU.
@@ -228,6 +233,12 @@ class MetalCommandProcessor : public CommandProcessor {
   MetalRenderTargetCache::RenderPassAttachments render_encoder_attachments_;
   // The render encoder is for utility drawing, not the guest render targets.
   bool render_encoder_is_utility_ = false;
+  struct DeferredClear {
+    bool is_depth;
+    float values[4];
+    uint32_t stencil;
+  };
+  std::vector<std::pair<id<MTLTexture>, DeferredClear>> deferred_clears_;
   // State bound to the current render encoder.
   id<MTLRenderPipelineState> encoder_pipeline_ = nil;
   id<MTLDepthStencilState> encoder_depth_stencil_state_ = nil;

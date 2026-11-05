@@ -85,6 +85,8 @@ class MetalTextureCache final : public TextureCache {
    public:
     MetalTexture(MetalTextureCache& texture_cache, const TextureKey& key, id<MTLTexture> texture);
     id<MTLTexture> texture() const { return texture_; }
+    // Swaps in another texture of the same layout (from a resolve snapshot).
+    void ReplaceTexture(id<MTLTexture> texture);
     // A view with the host swizzle (12 bits, 3 per component) and signedness.
     id<MTLTexture> GetView(bool is_signed, uint32_t host_swizzle);
     // The last submission that bound the texture for drawing.

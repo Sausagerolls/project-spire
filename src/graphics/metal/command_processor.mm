@@ -101,6 +101,10 @@ REXCVAR_DEFINE_STRING(metal_capture_path, "/Volumes/1TB/tmp/fc", "GPU/Metal",
 REXCVAR_DEFINE_BOOL(metal_sync_submissions, false, "GPU/Metal",
                     "Wait for the GPU after every submission (debugging CPU / GPU memory hazards)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(metal_defer_clears, true, "GPU/Metal",
+                    "Clear whole render targets with the load action of the next render pass "
+                    "that uses them, instead of a draw in a pass of their own")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(metal_debug_draw_delay_us, 0, "GPU/Metal",
                      "Busy-wait this many microseconds per draw on the command processor thread "
                      "(debugging timing races)")
@@ -745,9 +749,13 @@ void MetalCommandProcessor::EndSubmission(bool is_swap) {
     GetCommandBuffer();
     render_target_cache_->FlushPendingTransfers();
   }
+  if (!deferred_clears_.empty()) {
+    GetCommandBuffer();
+  }
   if (command_buffer_) {
     CountRenderPassBreak(is_swap ? "swap" : "submission");
     EndEncoding();
+    FlushDeferredClears();
     if (upload_command_buffer_) {
       if (upload_compute_encoder_) {
         [upload_compute_encoder_ endEncoding];
@@ -886,6 +894,7 @@ id<MTLComputeCommandEncoder> MetalCommandProcessor::GetComputeEncoder(const char
   }
   CountRenderPassBreak(reason);
   EndEncoding();
+  FlushDeferredClears();
   compute_encoder_ = [GetCommandBuffer() computeCommandEncoder];
   compute_encoder_.label = split ? [NSString stringWithFormat:@"compute %s", reason] : @"compute";
   encoder_reason_ = reason;
@@ -899,10 +908,77 @@ id<MTLBlitCommandEncoder> MetalCommandProcessor::GetBlitEncoder(const char* reas
   }
   CountRenderPassBreak(reason);
   EndEncoding();
+  FlushDeferredClears();
   blit_encoder_ = [GetCommandBuffer() blitCommandEncoder];
   blit_encoder_.label = split ? [NSString stringWithFormat:@"blit %s", reason] : @"blit";
   encoder_reason_ = reason;
   return blit_encoder_;
+}
+
+void MetalCommandProcessor::DeferClear(id<MTLTexture> texture, bool is_depth,
+                                      const float values[4], uint32_t stencil) {
+  // A compute, blit or utility encoder may read the target next without starting a new
+  // encoder, and an open pass that draws to it must not see it cleared early: end those so
+  // that the next encoder applies or flushes the clear.
+  bool in_open_pass = false;
+  if (render_encoder_ && !render_encoder_is_utility_) {
+    in_open_pass = render_encoder_attachments_.depth == texture;
+    for (id<MTLTexture> color : render_encoder_attachments_.color) {
+      in_open_pass |= color == texture;
+    }
+  }
+  if (compute_encoder_ || blit_encoder_ || (render_encoder_ && render_encoder_is_utility_) ||
+      in_open_pass) {
+    CountRenderPassBreak("clear");
+    EndEncoding();
+  }
+  if (REXCVAR_GET(metal_log_stats)) {
+    ++stats_.utility_passes["deferred clear"];
+  }
+  DeferredClear clear;
+  clear.is_depth = is_depth;
+  std::copy(values, values + 4, clear.values);
+  clear.stencil = stencil;
+  for (auto& entry : deferred_clears_) {
+    if (entry.first == texture) {
+      entry.second = clear;
+      return;
+    }
+  }
+  deferred_clears_.emplace_back(texture, clear);
+}
+
+void MetalCommandProcessor::FlushDeferredClears() {
+  if (deferred_clears_.empty()) {
+    return;
+  }
+  // Called with no encoder open.
+  for (const auto& [texture, clear] : deferred_clears_) {
+    MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    if (clear.is_depth) {
+      pass.depthAttachment.texture = texture;
+      pass.depthAttachment.loadAction = MTLLoadActionClear;
+      pass.depthAttachment.storeAction = MTLStoreActionStore;
+      pass.depthAttachment.clearDepth = clear.values[0];
+      pass.stencilAttachment.texture = texture;
+      pass.stencilAttachment.loadAction = MTLLoadActionClear;
+      pass.stencilAttachment.storeAction = MTLStoreActionStore;
+      pass.stencilAttachment.clearStencil = clear.stencil;
+    } else {
+      pass.colorAttachments[0].texture = texture;
+      pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+      pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+      pass.colorAttachments[0].clearColor =
+          MTLClearColorMake(clear.values[0], clear.values[1], clear.values[2], clear.values[3]);
+    }
+    id<MTLRenderCommandEncoder> encoder = [GetCommandBuffer() renderCommandEncoderWithDescriptor:pass];
+    encoder.label = @"deferred clear";
+    [encoder endEncoding];
+    if (REXCVAR_GET(metal_log_stats)) {
+      ++stats_.utility_passes["deferred clear flushed"];
+    }
+  }
+  deferred_clears_.clear();
 }
 
 id<MTLRenderCommandEncoder> MetalCommandProcessor::BeginUtilityRenderPass(
@@ -912,6 +988,7 @@ id<MTLRenderCommandEncoder> MetalCommandProcessor::BeginUtilityRenderPass(
     ++stats_.utility_passes[reason];
   }
   EndEncoding();
+  FlushDeferredClears();
   render_encoder_ = [GetCommandBuffer() renderCommandEncoderWithDescriptor:descriptor];
   render_encoder_is_utility_ = true;
   return render_encoder_;
@@ -942,6 +1019,31 @@ id<MTLRenderCommandEncoder> MetalCommandProcessor::GetRenderEncoderForCurrentRen
     pass.stencilAttachment.texture = attachments.depth;
     pass.stencilAttachment.loadAction = MTLLoadActionLoad;
     pass.stencilAttachment.storeAction = MTLStoreActionStore;
+  }
+  // Whole-target clears waiting for this pass.
+  for (auto it = deferred_clears_.begin(); it != deferred_clears_.end();) {
+    id<MTLTexture> texture = it->first;
+    const DeferredClear& clear = it->second;
+    bool used = false;
+    if (clear.is_depth) {
+      if (attachments.depth == texture) {
+        pass.depthAttachment.loadAction = MTLLoadActionClear;
+        pass.depthAttachment.clearDepth = clear.values[0];
+        pass.stencilAttachment.loadAction = MTLLoadActionClear;
+        pass.stencilAttachment.clearStencil = clear.stencil;
+        used = true;
+      }
+    } else {
+      for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+        if (attachments.color[i] == texture) {
+          pass.colorAttachments[i].loadAction = MTLLoadActionClear;
+          pass.colorAttachments[i].clearColor = MTLClearColorMake(
+              clear.values[0], clear.values[1], clear.values[2], clear.values[3]);
+          used = true;
+        }
+      }
+    }
+    it = used ? deferred_clears_.erase(it) : it + 1;
   }
   if (attachments.empty()) {
     // Rasterization without attachments (for instance, memexport only).
