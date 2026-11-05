@@ -172,7 +172,8 @@ bool ReXApp::SetupEnvironment() {
                                         log_level_str, category_levels);
   if (log_file_cvar.empty()) {
     log_config.app_name = std::string(GetName());
-    log_config.log_dir = (exe_dir / "logs").string();
+    // Next to the config, which an app may move out of the exe folder.
+    log_config.log_dir = (config_path_.parent_path() / "logs").string();
   }
 
   rex::InitLogging(log_config);
