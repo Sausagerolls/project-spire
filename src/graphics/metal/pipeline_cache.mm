@@ -37,7 +37,9 @@ REXCVAR_DEFINE_BOOL(metal_pipeline_archive, false, "GPU/Metal",
                     "Keep a pipeline binary archive on disk (compiles each new pipeline twice, "
                     "Metal also caches compiled shaders by itself)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
-REXCVAR_DEFINE_BOOL(metal_native_points, true, "GPU/Metal",
+// Off: with it, Fable II's snow moves with the camera (falls up when standing still; user,
+// 2026-11-05).
+REXCVAR_DEFINE_BOOL(metal_native_points, false, "GPU/Metal",
                     "Draw point sprites as Metal points (the vertex shader runs once per point) "
                     "instead of expanding each in the vertex shader. Read at startup.")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
