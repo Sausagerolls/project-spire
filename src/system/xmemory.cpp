@@ -1599,7 +1599,13 @@ bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
   uint32_t base_page_number = (base_address - heap_base_) >> page_size_shift_;
   auto base_page_entry = page_table_[base_page_number];
   if (base_page_entry.base_address != base_page_number) {
-    REXSYS_ERROR("BaseHeap::Release failed because address is not a region start");
+    // Rare Fable II crash (texture morph thread, 3 in about 470 runs): log enough to tell a
+    // corrupted guest pointer from a heap bookkeeping problem.
+    REXSYS_ERROR(
+        "BaseHeap::Release failed because address is not a region start: {:08X} (heap {:08X}, "
+        "page {}, region base page {}, {} pages, state {})",
+        base_address, heap_base_, base_page_number, uint32_t(base_page_entry.base_address),
+        uint32_t(base_page_entry.region_page_count), uint32_t(base_page_entry.state));
     return false;
   }
 
