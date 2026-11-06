@@ -143,6 +143,14 @@ class Fable2App : public rex::ReXApp {
 
   void OnPostSetup() override {
     fable2::branding::Apply(window());
+#ifndef _WIN32
+    // Display settings from controls.toml, now that the GPU plugin's cvars exist.
+    fable2::controls::LoadDisplay([](std::string_view cvar, std::string_view value) {
+      if (rex::cvar::GetFlagSource(cvar) == rex::cvar::Source::kDefault) {
+        rex::cvar::SetFlagByName(cvar, value);
+      }
+    });
+#endif
     // Hero/dog black-texture fix (see plans/hero-dog-texture-readback.md).
     // Approach + guest base 0x12704000 credit just-harry's Unofficial Xenia
     // femtofork for Fable II. readback_resolve_force_addresses is defined in the

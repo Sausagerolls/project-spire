@@ -102,6 +102,10 @@ inline double CurrentSensitivity() {
   }
 }
 
+inline bool ReduceFlashing() {
+  return rex::cvar::GetFlagByName("metal_reduce_flashing") != "false";
+}
+
 // Writes every action's keys and the mouse sensitivity.
 inline void Save() {
   if (detail::Path().empty()) {
@@ -113,9 +117,12 @@ inline void Save() {
   }
   toml::table mouse;
   mouse.insert("sensitivity", CurrentSensitivity());
+  toml::table display;
+  display.insert("reduce_flashing", ReduceFlashing());
   toml::table root;
   root.insert("keybinds", std::move(keybinds));
   root.insert("mouse", std::move(mouse));
+  root.insert("display", std::move(display));
   std::filesystem::path temporary = detail::Path();
   temporary += ".tmp";
   {
@@ -133,6 +140,11 @@ inline void SetKeys(const char* cvar, std::string_view keys) {
 
 inline void SetSensitivity(double sensitivity) {
   rex::cvar::SetFlagByName("mnk_sensitivity", std::to_string(sensitivity));
+  Save();
+}
+
+inline void SetReduceFlashing(bool on) {
+  rex::cvar::SetFlagByName("metal_reduce_flashing", on ? "true" : "false");
   Save();
 }
 
@@ -169,6 +181,23 @@ void Load(const std::filesystem::path& path, Seed&& seed) {
   }
   if (auto sensitivity = root["mouse"]["sensitivity"].value<double>()) {
     seed("mnk_sensitivity", std::to_string(*sensitivity));
+  }
+}
+
+// Display settings live in the GPU plugin, so they're applied once it's loaded.
+template <typename Seed>
+void LoadDisplay(Seed&& seed) {
+  if (detail::Path().empty() || !std::filesystem::exists(detail::Path())) {
+    return;
+  }
+  toml::table root;
+  try {
+    root = toml::parse_file(detail::Path().string());
+  } catch (const toml::parse_error&) {
+    return;
+  }
+  if (auto reduce = root["display"]["reduce_flashing"].value<bool>()) {
+    seed("metal_reduce_flashing", *reduce ? "true" : "false");
   }
 }
 

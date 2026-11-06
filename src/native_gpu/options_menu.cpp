@@ -62,6 +62,7 @@ const FrameRateItem kFrameRates[] = {
 };
 const char kFrameRate[] = "MacFrameRate";
 const char kSensitivity[] = "MacMouseSensitivity";
+const char kReduceFlashing[] = "MacReduceFlashing";
 const char kControls[] = "MacControls";
 const char kBindPrefix[] = "MacBind_";
 const char kControlsReset[] = "MacControlsReset";
@@ -186,6 +187,10 @@ std::string SensitivityLabel(double sensitivity) {
   return text;
 }
 
+std::string ReduceFlashingLabel() {
+  return fable2::controls::ReduceFlashing() ? "Reduce Flashing: On" : "Reduce Flashing: Off";
+}
+
 std::string BindName(size_t index) { return kBindPrefix + std::to_string(index); }
 
 std::string BindLabel(const fable2::controls::Action& action) {
@@ -207,6 +212,7 @@ void AddOptionsItems(PPCContext& ctx, uint8_t* base, uint32_t menu) {
   AddItem(ctx, base, menu, kOptions, "Options", "Root");
   AddItem(ctx, base, menu, kFrameRate, CurrentFrameRate().label, kOptions);
 #ifndef _WIN32
+  AddItem(ctx, base, menu, kReduceFlashing, ReduceFlashingLabel().c_str(), kOptions);
   AddItem(ctx, base, menu, kSensitivity,
           SensitivityLabel(fable2::controls::CurrentSensitivity()).c_str(), kOptions);
   AddItem(ctx, base, menu, kControls, "Controls", "Root");
@@ -246,6 +252,11 @@ bool OnSelect(PPCContext& ctx, uint8_t* base, uint32_t menu, const char* name) {
     return true;
   }
 #ifndef _WIN32
+  if (!std::strcmp(name, kReduceFlashing)) {
+    fable2::controls::SetReduceFlashing(!fable2::controls::ReduceFlashing());
+    Relabel(ctx, base, element, kReduceFlashing, ReduceFlashingLabel());
+    return true;
+  }
   if (!std::strcmp(name, kSensitivity)) {
     double current = fable2::controls::CurrentSensitivity();
     double next = fable2::controls::kSensitivities[0];
