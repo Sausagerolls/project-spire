@@ -11,6 +11,9 @@
 
 #include <cstdint>
 #include <memory>
+#include <unordered_set>
+#include <mutex>
+#include <vector>
 #include <unordered_map>
 
 #include <filesystem>
@@ -46,6 +49,7 @@ class MetalPipelineCache {
   // Total time spent on the command processor thread (for statistics).
   double shader_compile_seconds() const { return shader_compile_seconds_; }
   double pipeline_compile_seconds() const { return pipeline_compile_seconds_; }
+  double shader_translate_seconds() const { return shader_translate_seconds_; }
   uint64_t pipelines_created() const { return pipelines_created_; }
 
   MetalShader* LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
@@ -61,15 +65,19 @@ class MetalPipelineCache {
 
   // Translates (if needed) and compiles the shaders. Returns false if a shader
   // can't be used.
+  // With allow_async, shader functions not compiled yet are compiled in the background
+  // and pending is set instead of waiting for them.
   bool EnsureShadersTranslated(MetalShader::MetalTranslation* vertex_shader,
-                               MetalShader::MetalTranslation* pixel_shader);
+                               MetalShader::MetalTranslation* pixel_shader,
+                               bool allow_async = false, bool* pending = nullptr);
 
   // The pipeline state for the current registers and render target formats,
   // nil if it can't be created.
   id<MTLRenderPipelineState> GetPipeline(
       MetalShader::MetalTranslation* vertex_shader, MetalShader::MetalTranslation* pixel_shader,
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
-      uint32_t normalized_color_mask, const MetalRenderTargetCache::RenderPassFormats& formats);
+      uint32_t normalized_color_mask, const MetalRenderTargetCache::RenderPassFormats& formats,
+      bool allow_async = false, bool* pending = nullptr);
   id<MTLDepthStencilState> GetDepthStencilState(reg::RB_DEPTHCONTROL normalized_depth_control,
                                                 bool depth_attachment_bound,
                                                 bool primitive_polygonal);
@@ -98,8 +106,14 @@ class MetalPipelineCache {
   bool binary_archive_dirty_ = false;
   double shader_compile_seconds_ = 0.0;
   double pipeline_compile_seconds_ = 0.0;
+  double shader_translate_seconds_ = 0.0;
   uint64_t pipelines_created_ = 0;
   std::unordered_map<uint64_t, id<MTLRenderPipelineState>> pipelines_;
+  // Pipelines being compiled in the background, and those done (filled by Metal's
+  // completion handlers, moved to pipelines_ on the command processor thread).
+  std::unordered_set<uint64_t> pending_pipelines_;
+  std::mutex completed_pipelines_mutex_;
+  std::vector<std::pair<uint64_t, id<MTLRenderPipelineState>>> completed_pipelines_;
   std::unordered_map<uint64_t, id<MTLDepthStencilState>> depth_stencil_states_;
 };
 

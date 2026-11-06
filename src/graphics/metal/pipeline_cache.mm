@@ -17,6 +17,8 @@
 #include <xxhash.h>
 
 #include <rex/assert.h>
+#include <thread>
+#include <algorithm>
 #include <rex/cvar.h>
 #include <rex/graphics/metal/msl_util.h>
 #include <rex/graphics/metal/command_processor.h>
@@ -379,7 +381,11 @@ SpirvShaderTranslator::Modification MetalPipelineCache::GetCurrentPixelShaderMod
 }
 
 bool MetalPipelineCache::EnsureShadersTranslated(MetalShader::MetalTranslation* vertex_shader,
-                                                 MetalShader::MetalTranslation* pixel_shader) {
+                                                 MetalShader::MetalTranslation* pixel_shader,
+                                                 bool allow_async, bool* pending) {
+  if (pending) {
+    *pending = false;
+  }
   if ((!vertex_shader || vertex_shader->is_function_ready()) &&
       (!pixel_shader || pixel_shader->is_function_ready())) {
     return true;
@@ -398,12 +404,31 @@ bool MetalPipelineCache::EnsureShadersTranslated(MetalShader::MetalTranslation* 
       continue;
     }
     if (!translation->is_translated()) {
+      auto translate_start = std::chrono::steady_clock::now();
+      struct AddTranslateTime {
+        double& total;
+        std::chrono::steady_clock::time_point start;
+        ~AddTranslateTime() {
+          total += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        }
+      } add_translate_time{shader_translate_seconds_, translate_start};
       AnalyzeShaderUcode(translation->shader());
       if (!shader_translator_->TranslateAnalyzedShader(*translation)) {
         REXGPU_ERROR("Shader {:016X} translation failed; marking as ignored",
                      translation->shader().ucode_data_hash());
         return false;
       }
+    }
+    if (translation->is_function_ready()) {
+      continue;
+    }
+    if (translation->is_function_failed()) {
+      return false;
+    }
+    if (allow_async && pending) {
+      translation->RequestFunctionAsync(provider);
+      *pending = true;
+      continue;
     }
     if (!translation->GetOrCreateFunction(provider)) {
       return false;
@@ -415,8 +440,20 @@ bool MetalPipelineCache::EnsureShadersTranslated(MetalShader::MetalTranslation* 
 id<MTLRenderPipelineState> MetalPipelineCache::GetPipeline(
     MetalShader::MetalTranslation* vertex_shader, MetalShader::MetalTranslation* pixel_shader,
     const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
-    uint32_t normalized_color_mask, const MetalRenderTargetCache::RenderPassFormats& formats) {
+    uint32_t normalized_color_mask, const MetalRenderTargetCache::RenderPassFormats& formats,
+    bool allow_async, bool* pending) {
   const RegisterFile& regs = register_file_;
+  if (pending) {
+    *pending = false;
+  }
+  {
+    std::lock_guard<std::mutex> lock(completed_pipelines_mutex_);
+    for (auto& [completed_key, completed_pipeline] : completed_pipelines_) {
+      pending_pipelines_.erase(completed_key);
+      pipelines_[completed_key] = completed_pipeline;
+    }
+    completed_pipelines_.clear();
+  }
 
   SpirvShaderTranslator::Modification vertex_modification(vertex_shader->modification());
   bool tessellation_grid = vertex_modification.vertex.tessellation_grid;
@@ -481,6 +518,32 @@ id<MTLRenderPipelineState> MetalPipelineCache::GetPipeline(
   auto it = pipelines_.find(key_hash);
   if (it != pipelines_.end()) {
     return it->second;
+  }
+  if (pending_pipelines_.count(key_hash)) {
+    if (allow_async && pending) {
+      *pending = true;
+      return nil;
+    }
+    // Wait for the background compilation.
+    auto wait_start = std::chrono::steady_clock::now();
+    while (true) {
+      {
+        std::lock_guard<std::mutex> lock(completed_pipelines_mutex_);
+        auto done = std::find_if(completed_pipelines_.begin(), completed_pipelines_.end(),
+                                 [&](const auto& entry) { return entry.first == key_hash; });
+        if (done != completed_pipelines_.end()) {
+          id<MTLRenderPipelineState> pipeline = done->second;
+          completed_pipelines_.erase(done);
+          pending_pipelines_.erase(key_hash);
+          pipelines_[key_hash] = pipeline;
+          pipeline_compile_seconds_ +=
+              std::chrono::duration<double>(std::chrono::steady_clock::now() - wait_start)
+                  .count();
+          return pipeline;
+        }
+      }
+      std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
   }
 
   const ui::metal::MetalProvider& provider = command_processor_.GetMetalProvider();
@@ -560,6 +623,30 @@ id<MTLRenderPipelineState> MetalPipelineCache::GetPipeline(
   }
   descriptor.depthAttachmentPixelFormat = formats.depth;
   descriptor.stencilAttachmentPixelFormat = formats.depth;
+
+  if (allow_async && pending && !binary_archive_) {
+    pending_pipelines_.insert(key_hash);
+    ++pipelines_created_;
+    *pending = true;
+    uint64_t vertex_hash = vertex_shader->shader().ucode_data_hash();
+    uint64_t pixel_hash = pixel_shader ? pixel_shader->shader().ucode_data_hash() : 0;
+    std::mutex* mutex = &completed_pipelines_mutex_;
+    auto* completed = &completed_pipelines_;
+    [command_processor_.device()
+        newRenderPipelineStateWithDescriptor:descriptor
+                           completionHandler:^(id<MTLRenderPipelineState> pipeline, NSError* error) {
+                             if (!pipeline) {
+                               REXGPU_ERROR("MetalPipelineCache: Failed to create a pipeline for "
+                                            "shaders {:016X}/{:016X}: {}",
+                                            vertex_hash, pixel_hash,
+                                            error ? [error.localizedDescription UTF8String]
+                                                  : "unknown error");
+                             }
+                             std::lock_guard<std::mutex> lock(*mutex);
+                             completed->emplace_back(key_hash, pipeline);
+                           }];
+    return nil;
+  }
 
   auto compile_start = std::chrono::steady_clock::now();
   NSError* error = nil;

@@ -43,9 +43,15 @@ class MetalShader : public SpirvShader {
     id<MTLFunction> GetOrCreateFunction(const ui::metal::MetalProvider& provider);
     // Translated and with its function created (never goes back to false).
     bool is_function_ready() const { return function_ready_.load(std::memory_order_acquire); }
+    // Runs GetOrCreateFunction on a background thread, once.
+    void RequestFunctionAsync(const ui::metal::MetalProvider& provider);
+    // GetOrCreateFunction has failed (never goes back to false).
+    bool is_function_failed() const { return function_failed_.load(std::memory_order_acquire); }
 
    private:
     std::mutex function_mutex_;
+    std::atomic<bool> function_requested_{false};
+    std::atomic<bool> function_failed_{false};
     bool function_attempted_ = false;
     id<MTLFunction> function_ = nil;
     std::atomic<bool> function_ready_{false};

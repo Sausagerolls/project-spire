@@ -26,6 +26,10 @@ REXCVAR_DEFINE_STRING(metal_vertex_math_mode, "", "GPU/Metal",
                       "Math mode for guest vertex shaders ('safe', 'relaxed' or 'fast'), or empty "
                       "for metal_math_mode")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(metal_debug_shader_salt, "", "GPU/Metal",
+                      "Appended to every shader's source in its entry point's name (letters and digits "
+                      "only), so Metal's own shader cache misses (testing first-time compilation)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_STRING(metal_dump_shaders_path, "", "GPU/Metal",
                       "Directory to write the MSL of translated guest shaders to (debugging)");
 
@@ -39,6 +43,9 @@ std::unordered_map<std::string, id<MTLLibrary>> preloaded_libraries;
 }  // namespace
 
 void MetalShader::PreloadCachedLibraries(const ui::metal::MetalProvider& provider) {
+  if (!REXCVAR_GET(metal_debug_shader_salt).empty()) {
+    return;
+  }
   std::filesystem::path directory;
   {
     std::lock_guard<std::mutex> lock(msl_cache_mutex);
@@ -84,6 +91,7 @@ id<MTLFunction> MetalShader::MetalTranslation::GetOrCreateFunction(
   }
   function_attempted_ = true;
   if (!is_valid()) {
+    function_failed_.store(true, std::memory_order_release);
     return nil;
   }
   const std::vector<uint8_t>& spirv = translated_binary();
@@ -111,6 +119,7 @@ id<MTLFunction> MetalShader::MetalTranslation::GetOrCreateFunction(
       REXGPU_ERROR("MetalShader: Failed to convert shader {:016X} modification {:016X} to MSL: {}",
                    shader().ucode_data_hash(), modification(), error);
       MakeInvalid();
+      function_failed_.store(true, std::memory_order_release);
       return nil;
     }
     if (!msl_cache_path.empty()) {
@@ -130,9 +139,20 @@ id<MTLFunction> MetalShader::MetalTranslation::GetOrCreateFunction(
                               shader().ucode_data_hash(), modification()))
         << msl;
   }
+  NSString* entry_point = @"main0";
+  if (!REXCVAR_GET(metal_debug_shader_salt).empty()) {
+    // A new entry point name: Metal's cache would see through an unused declaration.
+    std::string salted = "main0_" + REXCVAR_GET(metal_debug_shader_salt);
+    size_t at = msl.find(" main0(");
+    if (at != std::string::npos) {
+      msl.replace(at + 1, 5, salted);
+      entry_point = @(salted.c_str());
+    }
+  }
   @autoreleasepool {
     id<MTLLibrary> library = nil;
-    if (!msl_cache_path.empty() && REXCVAR_GET(metal_vertex_math_mode).empty()) {
+    if (!msl_cache_path.empty() && REXCVAR_GET(metal_vertex_math_mode).empty() &&
+        REXCVAR_GET(metal_debug_shader_salt).empty()) {
       std::lock_guard<std::mutex> lock(msl_cache_mutex);
       auto preloaded = preloaded_libraries.find(msl_cache_path.filename().string());
       if (preloaded != preloaded_libraries.end()) {
@@ -146,15 +166,33 @@ id<MTLFunction> MetalShader::MetalTranslation::GetOrCreateFunction(
                                     ? REXCVAR_GET(metal_vertex_math_mode).c_str()
                                     : nullptr);
     if (library) {
-      function_ = [library newFunctionWithName:@"main0"];
+      function_ = [library newFunctionWithName:entry_point];
     }
   }
   if (!function_) {
     MakeInvalid();
+    function_failed_.store(true, std::memory_order_release);
   } else {
     function_ready_.store(true, std::memory_order_release);
   }
   return function_;
+}
+
+void MetalShader::MetalTranslation::RequestFunctionAsync(const ui::metal::MetalProvider& provider) {
+  if (function_requested_.exchange(true)) {
+    return;
+  }
+  // A few at a time, so a burst of new shaders doesn't take every core from the game.
+  static dispatch_semaphore_t slots = dispatch_semaphore_create(2);
+  const ui::metal::MetalProvider* provider_pointer = &provider;
+  MetalTranslation* translation = this;
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    dispatch_semaphore_wait(slots, DISPATCH_TIME_FOREVER);
+    @autoreleasepool {
+      translation->GetOrCreateFunction(*provider_pointer);
+    }
+    dispatch_semaphore_signal(slots);
+  });
 }
 
 }  // namespace rex::graphics::metal

@@ -101,6 +101,13 @@ REXCVAR_DEFINE_STRING(metal_capture_path, "/Volumes/1TB/tmp/fc", "GPU/Metal",
 REXCVAR_DEFINE_BOOL(metal_sync_submissions, false, "GPU/Metal",
                     "Wait for the GPU after every submission (debugging CPU / GPU memory hazards)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(metal_async_compile, true, "GPU/Metal",
+                    "Compile new shaders and pipelines in the background, skipping draws to "
+                    "screen-sized targets that need them meanwhile (instead of a hitch)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(metal_async_compile_min_width, 960, "GPU/Metal",
+                     "Smallest render target width whose draws metal_async_compile may skip")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(metal_defer_clears, true, "GPU/Metal",
                     "Clear whole render targets with the load action of the next render pass "
                     "that uses them, instead of a draw in a pass of their own")
@@ -1475,8 +1482,14 @@ bool MetalCommandProcessor::IssueDrawImpl() {
       pixel_shader ? static_cast<MetalShader::MetalTranslation*>(
                          pixel_shader->GetOrCreateTranslation(pixel_shader_modification.value))
                    : nullptr;
+  // New shaders and pipelines compile in the background for draws that may be skipped
+  // while they do (see below); others wait for them.
+  bool async_allowed = REXCVAR_GET(metal_async_compile) && !memexport_used_vertex &&
+                       !memexport_used_pixel;
+  bool shaders_pending = false;
   if (!pipeline_cache_->EnsureShadersTranslated(vertex_shader_translation,
-                                                pixel_shader_translation)) {
+                                                pixel_shader_translation, async_allowed,
+                                                &shaders_pending)) {
     return draw_fail("shader translation");
   }
 
@@ -1493,9 +1506,39 @@ bool MetalCommandProcessor::IssueDrawImpl() {
     return draw_fail("render target update");
   }
 
+  // Only draws to screen-sized targets are skipped while compiling: they're redrawn every
+  // frame, so a skip lasts a frame or so. Smaller targets may be drawn once (character
+  // textures, for instance).
+  if (async_allowed) {
+    const MetalRenderTargetCache::RenderPassAttachments& attachments =
+        render_target_cache_->last_update_attachments();
+    id<MTLTexture> target = attachments.color[0] ? attachments.color[0] : attachments.depth;
+    for (id<MTLTexture> color : attachments.color) {
+      if (!target && color) {
+        target = color;
+      }
+    }
+    async_allowed = target && target.width >= uint32_t(REXCVAR_GET(metal_async_compile_min_width));
+  }
+  if (shaders_pending) {
+    if (async_allowed) {
+      CountStatsEvent("draws skipped: shader compiling");
+      return true;
+    }
+    if (!pipeline_cache_->EnsureShadersTranslated(vertex_shader_translation,
+                                                  pixel_shader_translation)) {
+      return draw_fail("shader translation");
+    }
+  }
+  bool pipeline_pending = false;
   id<MTLRenderPipelineState> pipeline = pipeline_cache_->GetPipeline(
       vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
-      normalized_color_mask, render_target_cache_->last_update_formats());
+      normalized_color_mask, render_target_cache_->last_update_formats(), async_allowed,
+      &pipeline_pending);
+  if (pipeline_pending) {
+    CountStatsEvent("draws skipped: pipeline compiling");
+    return true;
+  }
   if (!pipeline) {
     return draw_fail("pipeline");
   }
@@ -2087,9 +2130,11 @@ void MetalCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fro
                     100.0 * stats_.cp_wait_seconds / seconds,
                     1000.0 * gpu_busy / std::max(stats_.swaps, uint64_t(1)));
       }
-      REXGPU_INFO("Metal compile totals: shaders {:.1f} s, {} pipelines {:.1f} s",
-                  pipeline_cache_->shader_compile_seconds(), pipeline_cache_->pipelines_created(),
-                  pipeline_cache_->pipeline_compile_seconds());
+      REXGPU_INFO("Metal compile totals: shaders {:.1f} s (translation {:.1f} s), {} pipelines "
+                  "{:.1f} s",
+                  pipeline_cache_->shader_compile_seconds(),
+                  pipeline_cache_->shader_translate_seconds(),
+                  pipeline_cache_->pipelines_created(), pipeline_cache_->pipeline_compile_seconds());
       REXGPU_INFO("Metal frame times: worst {:.0f} ms, {} over 50 ms, {} over 100 ms",
                   stats_.worst_frame_ms, stats_.frames_over_50ms, stats_.frames_over_100ms);
       REXGPU_INFO("Metal memory: {} MB allocated by the device, {} transient pages used, {} "
