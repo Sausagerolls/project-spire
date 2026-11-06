@@ -18,9 +18,11 @@
 #include <rex/ui/window.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <string_view>
 
 REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller emulation");
@@ -69,8 +71,8 @@ constexpr rex::input::DeviceId kMnkDevice = static_cast<rex::input::DeviceId>(0x
 // carrying modifier prefixes: "Q,I" or "Shift+W". Modifier matching is exact,
 // so "Up" stays silent while Shift is held and "Shift+Up" stays silent without
 // it. That is what lets the D-pad share the arrow keys. A consequence is
-// that binding a bare modifier name ("Shift") can never fire, since holding it
-// makes the live mask non-zero while the bind wants zero.
+// that a modifier bound on its own ("Shift") stops acting as a modifier: see
+// ModifiersBoundAsKeys.
 constexpr uint8_t kModShift = 1u << 0;
 constexpr uint8_t kModCtrl = 1u << 1;
 constexpr uint8_t kModAlt = 1u << 2;
@@ -137,7 +139,54 @@ bool TokenPressed(const bool (&key_down)[256], std::string_view token, uint8_t l
 
 std::atomic<bool> mouse_look_active{true};
 
+enum class CaptureState { kIdle, kWaiting, kCaptured };
+std::mutex capture_mutex;
+CaptureState capture_state = CaptureState::kIdle;
+uint16_t captured_vk = 0;
+// A capture nobody finishes (the rebinding screen was left) gives the keys back.
+constexpr auto kCaptureTimeout = std::chrono::seconds(10);
+std::chrono::steady_clock::time_point capture_started;
+
+void ExpireCaptureLocked() {
+  if (capture_state == CaptureState::kWaiting &&
+      std::chrono::steady_clock::now() - capture_started > kCaptureTimeout) {
+    capture_state = CaptureState::kIdle;
+  }
+}
+// Set when a capture starts; cleared once no key is held, so the captured press
+// (and the one that opened the capture) never reach the game.
+std::atomic<bool> capture_suppress{false};
+
 }  // namespace
+
+void BeginKeyCapture() {
+  std::lock_guard lock(capture_mutex);
+  capture_state = CaptureState::kWaiting;
+  captured_vk = 0;
+  capture_started = std::chrono::steady_clock::now();
+  capture_suppress.store(true, std::memory_order_relaxed);
+}
+
+void CancelKeyCapture() {
+  std::lock_guard lock(capture_mutex);
+  capture_state = CaptureState::kIdle;
+}
+
+bool IsKeyCaptureWaiting() {
+  std::lock_guard lock(capture_mutex);
+  ExpireCaptureLocked();
+  return capture_state == CaptureState::kWaiting;
+}
+
+bool TakeCapturedKey(std::string& name_out) {
+  std::lock_guard lock(capture_mutex);
+  if (capture_state != CaptureState::kCaptured) {
+    return false;
+  }
+  capture_state = CaptureState::kIdle;
+  name_out = rex::ui::VirtualKeyToString(static_cast<rex::ui::VirtualKey>(captured_vk));
+  return true;
+}
 
 void SetMouseLookActive(bool active) {
   mouse_look_active.store(active, std::memory_order_relaxed);
@@ -200,8 +249,34 @@ bool MnkInputDriver::IsEnabled() const {
   return REXCVAR_GET(mnk_mode);
 }
 
-static bool IsBindPressed(const bool (&key_down)[256], const std::string& cvar_val) {
-  const uint8_t live_mods = LiveModifiers(key_down);
+// Modifiers bound as plain keys (Shift to sprint, say) are game buttons, not
+// modifiers: holding one must not silence the other binds.
+static uint8_t ModifiersBoundAsKeys(std::initializer_list<const std::string*> binds) {
+  uint8_t mods = 0;
+  for (const std::string* bind : binds) {
+    std::string_view rest(*bind);
+    while (!rest.empty()) {
+      size_t comma = rest.find(',');
+      std::string_view token = TrimSpaces(rest.substr(0, comma));
+      rest = comma == std::string_view::npos ? std::string_view() : rest.substr(comma + 1);
+      if (TakeModifiers(token)) {
+        continue;
+      }
+      if (token == "Shift") {
+        mods |= kModShift;
+      } else if (token == "Ctrl" || token == "Control") {
+        mods |= kModCtrl;
+      } else if (token == "Alt") {
+        mods |= kModAlt;
+      }
+    }
+  }
+  return mods;
+}
+
+static bool IsBindPressed(const bool (&key_down)[256], uint8_t key_mods,
+                          const std::string& cvar_val) {
+  const uint8_t live_mods = LiveModifiers(key_down) & ~key_mods;
   std::string_view rest(cvar_val);
   while (!rest.empty()) {
     size_t comma = rest.find(',');
@@ -274,61 +349,91 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
 
   std::lock_guard lock(state_mutex_);
 
+  if (capture_suppress.load(std::memory_order_relaxed)) {
+    bool any_down = false;
+    for (bool down : key_down_) {
+      any_down |= down;
+    }
+    if (any_down || IsKeyCaptureWaiting()) {
+      mouse_dx_ = 0.0f;
+      mouse_dy_ = 0.0f;
+      if (out_state) {
+        std::memset(out_state, 0, sizeof(*out_state));
+        out_state->packet_number = ++packet_number_;
+      }
+      return X_ERROR_SUCCESS;
+    }
+    capture_suppress.store(false, std::memory_order_relaxed);
+  }
+
+  const uint8_t key_mods = ModifiersBoundAsKeys(
+      {&REXCVAR_GET(keybind_a), &REXCVAR_GET(keybind_b), &REXCVAR_GET(keybind_x),
+       &REXCVAR_GET(keybind_y), &REXCVAR_GET(keybind_left_shoulder),
+       &REXCVAR_GET(keybind_right_shoulder), &REXCVAR_GET(keybind_lstick_press),
+       &REXCVAR_GET(keybind_rstick_press), &REXCVAR_GET(keybind_back),
+       &REXCVAR_GET(keybind_start), &REXCVAR_GET(keybind_guide),
+       &REXCVAR_GET(keybind_dpad_up), &REXCVAR_GET(keybind_dpad_down),
+       &REXCVAR_GET(keybind_dpad_left), &REXCVAR_GET(keybind_dpad_right),
+       &REXCVAR_GET(keybind_left_trigger), &REXCVAR_GET(keybind_right_trigger),
+       &REXCVAR_GET(keybind_lstick_up), &REXCVAR_GET(keybind_lstick_down),
+       &REXCVAR_GET(keybind_lstick_left), &REXCVAR_GET(keybind_lstick_right),
+       &REXCVAR_GET(keybind_rstick_up), &REXCVAR_GET(keybind_rstick_down),
+       &REXCVAR_GET(keybind_rstick_left), &REXCVAR_GET(keybind_rstick_right)});
   uint16_t buttons = 0;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_a)))
+  if (IsBindPressed(key_down_, key_mods, REXCVAR_GET(keybind_a)))
     buttons |= X_INPUT_GAMEPAD_A;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_b)))
+  if (IsBindPressed(key_down_, key_mods, REXCVAR_GET(keybind_b)))
     buttons |= X_INPUT_GAMEPAD_B;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_x)))
+  if (IsBindPressed(key_down_, key_mods, REXCVAR_GET(keybind_x)))
     buttons |= X_INPUT_GAMEPAD_X;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_y)))
+  if (IsBindPressed(key_down_, key_mods, REXCVAR_GET(keybind_y)))
     buttons |= X_INPUT_GAMEPAD_Y;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_left_shoulder)))
+  if (IsBindPressed(key_down_, key_mods, REXCVAR_GET(keybind_left_shoulder)))
     buttons |= X_INPUT_GAMEPAD_LEFT_SHOULDER;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_right_shoulder)))
+  if (IsBindPressed(key_down_, key_mods, REXCVAR_GET(keybind_right_shoulder)))
     buttons |= X_INPUT_GAMEPAD_RIGHT_SHOULDER;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_press)))
+  if (IsBindPressed(key_down_, key_mods, REXCVAR_GET(keybind_lstick_press)))
     buttons |= X_INPUT_GAMEPAD_LEFT_THUMB;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_press)))
+  if (IsBindPressed(key_down_, key_mods, REXCVAR_GET(keybind_rstick_press)))
     buttons |= X_INPUT_GAMEPAD_RIGHT_THUMB;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_back)))
+  if (IsBindPressed(key_down_, key_mods, REXCVAR_GET(keybind_back)))
     buttons |= X_INPUT_GAMEPAD_BACK;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_start)))
+  if (IsBindPressed(key_down_, key_mods, REXCVAR_GET(keybind_start)))
     buttons |= X_INPUT_GAMEPAD_START;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_guide)))
+  if (IsBindPressed(key_down_, key_mods, REXCVAR_GET(keybind_guide)))
     buttons |= X_INPUT_GAMEPAD_GUIDE;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_up)))
+  if (IsBindPressed(key_down_, key_mods, REXCVAR_GET(keybind_dpad_up)))
     buttons |= X_INPUT_GAMEPAD_DPAD_UP;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_down)))
+  if (IsBindPressed(key_down_, key_mods, REXCVAR_GET(keybind_dpad_down)))
     buttons |= X_INPUT_GAMEPAD_DPAD_DOWN;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_left)))
+  if (IsBindPressed(key_down_, key_mods, REXCVAR_GET(keybind_dpad_left)))
     buttons |= X_INPUT_GAMEPAD_DPAD_LEFT;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_right)))
+  if (IsBindPressed(key_down_, key_mods, REXCVAR_GET(keybind_dpad_right)))
     buttons |= X_INPUT_GAMEPAD_DPAD_RIGHT;
 
-  uint8_t lt = IsBindPressed(key_down_, REXCVAR_GET(keybind_left_trigger)) ? 0xFF : 0;
-  uint8_t rt = IsBindPressed(key_down_, REXCVAR_GET(keybind_right_trigger)) ? 0xFF : 0;
+  uint8_t lt = IsBindPressed(key_down_, key_mods, REXCVAR_GET(keybind_left_trigger)) ? 0xFF : 0;
+  uint8_t rt = IsBindPressed(key_down_, key_mods, REXCVAR_GET(keybind_right_trigger)) ? 0xFF : 0;
 
   int32_t lx = 0;
   int32_t ly = 0;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_left)))
+  if (IsBindPressed(key_down_, key_mods, REXCVAR_GET(keybind_lstick_left)))
     lx -= INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_right)))
+  if (IsBindPressed(key_down_, key_mods, REXCVAR_GET(keybind_lstick_right)))
     lx += INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_up)))
+  if (IsBindPressed(key_down_, key_mods, REXCVAR_GET(keybind_lstick_up)))
     ly += INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_down)))
+  if (IsBindPressed(key_down_, key_mods, REXCVAR_GET(keybind_lstick_down)))
     ly -= INT16_MAX;
 
   int32_t rx = 0;
   int32_t ry = 0;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_left)))
+  if (IsBindPressed(key_down_, key_mods, REXCVAR_GET(keybind_rstick_left)))
     rx -= INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_right)))
+  if (IsBindPressed(key_down_, key_mods, REXCVAR_GET(keybind_rstick_right)))
     rx += INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_up)))
+  if (IsBindPressed(key_down_, key_mods, REXCVAR_GET(keybind_rstick_up)))
     ry += INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_down)))
+  if (IsBindPressed(key_down_, key_mods, REXCVAR_GET(keybind_rstick_down)))
     ry -= INT16_MAX;
 
   if (REXCVAR_GET(mnk_mouse) && IsMouseLookActive()) {
@@ -475,9 +580,20 @@ void MnkInputDriver::RecenterCursorFromUIThread(int32_t x, int32_t y) {
 }
 
 void MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
-  if (vk < 256) {
-    key_down_[vk] = down;
+  if (vk >= 256) {
+    return;
   }
+  // A new press (not a key repeat, not the key still held from opening the capture)
+  // of a key with a bind name completes a waiting capture.
+  if (down && !key_down_[vk] &&
+      !rex::ui::VirtualKeyToString(static_cast<rex::ui::VirtualKey>(vk)).empty()) {
+    std::lock_guard lock(capture_mutex);
+    if (capture_state == CaptureState::kWaiting) {
+      capture_state = CaptureState::kCaptured;
+      captured_vk = vk;
+    }
+  }
+  key_down_[vk] = down;
 }
 
 void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {

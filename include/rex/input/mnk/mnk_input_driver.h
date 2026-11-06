@@ -25,6 +25,16 @@ namespace rex::input::mnk {
 void SetMouseLookActive(bool active);
 bool IsMouseLookActive();
 
+// Key capture for rebinding screens. While a capture is waiting, and until every key
+// is released after it, the driver reports a neutral pad so the press doesn't also
+// act in the game. Safe to call from any thread.
+void BeginKeyCapture();
+void CancelKeyCapture();
+bool IsKeyCaptureWaiting();
+// Takes the captured key's bind name ("E", "LMB", "Escape"). False while waiting or
+// idle.
+bool TakeCapturedKey(std::string& name_out);
+
 class MnkInputDriver final : public InputDriver,
                              public rex::ui::WindowInputListener,
                              public rex::ui::WindowListener {
