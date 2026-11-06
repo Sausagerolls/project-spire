@@ -15,6 +15,7 @@
 #include <string_view>
 
 #include <rex/cvar.h>
+#include <rex/input/input_mode.h>
 #include <rex/logging.h>
 #include <toml++/toml.hpp>
 
@@ -136,6 +137,8 @@ inline void Save() {
 inline void SetKeys(const char* cvar, std::string_view keys) {
   rex::cvar::SetFlagByName(cvar, keys);
   Save();
+  // Prompts show the new keys.
+  rex::input::RefreshInputModeDependents();
 }
 
 inline void SetSensitivity(double sensitivity) {
@@ -154,6 +157,7 @@ inline void ResetToDefaults() {
   }
   rex::cvar::SetFlagByName("mnk_sensitivity", "1.0");
   Save();
+  rex::input::RefreshInputModeDependents();
 }
 
 // Turns keyboard and mouse on and sets each action from controls.toml, or its

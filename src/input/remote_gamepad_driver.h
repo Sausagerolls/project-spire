@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include <rex/input/input_mode.h>
 #include <atomic>
 #include <cstdint>
 #include <vector>
@@ -80,6 +81,11 @@ class GamepadDriver final : public rex::input::InputDriver {
       have_prev_ = true;
     }
 
+    // Remote input stands in for a gamepad (prompts show gamepad icons).
+    if (s.buttons || s.left_trigger || s.right_trigger || s.stk_lx || s.stk_ly || s.stk_rx ||
+        s.stk_ry) {
+      rex::input::NoteInputMode(rex::input::InputMode::kGamepad);
+    }
     out_state->packet_number.set(packet_number_);
     out_state->gamepad.buttons.set(s.buttons);
     out_state->gamepad.left_trigger = s.left_trigger;

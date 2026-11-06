@@ -1,13 +1,15 @@
 // Replaces the controller button icons the game shows in prompts with the keyboard
-// and mouse keys they're bound to (macOS).
+// and mouse keys they're bound to while the keyboard and mouse are in use (macOS).
 //
 // The icons are entries of data/art/gui/gui_textures.bnk. A, B, X and Y
 // (Art\GUI\Controller\icon_button_*.tex) are 64x64 ARGB levels, tiled the way the
-// Xenos GPU reads them, after a 4-byte size. The bank is read through the guest's
-// file calls, so the SDK's read hook (rex::system::g_xfile_read_hook) replaces those
-// bytes as they're read with keycaps drawn here with Core Graphics. Each keycap
-// shows the first key bound to its button (src/input/mac_controls.h) when the bank
-// is read, so a rebinding shows in the prompts after the game restarts.
+// Xenos GPU reads them, after a 4-byte size, so their texture hashes are those of
+// the bank's bytes. The other icons are stored compressed and were found by their
+// decoded hashes (metal_log_texture_hashes). All are replaced through the SDK's
+// texture replacement hook with keycaps drawn here with Core Graphics, showing the
+// first key bound to each button (src/input/mac_controls.h). When the player
+// switches between gamepad and keyboard, the textures load again and show the
+// game's own icons or the keycaps.
 
 #include "mac_prompts.h"
 
@@ -29,7 +31,9 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/graphics/texture_replacement.h>
-#include <rex/system/xfile.h>
+#include <rex/input/input_mode.h>
+#define XXH_INLINE_ALL
+#include <xxhash.h>
 
 #include "mac_controls.h"
 
@@ -43,7 +47,7 @@ struct Icon {
   const char* entry;  // bank entry name
   const char* cvar;   // the button's keybind cvar
   uint64_t pixels_offset = 0;  // in the bank file, 0 if not found
-  std::vector<uint8_t> tiled;  // the keycap, as stored
+  uint64_t hash = 0;           // of those bytes, as the texture cache hashes them
 };
 
 std::array<Icon, 4> icons = {{
@@ -52,18 +56,7 @@ std::array<Icon, 4> icons = {{
     {"Art\\GUI\\Controller\\icon_button_x.tex", "keybind_x"},
     {"Art\\GUI\\Controller\\icon_button_y.tex", "keybind_y"},
 }};
-std::once_flag icons_drawn;
 
-// Byte offset of a 32bpp texel in a tiled 2D Xenos texture.
-uint32_t TiledOffset(uint32_t x, uint32_t y, uint32_t pitch) {
-  constexpr uint32_t bpb_log2 = 2;
-  pitch = (pitch + 31) & ~31u;
-  uint32_t macro = ((x >> 5) + (y >> 5) * (pitch >> 5)) << (bpb_log2 + 7);
-  uint32_t micro = ((x & 7) + ((y & 0xE) << 2)) << bpb_log2;
-  uint32_t offset = macro + ((micro & ~0xFu) << 1) + (micro & 0xF) + ((y & 1) << 4);
-  return ((offset & ~0x1FFu) << 3) + ((y & 16) << 7) + ((offset & 0x1C0) << 2) +
-         (((((y & 8) >> 2) + (x >> 3)) & 3) << 6) + (offset & 0x3F);
-}
 
 uint32_t ReadU32(const uint8_t* p) {
   return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];
@@ -284,16 +277,6 @@ std::vector<uint8_t> DrawKeycap(const std::string& key, uint32_t size = kSize,
   return premultiplied;
 }
 
-// As the bank stores 32bpp icons: tiled.
-std::vector<uint8_t> Tile(const std::vector<uint8_t>& argb) {
-  std::vector<uint8_t> tiled(kBytes, 0);
-  for (uint32_t y = 0; y < kSize; ++y) {
-    for (uint32_t x = 0; x < kSize; ++x) {
-      std::memcpy(&tiled[TiledOffset(x, y, kSize)], &argb[(y * kSize + x) * 4], 4);
-    }
-  }
-  return tiled;
-}
 
 // Byte offset of a 128-bit block in a tiled 2D Xenos texture (pitch in blocks).
 uint32_t TiledBlockOffset(uint32_t x, uint32_t y, uint32_t pitch) {
@@ -409,11 +392,12 @@ struct SingleIcon {
 constexpr SingleIcon kSingleIcons[] = {
     {0x675A49C07D8610CEull, "keybind_left_trigger"},  // "Tap LT ..." hints, 32x32
     {0xD50ABA1873F4DD1Bull, "keybind_left_trigger"},  // 64x64
+    {0xDC53FC27CDB38059ull, "keybind_left_trigger"},  // 32x32
     {0x0574501F949C2CD6ull, nullptr},                 // the D-pad, 64x64
     {0x3C88BE8AD6189A55ull, nullptr},                 // the D-pad, 32x32
 };
 
-// The D-pad: a gem holding four small keys, those of the D-pad directions.
+// The D-pad as the arrow keys: four small keycaps in an inverted T.
 std::vector<uint8_t> DrawDpad(uint32_t size) {
   std::vector<uint8_t> premultiplied(size_t(size) * size * 4, 0);
   CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
@@ -421,46 +405,31 @@ std::vector<uint8_t> DrawDpad(uint32_t size) {
       premultiplied.data(), size, size, 8, size * 4, space,
       uint32_t(kCGImageAlphaPremultipliedFirst) | uint32_t(kCGBitmapByteOrder32Big));
   CGColorSpaceRelease(space);
+  CGContextSetShouldAntialias(context, true);
   CGContextScaleCTM(context, double(size) / kSize, double(size) / kSize);
-  CGPathRef disc = CGPathCreateWithEllipseInRect(CGRectMake(3, 3, 58, 58), nullptr);
-  FillPath(context, disc, Color(0.13, 0.10, 0.08));
-  StrokePath(context, disc, Color(0.79, 0.64, 0.35), 2.5);
-  CGPathRelease(disc);
-  // y grows up: up, down, left, right.
+  // Centres (y grows up) and the arrow each key's triangle points to.
   const struct {
-    const char* cvar;
-    double x, y;
-  } keys[] = {{"keybind_dpad_up", 32, 46}, {"keybind_dpad_down", 32, 18},
-              {"keybind_dpad_left", 18, 32}, {"keybind_dpad_right", 46, 32}};
+    double x, y, dx, dy;
+  } keys[] = {{32, 44, 0, 1}, {12, 22, -1, 0}, {32, 22, 0, -1}, {52, 22, 1, 0}};
+  constexpr double kHalf = 9.5;
   for (const auto& key : keys) {
-    CGRect cap = CGRectMake(key.x - 9, key.y - 9, 18, 18);
+    CGRect cap = CGRectMake(key.x - kHalf, key.y - kHalf, 2 * kHalf, 2 * kHalf);
+    CGPathRef shadow = CGPathCreateWithRoundedRect(CGRectOffset(cap, 0, -1.5), 4, 4, nullptr);
+    FillPath(context, shadow, Color(0, 0, 0, 0.55));
+    CGPathRelease(shadow);
     CGPathRef outline = CGPathCreateWithRoundedRect(cap, 4, 4, nullptr);
-    FillPath(context, outline, Color(0.30, 0.24, 0.18));
-    StrokePath(context, outline, Color(0.79, 0.64, 0.35), 1.2);
+    FillPath(context, outline, Color(0.24, 0.19, 0.14));
+    StrokePath(context, outline, Color(0.79, 0.64, 0.35), 1.6);
     CGPathRelease(outline);
-    std::string label = FirstKey(key.cvar);
-    label = label == "Up" ? "\xE2\x86\x91" : label == "Down" ? "\xE2\x86\x93"
-          : label == "Left" ? "\xE2\x86\x90" : label == "Right" ? "\xE2\x86\x92" : label;
-    CFStringRef text = CFStringCreateWithCString(nullptr, label.c_str(), kCFStringEncodingUTF8);
-    CTFontRef font = CTFontCreateWithName(CFSTR("Palatino-Bold"), label.size() > 3 ? 8 : 13, nullptr);
-    CGColorRef color = Color(0.96, 0.91, 0.78);
-    const void* attribute_keys[] = {kCTFontAttributeName, kCTForegroundColorAttributeName};
-    const void* values[] = {font, color};
-    CFDictionaryRef attributes = CFDictionaryCreate(nullptr, attribute_keys, values, 2,
-                                                    &kCFTypeDictionaryKeyCallBacks,
-                                                    &kCFTypeDictionaryValueCallBacks);
-    CFAttributedStringRef string = CFAttributedStringCreate(nullptr, text, attributes);
-    CTLineRef line = CTLineCreateWithAttributedString(string);
-    CGRect bounds = CTLineGetImageBounds(line, context);
-    CGContextSetTextPosition(context, key.x - bounds.size.width / 2 - bounds.origin.x,
-                             key.y - bounds.size.height / 2 - bounds.origin.y);
-    CTLineDraw(line, context);
-    CFRelease(line);
-    CFRelease(string);
-    CFRelease(attributes);
-    CGColorRelease(color);
-    CFRelease(font);
-    CFRelease(text);
+    // A solid triangle: tip along (dx, dy), base across it.
+    double px = -key.dy, py = key.dx;
+    CGMutablePathRef arrow = CGPathCreateMutable();
+    CGPathMoveToPoint(arrow, nullptr, key.x + key.dx * 5.5, key.y + key.dy * 5.5);
+    CGPathAddLineToPoint(arrow, nullptr, key.x - key.dx * 3.5 + px * 5, key.y - key.dy * 3.5 + py * 5);
+    CGPathAddLineToPoint(arrow, nullptr, key.x - key.dx * 3.5 - px * 5, key.y - key.dy * 3.5 - py * 5);
+    CGPathCloseSubpath(arrow);
+    FillPath(context, arrow, Color(0.96, 0.91, 0.78));
+    CGPathRelease(arrow);
   }
   CGContextRelease(context);
   for (size_t i = 0; i < premultiplied.size(); i += 4) {
@@ -472,10 +441,37 @@ std::vector<uint8_t> DrawDpad(uint32_t size) {
   return premultiplied;
 }
 
-bool ReplaceTexture(const rex::graphics::GuestTextureData& texture,
-                    rex::graphics::TextureReplacement& out) {
+bool ReplaceForKeyboard(const rex::graphics::GuestTextureData& texture,
+                        rex::graphics::TextureReplacement& out) {
+  for (const Icon& icon : icons) {
+    if (icon.hash && texture.hash == icon.hash && texture.width == kSize &&
+        texture.height == kSize) {
+      std::vector<uint8_t> cap = DrawKeycap(FirstKey(icon.cvar));
+      out.width = out.height = kSize;
+      out.rgba.resize(cap.size());
+      for (size_t i = 0; i < cap.size(); i += 4) {
+        out.rgba[i] = cap[i + 1];
+        out.rgba[i + 1] = cap[i + 2];
+        out.rgba[i + 2] = cap[i + 3];
+        out.rgba[i + 3] = cap[i];
+      }
+      return true;
+    }
+  }
+  if ((texture.width == 32 || texture.width == 64) && texture.width == texture.height) {
+    static std::mutex mutex;
+    static std::vector<uint64_t> seen;
+    std::lock_guard lock(mutex);
+    if (std::find(seen.begin(), seen.end(), texture.hash) == seen.end()) {
+      seen.push_back(texture.hash);
+      REXSYS_INFO("[prompts] icon-sized texture {:016X} {}x{} format {}", texture.hash,
+                  texture.width, texture.height, texture.format);
+    }
+  }
   for (const SingleIcon& icon : kSingleIcons) {
     if (texture.hash == icon.hash && texture.width == texture.height) {
+      REXSYS_INFO("[prompts] replacing icon {:016X} ({}x{})", texture.hash, texture.width,
+                  texture.height);
       std::vector<uint8_t> cap = icon.cvar ? DrawKeycap(FirstKey(icon.cvar), texture.width, true)
                                            : DrawDpad(texture.width);
       out.width = out.height = texture.width;
@@ -526,43 +522,36 @@ bool ReplaceTexture(const rex::graphics::GuestTextureData& texture,
   return true;
 }
 
-void OnRead(const std::string& path, uint8_t* data, size_t length, uint64_t file_offset) {
-  if (path.size() < 16) {
-    return;
-  }
-  std::string lower = path.substr(path.size() - 16);
-  for (char& c : lower) {
-    c = char(std::tolower(static_cast<unsigned char>(c)));
-  }
-  if (lower != "gui_textures.bnk") {
-    return;
-  }
-  std::call_once(icons_drawn, [] {
-    for (Icon& icon : icons) {
-      if (icon.pixels_offset) {
-        icon.tiled = Tile(DrawKeycap(FirstKey(icon.cvar)));
-      }
-    }
-  });
-  uint64_t read_end = file_offset + length;
-  for (const Icon& icon : icons) {
-    if (icon.tiled.empty()) {
-      continue;
-    }
-    uint64_t start = std::max(file_offset, icon.pixels_offset);
-    uint64_t end = std::min(read_end, icon.pixels_offset + kBytes);
-    if (start < end) {
-      std::memcpy(data + (start - file_offset), icon.tiled.data() + (start - icon.pixels_offset),
-                  size_t(end - start));
-    }
-  }
-}
-
 }  // namespace
 
+// Keycaps while the keyboard and mouse are in use, the game's own icons while a
+// gamepad is; every texture that has a keycap is asked about again on a change.
+bool ReplaceTexture(const rex::graphics::GuestTextureData& texture,
+                    rex::graphics::TextureReplacement& out) {
+  if (!ReplaceForKeyboard(texture, out)) {
+    return false;
+  }
+  out.depends_on_input_mode = true;
+  if (rex::input::GetInputMode() == rex::input::InputMode::kGamepad) {
+    out.rgba.clear();
+    return false;
+  }
+  return true;
+}
+
 void Install(const std::filesystem::path& game_data_root) {
-  FindIcons(game_data_root / "data" / "art" / "gui" / "gui_textures.bnk");
-  rex::system::g_xfile_read_hook = OnRead;
+  std::filesystem::path bank = game_data_root / "data" / "art" / "gui" / "gui_textures.bnk";
+  FindIcons(bank);
+  // A, B, X and Y are stored as the GPU reads them, so their hashes are those of
+  // their bytes in the bank.
+  std::ifstream in(bank, std::ios::binary);
+  std::vector<uint8_t> pixels(kBytes);
+  for (Icon& icon : icons) {
+    if (icon.pixels_offset && in.seekg(std::streamoff(icon.pixels_offset)) &&
+        in.read(reinterpret_cast<char*>(pixels.data()), kBytes)) {
+      icon.hash = XXH3_64bits(pixels.data(), kBytes);
+    }
+  }
   rex::graphics::g_texture_replacement_hook = ReplaceTexture;
 }
 
