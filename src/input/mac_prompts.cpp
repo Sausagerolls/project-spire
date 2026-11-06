@@ -400,8 +400,95 @@ void PaintGem(std::vector<uint8_t>& rgba, uint32_t width, const Gem& gem) {
   }
 }
 
+// Single controller icons as the game decodes them (the bank stores them compressed),
+// found with metal_log_texture_hashes. Each becomes a round keycap of its size.
+struct SingleIcon {
+  uint64_t hash;
+  const char* cvar;
+};
+constexpr SingleIcon kSingleIcons[] = {
+    {0x675A49C07D8610CEull, "keybind_left_trigger"},  // "Tap LT ..." hints, 32x32
+    {0xD50ABA1873F4DD1Bull, "keybind_left_trigger"},  // 64x64
+    {0x0574501F949C2CD6ull, nullptr},                 // the D-pad, 64x64
+    {0x3C88BE8AD6189A55ull, nullptr},                 // the D-pad, 32x32
+};
+
+// The D-pad: a gem holding four small keys, those of the D-pad directions.
+std::vector<uint8_t> DrawDpad(uint32_t size) {
+  std::vector<uint8_t> premultiplied(size_t(size) * size * 4, 0);
+  CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+  CGContextRef context = CGBitmapContextCreate(
+      premultiplied.data(), size, size, 8, size * 4, space,
+      uint32_t(kCGImageAlphaPremultipliedFirst) | uint32_t(kCGBitmapByteOrder32Big));
+  CGColorSpaceRelease(space);
+  CGContextScaleCTM(context, double(size) / kSize, double(size) / kSize);
+  CGPathRef disc = CGPathCreateWithEllipseInRect(CGRectMake(3, 3, 58, 58), nullptr);
+  FillPath(context, disc, Color(0.13, 0.10, 0.08));
+  StrokePath(context, disc, Color(0.79, 0.64, 0.35), 2.5);
+  CGPathRelease(disc);
+  // y grows up: up, down, left, right.
+  const struct {
+    const char* cvar;
+    double x, y;
+  } keys[] = {{"keybind_dpad_up", 32, 46}, {"keybind_dpad_down", 32, 18},
+              {"keybind_dpad_left", 18, 32}, {"keybind_dpad_right", 46, 32}};
+  for (const auto& key : keys) {
+    CGRect cap = CGRectMake(key.x - 9, key.y - 9, 18, 18);
+    CGPathRef outline = CGPathCreateWithRoundedRect(cap, 4, 4, nullptr);
+    FillPath(context, outline, Color(0.30, 0.24, 0.18));
+    StrokePath(context, outline, Color(0.79, 0.64, 0.35), 1.2);
+    CGPathRelease(outline);
+    std::string label = FirstKey(key.cvar);
+    label = label == "Up" ? "\xE2\x86\x91" : label == "Down" ? "\xE2\x86\x93"
+          : label == "Left" ? "\xE2\x86\x90" : label == "Right" ? "\xE2\x86\x92" : label;
+    CFStringRef text = CFStringCreateWithCString(nullptr, label.c_str(), kCFStringEncodingUTF8);
+    CTFontRef font = CTFontCreateWithName(CFSTR("Palatino-Bold"), label.size() > 3 ? 8 : 13, nullptr);
+    CGColorRef color = Color(0.96, 0.91, 0.78);
+    const void* attribute_keys[] = {kCTFontAttributeName, kCTForegroundColorAttributeName};
+    const void* values[] = {font, color};
+    CFDictionaryRef attributes = CFDictionaryCreate(nullptr, attribute_keys, values, 2,
+                                                    &kCFTypeDictionaryKeyCallBacks,
+                                                    &kCFTypeDictionaryValueCallBacks);
+    CFAttributedStringRef string = CFAttributedStringCreate(nullptr, text, attributes);
+    CTLineRef line = CTLineCreateWithAttributedString(string);
+    CGRect bounds = CTLineGetImageBounds(line, context);
+    CGContextSetTextPosition(context, key.x - bounds.size.width / 2 - bounds.origin.x,
+                             key.y - bounds.size.height / 2 - bounds.origin.y);
+    CTLineDraw(line, context);
+    CFRelease(line);
+    CFRelease(string);
+    CFRelease(attributes);
+    CGColorRelease(color);
+    CFRelease(font);
+    CFRelease(text);
+  }
+  CGContextRelease(context);
+  for (size_t i = 0; i < premultiplied.size(); i += 4) {
+    uint8_t alpha = premultiplied[i];
+    for (int c = 1; c < 4; ++c) {
+      premultiplied[i + c] = alpha ? uint8_t(std::min(255, premultiplied[i + c] * 255 / alpha)) : 0;
+    }
+  }
+  return premultiplied;
+}
+
 bool ReplaceTexture(const rex::graphics::GuestTextureData& texture,
                     rex::graphics::TextureReplacement& out) {
+  for (const SingleIcon& icon : kSingleIcons) {
+    if (texture.hash == icon.hash && texture.width == texture.height) {
+      std::vector<uint8_t> cap = icon.cvar ? DrawKeycap(FirstKey(icon.cvar), texture.width, true)
+                                           : DrawDpad(texture.width);
+      out.width = out.height = texture.width;
+      out.rgba.resize(cap.size());
+      for (size_t i = 0; i < cap.size(); i += 4) {
+        out.rgba[i] = cap[i + 1];
+        out.rgba[i + 1] = cap[i + 2];
+        out.rgba[i + 2] = cap[i + 3];
+        out.rgba[i + 3] = cap[i];
+      }
+      return true;
+    }
+  }
   if (texture.hash == kMenuAtlas && texture.width == 512 && texture.height == 512 &&
       texture.format == 20) {
     out.width = texture.width;

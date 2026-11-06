@@ -132,18 +132,22 @@ void AddItem(PPCContext& ctx, uint8_t* base, uint32_t menu, const char* name, co
   DestructString(ctx, base, frame + kName);
 }
 
-// The Lua engine the menu's events go to, as the game's menu functions find it.
+// The Lua engine the menu's events go to, as the game's menu functions find it: the
+// front end's, and the one of in-game menus (pause).
 uint32_t MenuEngine(uint8_t* base) {
   uint32_t root = REX_LOAD_U32(0x83496928);
   return REX_LOAD_U32(REX_LOAD_U32(REX_LOAD_U32(root + 8) + 80) + 40);
 }
+uint32_t GameMenuEngine(uint8_t* base) { return REX_LOAD_U32(REX_LOAD_U32(0x834968A4) + 40); }
+// The engine of the menu being changed.
+uint32_t current_engine = 0;
 
 void SetElementString(PPCContext& ctx, uint8_t* base, uint32_t element, const char* key,
                       const std::string& value) {
   uint32_t frame = ctx.r1.u32;
   ConstructString(ctx, base, frame + kName, key);
   ConstructString(ctx, base, frame + kText, value.c_str());
-  ctx.r3.u64 = MenuEngine(base);
+  ctx.r3.u64 = current_engine;
   ctx.r4.u64 = frame + kName;
   ctx.r5.u64 = frame + kText;
   ctx.r6.u64 = element;
@@ -203,12 +207,10 @@ struct PendingCapture {
   bool active = false;
   size_t action = 0;
   uint32_t element = 0;
+  uint32_t engine = 0;
 } pending_capture;
 
 void AddOptionsItems(PPCContext& ctx, uint8_t* base, uint32_t menu) {
-  if (current_frame_rate_limit < 0) {
-    current_frame_rate_limit = fable2::config::Get().frame_rate_limit;
-  }
   AddItem(ctx, base, menu, kOptions, "Options", "Root");
   AddItem(ctx, base, menu, kFrameRate, CurrentFrameRate().label, kOptions);
 #ifndef _WIN32
@@ -235,8 +237,9 @@ void RelabelAllBinds(PPCContext& ctx, uint8_t* base, uint32_t element) {
 #endif
 
 // Returns whether the name was one of the added items.
-bool OnSelect(PPCContext& ctx, uint8_t* base, uint32_t menu, const char* name) {
-  uint32_t element = REX_LOAD_U32(menu + 20);
+bool OnSelect(PPCContext& ctx, uint8_t* base, uint32_t element, uint32_t engine,
+              const char* name) {
+  current_engine = engine;
   if (!std::strcmp(name, kFrameRate)) {
     const FrameRateItem* next = &kFrameRates[0];
     for (size_t i = 0; i < std::size(kFrameRates); ++i) {
@@ -284,10 +287,12 @@ bool OnSelect(PPCContext& ctx, uint8_t* base, uint32_t menu, const char* name) {
     }
     if (pending_capture.active) {
       // Another item was selected while waiting: put the old label back.
+      current_engine = pending_capture.engine;
       Relabel(ctx, base, pending_capture.element, BindName(pending_capture.action).c_str(),
               BindLabel(fable2::controls::kActions[pending_capture.action]));
+      current_engine = engine;
     }
-    pending_capture = {true, index, element};
+    pending_capture = {true, index, element, engine};
     rex::input::mnk::BeginKeyCapture();
     Relabel(ctx, base, element, name,
             std::string(fable2::controls::kActions[index].label) + ": Press a key");
@@ -322,7 +327,7 @@ extern "C" void ProcessAndProcessAndProcess2446_826C81A0(PPCContext& __restrict 
       const char* name = reinterpret_cast<const char*>(REX_RAW_ADDR(name_address));
       uint64_t saved_lr = ctx.lr;
       ctx.r1.u32 -= kFrameSize;
-      bool handled = OnSelect(ctx, base, menu, name);
+      bool handled = OnSelect(ctx, base, REX_LOAD_U32(menu + 20), MenuEngine(base), name);
       ctx.r1.u32 += kFrameSize;
       ctx.lr = saved_lr;
       if (handled) {
@@ -338,9 +343,15 @@ extern "C" void ProcessAndProcessAndProcess2446_826C81A0(PPCContext& __restrict 
 // Called each frame the front end menu polls its input (src/diagnostics/fable2_menu_probe.h).
 void fable2_options_menu_poll(PPCContext& ctx, uint8_t* base) {
 #ifndef _WIN32
-  if (!pending_capture.active) {
+  // Relabelling runs Lua, which comes back here through the Lua hook.
+  static bool polling = false;
+  if (!pending_capture.active || polling) {
     return;
   }
+  struct Guard {
+    Guard() { polling = true; }
+    ~Guard() { polling = false; }
+  } guard;
   // Esc, or a capture that timed out, keeps the old keys.
   std::string key = "Escape";
   if (!rex::input::mnk::TakeCapturedKey(key) && rex::input::mnk::IsKeyCaptureWaiting()) {
@@ -355,6 +366,7 @@ void fable2_options_menu_poll(PPCContext& ctx, uint8_t* base) {
   PPCRegister saved_r3 = ctx.r3;
   uint64_t saved_lr = ctx.lr;
   ctx.r1.u32 -= kFrameSize;
+  current_engine = pending_capture.engine;
   Relabel(ctx, base, pending_capture.element, BindName(pending_capture.action).c_str(),
           BindLabel(action));
   ctx.r1.u32 += kFrameSize;
@@ -364,4 +376,171 @@ void fable2_options_menu_poll(PPCContext& ctx, uint8_t* base) {
   (void)ctx;
   (void)base;
 #endif
+}
+
+namespace {
+
+// The pause menu's Options page is filled by the menu's Lua (g_Menu:SetPopulationTable
+// with the parent's MenuPopulationScript "OptionsMenu"). When a GUI presentation has
+// loaded its scripts, its Lua gets the current labels and, once, a wrapper of
+// SetPopulationTable that adds the settings to Options and turns Controls into a
+// submenu: the controller layout screen, then the key bindings.
+std::string LuaQuote(const std::string& text) {
+  std::string out = "'";
+  for (char c : text) {
+    if (c == '\'' || c == '\\') out += '\\';
+    out += c;
+  }
+  return out + "'";
+}
+
+std::string PauseOptionsLua() {
+  std::string lua = "MacOptionItems = {";
+  auto item = [&](const char* name, const std::string& label) {
+    lua += "{Name=" + LuaQuote(name) + ",TextTag=" + LuaQuote(label) + "},";
+  };
+  item(kFrameRate, CurrentFrameRate().label);
+#ifndef _WIN32
+  item(kReduceFlashing, ReduceFlashingLabel());
+  item(kSensitivity, SensitivityLabel(fable2::controls::CurrentSensitivity()));
+  lua += "} MacBindItems = {";
+  for (size_t i = 0; i < std::size(fable2::controls::kActions); ++i) {
+    item(BindName(i).c_str(), BindLabel(fable2::controls::kActions[i]));
+  }
+  item(kControlsReset, "Reset to Defaults");
+#endif
+  lua += R"(}
+if not MacOptionsWrapped and g_Menu and g_Menu.SetPopulationTable then
+  MacOptionsWrapped = true
+  local original = g_Menu.SetPopulationTable
+  g_Menu.SetPopulationTable = function(self)
+    original(self)
+    local parent = getElement('parent', g_Menu.element)
+    if not parent or getAttribute(parent, 'MenuPopulationScript') ~= 'OptionsMenu' then return end
+    local t = g_Menu.PopulationTable
+    local icon = 'Art\\GUI\\WheelIcons\\Abilities\\icon_logbook.tga'
+    local button = self.EventConst.EVENT_TYPE_MENU_ITEM_NODE
+    local layout = nil
+    for _, entry in ipairs(t) do
+      if entry.Name == 'Controls' then
+        layout = {Name='Controls', TextTag='Controller Layout', IconTexture=entry.IconTexture,
+                  EventType=entry.EventType, Parent='MacControls'}
+        entry.Name = 'MacControls'
+        entry.EventType = self.EventConst.EVENT_TYPE_SUBMENU
+      end
+    end
+    for _, o in ipairs(MacOptionItems) do
+      table.insert(t, {Name=o.Name, TextTag=o.TextTag, IconTexture=icon, EventType=button})
+    end
+    if layout then
+      table.insert(t, layout)
+      for _, o in ipairs(MacBindItems) do
+        table.insert(t, {Name=o.Name, TextTag=o.TextTag, IconTexture=icon, EventType=button,
+                         Parent='MacControls'})
+      end
+    end
+  end
+end)";
+  return lua;
+}
+
+}  // namespace
+
+// Runs Lua on a GUI element, as the game does: (code string, element).
+// The element of the in-game menu whose highlighted item was last read.
+uint32_t last_highlight_element = 0;
+void fable2_options_menu_poll(PPCContext& ctx, uint8_t* base);
+
+extern "C" void __imp__ProcessAndVcallAndProcess16_823F8908(PPCContext& ctx, uint8_t* base);
+extern "C" void ProcessAndVcallAndProcess16_823F8908(PPCContext& ctx, uint8_t* base) {
+  uint32_t code_object = REX_LOAD_U32(ctx.r3.u32);
+  uint32_t code = code_object ? REX_LOAD_U32(code_object) : 0;
+  bool scripts_loaded =
+      code && !std::strcmp(reinterpret_cast<const char*>(REX_RAW_ADDR(code)),
+                           "GUI:StoreScriptsDirectoryAndLoadAppropriateScripts()");
+  static const bool log_lua = std::getenv("FABLE2_LUA_LOG") != nullptr;
+  if (code && log_lua) {
+    REXSYS_INFO("[lua] lr {:08X} {:08X}: {}", uint32_t(ctx.lr), ctx.r4.u32,
+                std::string(reinterpret_cast<const char*>(REX_RAW_ADDR(code))).substr(0, 100));
+  }
+  uint32_t element = ctx.r4.u32;
+  if (code && !std::strcmp(reinterpret_cast<const char*>(REX_RAW_ADDR(code)),
+                           "g_Menu:GetHighlightedMenuItemData()")) {
+    last_highlight_element = element;
+  }
+  __imp__ProcessAndVcallAndProcess16_823F8908(ctx, base);
+  // In-game menus run Lua every frame; a rebind waiting there finishes here.
+  fable2_options_menu_poll(ctx, base);
+  if (scripts_loaded) {
+    // Once the presentation's scripts are loaded, before its menu is populated.
+    PPCRegister r3 = ctx.r3, r4 = ctx.r4;
+    uint64_t saved_lr = ctx.lr;
+    ctx.r1.u32 -= kFrameSize;
+    uint32_t frame = ctx.r1.u32;
+    std::string lua = PauseOptionsLua();
+    ConstructString(ctx, base, frame + kName, lua.c_str());
+    ctx.r3.u64 = frame + kName;
+    ctx.r4.u64 = element;
+    __imp__ProcessAndVcallAndProcess16_823F8908(ctx, base);
+    DestructString(ctx, base, frame + kName);
+    ctx.r1.u32 += kFrameSize;
+    ctx.lr = saved_lr;
+    ctx.r3 = r3;
+    ctx.r4 = r4;
+  }
+}
+
+// The pause Options screen's button handler: (screen, button, pressed). On A (36)
+// with no panel open, it reads the highlighted item (sub_8259DB00: type at +0, then
+// String name and label at +8 and +12) and opens the panel for its type. The
+// settings added there are handled instead, without a panel.
+extern "C" void __imp__sub_8259DB00(PPCContext& ctx, uint8_t* base);
+extern "C" void __imp__sub_82582E50(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_82582E50(PPCContext& ctx, uint8_t* base) {
+  constexpr uint32_t kButtonA = 36;
+  if (ctx.r4.u32 != kButtonA || ctx.r5.u32 != 1 || REX_LOAD_U8(ctx.r3.u32 + 24)) {
+    __imp__sub_82582E50(ctx, base);
+    return;
+  }
+  PPCRegister r3 = ctx.r3, r4 = ctx.r4, r5 = ctx.r5;
+  uint64_t saved_lr = ctx.lr;
+  ctx.r1.u32 -= kFrameSize;
+  uint32_t item = ctx.r1.u32 + kName;
+  for (uint32_t i = 0; i < 16; i += 4) {
+    REX_STORE_U32(item + i, 0);
+  }
+  // The two empty strings share the game's empty string, as the screen sets them up.
+  constexpr uint32_t kEmptyStringReferences = 0x83496EB8;
+  REX_STORE_U32(kEmptyStringReferences, REX_LOAD_U32(kEmptyStringReferences) + 2);
+  ctx.r3.u64 = REX_LOAD_U32(REX_LOAD_U32(REX_LOAD_U32(0x834968A4) + 28) + 60);
+  ctx.r4.u64 = item;
+  __imp__sub_8259DB00(ctx, base);
+  uint32_t name_object = REX_LOAD_U32(item + 8);
+  uint32_t name_address = name_object ? REX_LOAD_U32(name_object) : 0;
+  std::string name = name_address ? reinterpret_cast<const char*>(REX_RAW_ADDR(name_address)) : "";
+  DestructString(ctx, base, item + 12);
+  DestructString(ctx, base, item + 8);
+  bool handled = false;
+  if (!name.compare(0, 3, "Mac") && last_highlight_element) {
+    if (name == "MacControls") {
+      // A submenu: opened by the menu's own Lua, as the main menu's are.
+      uint32_t frame = ctx.r1.u32;
+      ConstructString(ctx, base, frame + kParent, "g_Menu:SelectMenuItem()");
+      ctx.r3.u64 = frame + kParent;
+      ctx.r4.u64 = last_highlight_element;
+      __imp__ProcessAndVcallAndProcess16_823F8908(ctx, base);
+      DestructString(ctx, base, frame + kParent);
+      handled = true;
+    } else {
+      handled = OnSelect(ctx, base, last_highlight_element, GameMenuEngine(base), name.c_str());
+    }
+  }
+  ctx.r1.u32 += kFrameSize;
+  ctx.lr = saved_lr;
+  ctx.r3 = r3;
+  ctx.r4 = r4;
+  ctx.r5 = r5;
+  if (!handled) {
+    __imp__sub_82582E50(ctx, base);
+  }
 }
