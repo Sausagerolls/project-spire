@@ -194,6 +194,11 @@ class MetalCommandProcessor : public CommandProcessor {
   std::unique_ptr<MetalTextureCache> texture_cache_;
 
   id<MTLComputePipelineState> swap_pipeline_ = nil;
+  // Reduce flashing (see kSwapShaderSource).
+  id<MTLComputePipelineState> flash_limit_pipeline_ = nil;
+  id<MTLComputePipelineState> flash_scale_pipeline_ = nil;
+  id<MTLBuffer> flash_state_ = nil;
+  std::chrono::steady_clock::time_point last_flash_time_;
 
   // Index buffers for tessellation drawn as an indexed grid, per grid factor:
   // (factor + 1)^2 vertices per patch, factor^2 quads of 2 triangles.

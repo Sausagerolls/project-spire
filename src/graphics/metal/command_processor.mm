@@ -101,6 +101,14 @@ REXCVAR_DEFINE_STRING(metal_capture_path, "/Volumes/1TB/tmp/fc", "GPU/Metal",
 REXCVAR_DEFINE_BOOL(metal_sync_submissions, false, "GPU/Metal",
                     "Wait for the GPU after every submission (debugging CPU / GPU memory hazards)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(metal_reduce_flashing, true, "GPU/Metal",
+                    "Keep the screen's mean brightness from rising faster than "
+                    "metal_flash_max_rise, so full-screen white flashes become gradual")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(metal_flash_max_rise, 1.0, "GPU/Metal",
+                      "With metal_reduce_flashing, the most the mean brightness (0 to 1) may "
+                      "rise per second")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(metal_async_compile, true, "GPU/Metal",
                     "Compile new shaders and pipelines in the background, skipping draws to "
                     "screen-sized targets that need them meanwhile (instead of a hitch)")
@@ -208,10 +216,47 @@ float f7e3_to_f32(uint f10) {
   }
   return (1.0 + float(mantissa) / 128.0) * exp2(float(exponent) - 3.0);
 }
+// Reduce flashing: swap_cs adds up the frame's brightness, flash_limit_cs picks a
+// scale that keeps the mean brightness from rising faster than a set rate, and
+// flash_scale_cs applies it.
+struct FlashState {
+  atomic_uint sum;     // luma * 255 of the pixels counted
+  uint count;          // pixels in the frame
+  float shown;         // mean brightness last shown
+  float scale;         // for flash_scale_cs
+};
+struct FlashConstants {
+  float max_rise;      // brightness per frame
+  uint enabled;
+};
 kernel void swap_cs(device const uint* memory [[buffer(0)]],
                     constant SwapConstants& constants [[buffer(1)]],
                     texture2d<float, access::write> output [[texture(0)]],
-                    uint2 xy [[thread_position_in_grid]]) {
+                    device FlashState& flash [[buffer(2)]],
+                    uint2 xy [[thread_position_in_grid]],
+                    uint index_in_group [[thread_index_in_threadgroup]]) {
+  threadgroup uint group_sum[64];
+  group_sum[index_in_group] = 0u;
+  if (xy.x < constants.width && xy.y < constants.height && ((xy.x | xy.y) & 1u) == 0u) {
+    uint offset = constants.tiled != 0u
+                      ? uint(tiled_offset_2d(int(xy.x), int(xy.y), constants.pitch, 2u))
+                      : (xy.y * constants.pitch + xy.x) * 4u;
+    uint value = swap_endian(memory[(constants.base + offset) >> 2u], constants.endian);
+    float3 rgb = constants.format == 0u
+                     ? float3(float(value & 0xFFu), float((value >> 8u) & 0xFFu),
+                              float((value >> 16u) & 0xFFu)) / 255.0
+                     : float3(float(value & 0x3FFu), float((value >> 10u) & 0x3FFu),
+                              float((value >> 20u) & 0x3FFu)) / 1023.0;
+    group_sum[index_in_group] = uint(dot(rgb, float3(0.299, 0.587, 0.114)) * 255.0);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (index_in_group == 0u) {
+    uint total = 0u;
+    for (uint i = 0u; i < 64u; ++i) {
+      total += group_sum[i];
+    }
+    atomic_fetch_add_explicit(&flash.sum, total, memory_order_relaxed);
+  }
   if (xy.x >= constants.width || xy.y >= constants.height) {
     return;
   }
@@ -234,6 +279,29 @@ kernel void swap_cs(device const uint* memory [[buffer(0)]],
     color[i] = component < 4u ? source[component] : (component == 4u ? 0.0 : 1.0);
   }
   output.write(float4(color.rgb, 1.0), xy);
+}
+kernel void flash_limit_cs(device FlashState& flash [[buffer(0)]],
+                           constant FlashConstants& constants [[buffer(1)]]) {
+  uint sum = atomic_exchange_explicit(&flash.sum, 0u, memory_order_relaxed);
+  float mean = float(sum) / (255.0 * float(max(flash.count, 1u)));
+  float scale = 1.0;
+  if (constants.enabled != 0u) {
+    float allowed = flash.shown + constants.max_rise;
+    if (mean > allowed && mean > 0.0) {
+      scale = allowed / mean;
+    }
+  }
+  flash.scale = scale;
+  flash.shown = mean * scale;
+}
+kernel void flash_scale_cs(texture2d<float, access::read_write> output [[texture(0)]],
+                           device const FlashState& flash [[buffer(0)]],
+                           uint2 xy [[thread_position_in_grid]]) {
+  if (flash.scale >= 1.0 || xy.x >= output.get_width() || xy.y >= output.get_height()) {
+    return;
+  }
+  float4 color = output.read(xy);
+  output.write(float4(color.rgb * flash.scale, color.a), xy);
 }
 )";
 
@@ -295,6 +363,22 @@ bool MetalCommandProcessor::SetupContext() {
     REXGPU_ERROR("Failed to create the swap pipeline");
     return false;
   }
+  {
+    NSError* error = nil;
+    flash_limit_pipeline_ = [device_
+        newComputePipelineStateWithFunction:[swap_library newFunctionWithName:@"flash_limit_cs"]
+                                      error:&error];
+    flash_scale_pipeline_ = [device_
+        newComputePipelineStateWithFunction:[swap_library newFunctionWithName:@"flash_scale_cs"]
+                                      error:&error];
+    flash_state_ = [device_ newBufferWithLength:16 options:MTLResourceStorageModeShared];
+    if (!flash_limit_pipeline_ || !flash_scale_pipeline_ || !flash_state_) {
+      REXGPU_ERROR("Failed to create the flash limiting pipelines");
+      return false;
+    }
+    std::memset(flash_state_.contents, 0, 16);
+    flash_state_.label = @"flash state";
+  }
 
   std::memset(&system_constants_, 0, sizeof(system_constants_));
   current_constant_buffers_up_to_date_ = 0;
@@ -314,6 +398,9 @@ void MetalCommandProcessor::ShutdownContext() {
   transient_pages_used_.clear();
   transient_page_current_ = nil;
   swap_pipeline_ = nil;
+  flash_limit_pipeline_ = nil;
+  flash_scale_pipeline_ = nil;
+  flash_state_ = nil;
   CommandProcessor::ShutdownContext();
 }
 
@@ -2230,9 +2317,41 @@ void MetalCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fro
         [encoder setBuffer:shared_memory_->buffer() offset:0 atIndex:0];
         [encoder setBytes:&constants length:sizeof(constants) atIndex:1];
         [encoder setTexture:metal_context.texture() atIndex:0];
+        [encoder setBuffer:flash_state_ offset:0 atIndex:2];
+        // Pixel count of the brightness sum (every second pixel in each direction).
+        static_cast<uint32_t*>(flash_state_.contents)[1] =
+            ((frontbuffer_width + 1) / 2) * ((frontbuffer_height + 1) / 2);
         [encoder dispatchThreadgroups:MTLSizeMake((frontbuffer_width + 7) / 8,
                                                   (frontbuffer_height + 7) / 8, 1)
                 threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        {
+          // The rise allowed since the last frame, from the time between them.
+          auto now = std::chrono::steady_clock::now();
+          double seconds = last_flash_time_.time_since_epoch().count()
+                               ? std::chrono::duration<double>(now - last_flash_time_).count()
+                               : 1.0 / 30.0;
+          last_flash_time_ = now;
+          struct {
+            float max_rise;
+            uint32_t enabled;
+          } flash_constants;
+          flash_constants.max_rise =
+              float(REXCVAR_GET(metal_flash_max_rise) * std::clamp(seconds, 1.0 / 240.0, 0.1));
+          flash_constants.enabled = REXCVAR_GET(metal_reduce_flashing) ? 1 : 0;
+          [encoder setComputePipelineState:flash_limit_pipeline_];
+          [encoder setBuffer:flash_state_ offset:0 atIndex:0];
+          [encoder setBytes:&flash_constants length:sizeof(flash_constants) atIndex:1];
+          [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+          if (flash_constants.enabled) {
+            [encoder setComputePipelineState:flash_scale_pipeline_];
+            [encoder setTexture:metal_context.texture() atIndex:0];
+            [encoder setBuffer:flash_state_ offset:0 atIndex:0];
+            [encoder dispatchThreadgroups:MTLSizeMake((frontbuffer_width + 7) / 8,
+                                                      (frontbuffer_height + 7) / 8, 1)
+                    threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+          }
+        }
         {
           // Frame-exact capture for debugging.
           static int32_t capture_last = 0, capture_left = 0, capture_index = 0;
