@@ -71,3 +71,8 @@ thirdparty/android-ndk/
 # --- Historical reference (pre-ReXGlue XenonRecomp configs) -------------------
 XenonRecomp
 TODO.md
+
+# --- Project Spire launcher and the Steam Deck port: their scripts, tools and
+#     icon are part of the project ---------------------------------------------
+!macos/ProjectSpire/**
+!steamdeck/**
