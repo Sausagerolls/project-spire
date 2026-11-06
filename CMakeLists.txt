@@ -80,6 +80,7 @@ set(FABLE2_SOURCES
     src/core/fable2_address_scan.cpp
     src/native_gpu/draw_capture.cpp
     src/native_gpu/options_menu.cpp
+    src/input/mac_prompts.cpp
     ${HOTFUNC_SOURCES}
 )
 
@@ -97,6 +98,11 @@ set(FABLE2_HEADER_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/diagnostics
     ${CMAKE_CURRENT_SOURCE_DIR}/src/input)
 target_include_directories(fable_2 PRIVATE ${FABLE2_HEADER_DIRS})
+if(APPLE)
+    # Keycap prompts (src/input/mac_prompts.cpp).
+    target_link_libraries(fable_2 PRIVATE "-framework CoreGraphics" "-framework CoreText"
+                          "-framework CoreFoundation" z)
+endif()
 if(TARGET fable_2_recomp)
     target_include_directories(fable_2_recomp PRIVATE ${FABLE2_HEADER_DIRS})
 endif()
