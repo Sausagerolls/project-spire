@@ -52,7 +52,7 @@ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_STRING(gpu_backend, "any", "GPU",
                       "Graphics backend of the GPU plugin: 'any' (the default for the platform), "
-                      "'vulkan', 'd3d12' or 'metal' (experimental, macOS)")
+                      "'vulkan', 'd3d12' or 'metal' (the default on macOS)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex {

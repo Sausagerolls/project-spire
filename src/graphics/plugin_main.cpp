@@ -42,8 +42,8 @@ extern "C" REX_GPU_PLUGIN_EXPORT rex::system::IGraphicsSystem* rex_gpu_create(
 
   std::string_view backend = info->backend ? info->backend : "any";
 #if REX_HAS_METAL
-  // Experimental - only when requested explicitly.
-  if (backend == "metal") {
+  // The native backend on macOS; "any" picks it before Vulkan (MoltenVK).
+  if (backend == "any" || backend == "metal") {
     return new rex::graphics::metal::MetalGraphicsSystem();
   }
 #endif
