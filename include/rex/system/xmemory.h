@@ -360,6 +360,10 @@ class PhysicalHeap : public BaseHeap {
 // overlap with other ranges. Each range is represented by a BaseHeap of either
 // VirtualHeap or PhysicalHeap depending on type. Heaps model the page tables
 // and can handle reservation and committing of requested pages.
+// Called once, on the first unhandled guest access violation (debugging: the GPU
+// backend dumps its recent guest memory writes).
+extern void (*g_unhandled_guest_access_hook)();
+
 class Memory {
  public:
   Memory();

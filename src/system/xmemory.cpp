@@ -28,6 +28,7 @@
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/mmio_handler.h>
 #include <rex/system/xmemory.h>
+#include <rex/system/xthread.h>
 #include <rex/thread.h>
 
 // TODO(benvanik): move xbox.h out
@@ -531,6 +532,8 @@ runtime::MMIORange* Memory::LookupVirtualMappedRange(uint32_t virtual_address) {
   return mmio_handler_->LookupRange(virtual_address);
 }
 
+void (*g_unhandled_guest_access_hook)() = nullptr;
+
 bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
                                      void* host_address, bool is_write) {
   // Access via physical_membase_ is special, when need to bypass everything
@@ -547,6 +550,25 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
     // the first ones and then a sample (the global lock is held here).
     static uint64_t unhandled_count = 0;
     ++unhandled_count;
+    if (unhandled_count == 1) {
+      // The faulting thread's guest registers, to find the corrupted pointer's source.
+      if (auto* thread = rex::system::XThread::GetCurrentThread()) {
+        if (auto* state = thread->thread_state()) {
+          if (const ::PPCContext* ctx = state->context()) {
+            std::string regs;
+            const PPCRegister* r = &ctx->r0;
+            for (int i = 0; i < 32; ++i) {
+              regs += fmt::format(" r{}={:08X}", i, r[i].u32);
+            }
+            REXSYS_ERROR("Guest registers at the first unhandled access: lr={:08X}{}",
+                         uint32_t(ctx->lr), regs);
+          }
+        }
+      }
+      if (g_unhandled_guest_access_hook) {
+        g_unhandled_guest_access_hook();
+      }
+    }
     if (unhandled_count <= 16 || !(unhandled_count & 0xFFFF)) {
       REXSYS_ERROR(
           "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread "

@@ -117,6 +117,50 @@ namespace rex::graphics::metal {
 
 namespace {
 
+// Recent GPU writes to guest memory, dumped on the first unhandled guest access violation
+// (rare crashes where guest heap data looks overwritten).
+struct GpuWriteRecord {
+  uint32_t start;
+  uint32_t length;
+  uint32_t value;
+  char kind;  // 'r' resolve / memexport range, 'f' fence write, 'w' other stream write
+  uint64_t submission;
+  int64_t time_ms;
+};
+std::mutex gpu_write_records_mutex;
+std::array<GpuWriteRecord, 4096> gpu_write_records;
+size_t gpu_write_records_next = 0;
+
+void RecordGpuWrite(char kind, uint32_t start, uint32_t length, uint32_t value,
+                    uint64_t submission) {
+  int64_t time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+  std::lock_guard<std::mutex> lock(gpu_write_records_mutex);
+  gpu_write_records[gpu_write_records_next++ % gpu_write_records.size()] = {
+      start, length, value, kind, submission, time_ms};
+}
+
+void DumpGpuWrites() {
+  std::lock_guard<std::mutex> lock(gpu_write_records_mutex);
+  int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count();
+  size_t count = std::min(gpu_write_records_next, gpu_write_records.size());
+  std::string line;
+  for (size_t i = 0; i < count; ++i) {
+    const GpuWriteRecord& r =
+        gpu_write_records[(gpu_write_records_next - count + i) % gpu_write_records.size()];
+    line += fmt::format(" {}{:08X}+{:X}={:X}@{}/{}ms", r.kind, r.start, r.length, r.value,
+                        r.submission, now - r.time_ms);
+    if (line.size() > 3000 || i + 1 == count) {
+      REXGPU_ERROR("Recent GPU guest memory writes (kind address+length=value@submission/age):{}",
+                   line);
+      line.clear();
+    }
+  }
+}
+
 // Copies the front buffer (a guest texture in shared memory) to the guest
 // output image. 32bpp formats only for now.
 NSString* const kSwapShaderSource = @R"(
@@ -247,6 +291,7 @@ bool MetalCommandProcessor::SetupContext() {
 
   std::memset(&system_constants_, 0, sizeof(system_constants_));
   current_constant_buffers_up_to_date_ = 0;
+  memory::g_unhandled_guest_access_hook = DumpGpuWrites;
   REXGPU_INFO("Metal command processor: initialized (zero-copy guest memory)");
   return true;
 }
@@ -589,6 +634,7 @@ void MetalCommandProcessor::WriteMemoryFromCommandStream(uint32_t address, uint3
   bool defer = REXCVAR_GET(metal_defer_fence_writes) &&
                (is_fence || REXCVAR_GET(metal_defer_all_stream_writes));
   if (!defer) {
+    RecordGpuWrite('w', address, 4, value, submission_current_);
     CommandProcessor::WriteMemoryFromCommandStream(address, value);
     return;
   }
@@ -600,6 +646,7 @@ void MetalCommandProcessor::WriteMemoryFromCommandStream(uint32_t address, uint3
     if (completed_submission >= after_submission) {
       // Earlier deferred writes follow earlier submissions, so they're due too.
       ApplyDeferredMemoryWrites(UINT64_MAX);
+      RecordGpuWrite('f', address, 4, value, submission_current_);
       CommandProcessor::WriteMemoryFromCommandStream(address, value);
       return;
     }
@@ -618,6 +665,7 @@ void MetalCommandProcessor::ApplyDeferredMemoryWrites(uint64_t completed_submiss
   while (!deferred_memory_writes_.empty() &&
          deferred_memory_writes_.front().submission <= completed_submission) {
     const DeferredMemoryWrite& write = deferred_memory_writes_.front();
+    RecordGpuWrite('f', write.address, 4, write.value, write.submission);
     CommandProcessor::WriteMemoryFromCommandStream(write.address, write.value);
     deferred_memory_writes_.pop_front();
   }
@@ -862,6 +910,7 @@ id<MTLBlitCommandEncoder> MetalCommandProcessor::GetUploadBlitEncoder() {
 
 void MetalCommandProcessor::MarkGpuWrittenInSubmission(uint32_t start, uint32_t length) {
   if (length) {
+    RecordGpuWrite('r', start, length, 0, submission_current_);
     submission_gpu_written_ranges_.emplace_back(start, start + length);
   }
 }
