@@ -12,6 +12,7 @@
 
 #include <rex/cvar.h>
 #include <rex/input/input.h>
+#include <rex/input/input_mode.h>
 #include <rex/logging.h>
 #include <rex/ui/keybinds.h>
 #include <rex/ui/virtual_key.h>
@@ -583,6 +584,9 @@ void MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
   if (vk >= 256) {
     return;
   }
+  if (down) {
+    rex::input::NoteInputMode(rex::input::InputMode::kKeyboardMouse);
+  }
   // A new press (not a key repeat, not the key still held from opening the capture)
   // of a key with a bind name completes a waiting capture.
   if (down && !key_down_[vk] &&
@@ -657,6 +661,9 @@ void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
   int32_t y = e.y();
   {
     std::lock_guard lock(state_mutex_);
+    if (std::abs(e.dx()) + std::abs(e.dy()) > 3) {
+      rex::input::NoteInputMode(rex::input::InputMode::kKeyboardMouse);
+    }
     if (relative_mouse_mode_) {
       // The pointer is locked, so the absolute position no longer moves.
       mouse_dx_ += e.dx();

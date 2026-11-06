@@ -131,6 +131,16 @@ class TextureCache {
   }
 
  protected:
+  // Makes the textures load again on their next use.
+  template <typename Textures>
+  void ReloadTextures(const Textures& textures) {
+    auto global_lock = global_critical_region_.Acquire();
+    for (Texture* texture : textures) {
+      texture->MarkOutdated(global_lock);
+    }
+    texture_became_outdated_.store(true, std::memory_order_release);
+  }
+
   struct TextureKey {
     // Dimensions minus 1 are stored similarly to how they're stored in fetch
     // constants so fewer bits can be used, while the maximum size (8192 for 2D)
@@ -229,6 +239,8 @@ class TextureCache {
     void MakeUpToDateAndWatch(const std::unique_lock<std::recursive_mutex>& global_lock);
 
     void WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip);
+    // Makes the texture load again on its next use, as if its memory had been written.
+    void MarkOutdated(const std::unique_lock<std::recursive_mutex>& global_lock);
 
     // For LRU caching - updates the last usage frame and moves the texture to
     // the end of the usage queue. Must be called any time the texture is

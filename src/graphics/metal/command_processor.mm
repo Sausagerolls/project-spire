@@ -1586,6 +1586,7 @@ bool MetalCommandProcessor::IssueDrawImpl() {
   uint32_t used_texture_mask =
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
       (pixel_shader ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
+  texture_cache_->ReloadTexturesForInputMode();
   texture_cache_->RequestTextures(used_texture_mask);
 
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,

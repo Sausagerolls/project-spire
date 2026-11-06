@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/input/input_mode.h>
+#include <cstdlib>
 #include <array>
 #include <filesystem>
 
@@ -225,6 +227,15 @@ X_RESULT SDLInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
     controller->state_changed = false;
   }
   std::memcpy(out_state, &controller->state, sizeof(*out_state));
+  if (is_active) {
+    const auto& pad = controller->state.gamepad;
+    constexpr int kDeadZone = 9000;
+    if (uint16_t(pad.buttons) || pad.left_trigger > 40 || pad.right_trigger > 40 ||
+        std::abs(int(pad.thumb_lx)) > kDeadZone || std::abs(int(pad.thumb_ly)) > kDeadZone ||
+        std::abs(int(pad.thumb_rx)) > kDeadZone || std::abs(int(pad.thumb_ry)) > kDeadZone) {
+      rex::input::NoteInputMode(rex::input::InputMode::kGamepad);
+    }
+  }
   if (!is_active) {
     // Simulate an "untouched" controller. When we become active again the
     // pressed buttons aren't lost and will be visible again.

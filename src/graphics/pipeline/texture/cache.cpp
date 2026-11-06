@@ -747,6 +747,22 @@ void TextureCache::Texture::WatchCallback(
   }
 }
 
+void TextureCache::Texture::MarkOutdated(
+    const std::unique_lock<std::recursive_mutex>& global_lock) {
+  if (base_watch_handle_) {
+    texture_cache().shared_memory().UnwatchMemoryRange(base_watch_handle_);
+  }
+  if (mips_watch_handle_) {
+    texture_cache().shared_memory().UnwatchMemoryRange(mips_watch_handle_);
+  }
+  if (GetGuestBaseSize()) {
+    WatchCallback(global_lock, false);
+  }
+  if (GetGuestMipsSize()) {
+    WatchCallback(global_lock, true);
+  }
+}
+
 void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock,
                                  void* context, void* data, uint64_t argument,
                                  bool invalidated_by_gpu) {

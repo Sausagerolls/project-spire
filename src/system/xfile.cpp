@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
+#include <rex/input/input_mode.h>
 #include <rex/graphics/texture_replacement.h>
 #include <rex/filesystem/vfs.h>
 #include <rex/logging.h>
@@ -118,6 +120,21 @@ XFileReadHook g_xfile_read_hook = nullptr;
 namespace rex::graphics {
 TextureReplacementHook g_texture_replacement_hook = nullptr;
 }  // namespace rex::graphics
+
+namespace rex::input {
+namespace {
+std::atomic<uint32_t> input_mode{uint32_t(InputMode::kKeyboardMouse)};
+std::atomic<uint32_t> input_mode_generation{0};
+}  // namespace
+void NoteInputMode(InputMode mode) {
+  if (input_mode.exchange(uint32_t(mode), std::memory_order_relaxed) != uint32_t(mode)) {
+    input_mode_generation.fetch_add(1, std::memory_order_release);
+  }
+}
+InputMode GetInputMode() { return InputMode(input_mode.load(std::memory_order_relaxed)); }
+uint32_t GetInputModeGeneration() { return input_mode_generation.load(std::memory_order_acquire); }
+void RefreshInputModeDependents() { input_mode_generation.fetch_add(1, std::memory_order_release); }
+}  // namespace rex::input
 
 namespace rex::system {
 

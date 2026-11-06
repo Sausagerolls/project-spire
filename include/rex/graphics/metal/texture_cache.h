@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #import <Metal/Metal.h>
@@ -90,9 +91,21 @@ class MetalTextureCache final : public TextureCache {
     // Swaps in an RGBA8 texture from a game's texture replacement hook. Views then
     // use its format instead of the guest format's.
     void ReplaceWithImage(id<MTLTexture> texture) {
+      if (!own_format_) {
+        original_texture_ = texture_;
+      }
       ReplaceTexture(texture);
       own_format_ = true;
     }
+    // Back to the texture of the guest format, after ReplaceWithImage.
+    void RestoreOriginal() {
+      if (own_format_ && original_texture_) {
+        ReplaceTexture(original_texture_);
+        original_texture_ = nil;
+      }
+    }
+    bool replaced() const { return own_format_; }
+    ~MetalTexture();
     // A view with the host swizzle (12 bits, 3 per component) and signedness.
     id<MTLTexture> GetView(bool is_signed, uint32_t host_swizzle);
     // The last submission that bound the texture for drawing.
@@ -102,6 +115,7 @@ class MetalTextureCache final : public TextureCache {
     id<MTLTexture> texture_;
     std::unordered_map<uint32_t, id<MTLTexture>> views_;
     bool own_format_ = false;
+    id<MTLTexture> original_texture_ = nil;
   };
 
   MetalTextureCache(const RegisterFile& register_file, MetalSharedMemory& shared_memory,
@@ -125,6 +139,15 @@ class MetalTextureCache final : public TextureCache {
   id<MTLBuffer> AcquireScratchBuffer(size_t size);
   // Through rex::graphics::g_texture_replacement_hook.
   bool TryReplaceTexture(MetalTexture& texture);
+  // Textures whose replacement depends on the input mode, reloaded when it changes.
+  std::unordered_set<MetalTexture*> input_mode_textures_;
+  uint32_t input_mode_generation_ = 0;
+
+ public:
+  // Before textures are requested for a draw.
+  void ReloadTexturesForInputMode();
+
+ private:
 
   id<MTLTexture> null_texture_2d_array_ = nil;
   id<MTLTexture> null_texture_3d_ = nil;

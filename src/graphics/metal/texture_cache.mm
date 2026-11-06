@@ -14,6 +14,7 @@
 #include <unordered_set>
 #include <xxhash.h>
 #include <rex/graphics/texture_replacement.h>
+#include <rex/input/input_mode.h>
 
 #include <rex/cvar.h>
 #include <rex/graphics/flags.h>
@@ -498,6 +499,21 @@ MetalTextureCache::MetalTexture::MetalTexture(MetalTextureCache& texture_cache,
   SetHostMemoryUsage(uint64_t(texture.allocatedSize));
 }
 
+MetalTextureCache::MetalTexture::~MetalTexture() {
+  static_cast<MetalTextureCache&>(texture_cache()).input_mode_textures_.erase(this);
+}
+
+void MetalTextureCache::ReloadTexturesForInputMode() {
+  uint32_t generation = rex::input::GetInputModeGeneration();
+  if (generation == input_mode_generation_) {
+    return;
+  }
+  input_mode_generation_ = generation;
+  if (!input_mode_textures_.empty()) {
+    ReloadTextures(input_mode_textures_);
+  }
+}
+
 void MetalTextureCache::MetalTexture::ReplaceTexture(id<MTLTexture> texture) {
   texture_ = texture;
   views_.clear();
@@ -638,13 +654,18 @@ bool MetalTextureCache::TryReplaceTexture(MetalTexture& texture) {
     }
   }
   rex::graphics::TextureReplacement replacement;
-  if (!rex::graphics::g_texture_replacement_hook ||
-      !rex::graphics::g_texture_replacement_hook(
-          {hash, width, height, uint32_t(key.format), bool(key.tiled), uint32_t(key.endianness),
-           data, length},
-          replacement) ||
-      !replacement.width || !replacement.height ||
+  bool replace = rex::graphics::g_texture_replacement_hook &&
+                 rex::graphics::g_texture_replacement_hook(
+                     {hash, width, height, uint32_t(key.format), bool(key.tiled),
+                      uint32_t(key.endianness), data, length},
+                     replacement);
+  if (replacement.depends_on_input_mode) {
+    input_mode_textures_.insert(&texture);
+  }
+  if (!replace || !replacement.width || !replacement.height ||
       replacement.rgba.size() < size_t(replacement.width) * replacement.height * 4) {
+    // Loaded from guest memory into the texture of the guest format.
+    texture.RestoreOriginal();
     return false;
   }
   MTLTextureDescriptor* descriptor = [[MTLTextureDescriptor alloc] init];

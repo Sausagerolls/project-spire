@@ -17,6 +17,9 @@ struct TextureReplacement {
   uint32_t width = 0;
   uint32_t height = 0;
   std::vector<uint8_t> rgba;
+  // Set, whether or not the texture is replaced now, when the choice depends on the
+  // input mode (rex/input/input_mode.h): the hook is asked again when it changes.
+  bool depends_on_input_mode = false;
 };
 
 // A guest texture's base level as it is in guest memory.
