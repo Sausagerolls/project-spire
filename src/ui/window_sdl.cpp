@@ -248,6 +248,24 @@ void* WindowSDL::GetNativeWindowHandle() const {
 #endif
 }
 
+void WindowSDL::SetCursorImage(const uint8_t* rgba, uint32_t width, uint32_t height,
+                               int32_t hot_x, int32_t hot_y) {
+  SDL_Cursor* cursor = nullptr;
+  if (rgba && width && height) {
+    SDL_Surface* surface = SDL_CreateSurfaceFrom(int(width), int(height), SDL_PIXELFORMAT_RGBA32,
+                                                 const_cast<uint8_t*>(rgba), int(width * 4));
+    if (surface) {
+      cursor = SDL_CreateColorCursor(surface, hot_x, hot_y);
+      SDL_DestroySurface(surface);
+    }
+  }
+  SDL_SetCursor(cursor ? cursor : SDL_GetDefaultCursor());
+  if (custom_cursor_) {
+    SDL_DestroyCursor(custom_cursor_);
+  }
+  custom_cursor_ = cursor;
+}
+
 bool WindowSDL::SetRelativeMouseMode(bool enable) {
   if (!sdl_window_) {
     return false;

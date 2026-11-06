@@ -308,6 +308,16 @@ class Window {
     (void)enable;
     return false;
   }
+  // A custom pointer image: RGBA8, rows from the top, straight alpha; null for the
+  // system arrow. Call from the UI thread.
+  virtual void SetCursorImage(const uint8_t* rgba, uint32_t width, uint32_t height,
+                              int32_t hot_x, int32_t hot_y) {
+    (void)rgba;
+    (void)width;
+    (void)height;
+    (void)hot_x;
+    (void)hot_y;
+  }
   // Fallback when relative mode isn't available. Returns false, leaving the
   // outputs untouched, unless the pointer verifiably reached the center.
   virtual bool WarpMouseToCenter(int32_t& x_out, int32_t& y_out) {

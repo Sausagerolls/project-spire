@@ -23,6 +23,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <initializer_list>
 #include <string_view>
 
@@ -158,7 +159,48 @@ void ExpireCaptureLocked() {
 // (and the one that opened the capture) never reach the game.
 std::atomic<bool> capture_suppress{false};
 
+std::mutex pointer_mutex;
+float pointer_x = -1.0f, pointer_y = -1.0f;
+std::deque<PointerEvent> pointer_events;
+std::atomic<rex::ui::Window*> pointer_window{nullptr};
+
+void NotePointer(rex::ui::Window* window, int32_t x, int32_t y, float& nx, float& ny) {
+  float width = float(std::max<uint32_t>(1, window->GetActualPhysicalWidth()));
+  float height = float(std::max<uint32_t>(1, window->GetActualPhysicalHeight()));
+  nx = float(x) / width;
+  ny = float(y) / height;
+  std::lock_guard lock(pointer_mutex);
+  pointer_x = nx;
+  pointer_y = ny;
+}
+
+void PushPointerEvent(PointerEvent event) {
+  std::lock_guard lock(pointer_mutex);
+  if (pointer_events.size() < 32) {
+    pointer_events.push_back(event);
+  }
+}
+
 }  // namespace
+
+bool GetPointerPosition(float& x, float& y) {
+  std::lock_guard lock(pointer_mutex);
+  x = pointer_x;
+  y = pointer_y;
+  return pointer_x >= 0.0f;
+}
+
+bool TakePointerEvent(PointerEvent& event_out) {
+  std::lock_guard lock(pointer_mutex);
+  if (pointer_events.empty()) {
+    return false;
+  }
+  event_out = pointer_events.front();
+  pointer_events.pop_front();
+  return true;
+}
+
+rex::ui::Window* GetPointerWindow() { return pointer_window.load(); }
 
 void BeginKeyCapture() {
   std::lock_guard lock(capture_mutex);
@@ -219,6 +261,7 @@ void MnkInputDriver::OnWindowAvailable(rex::ui::Window* window) {
     }
     window->AddInputListener(this, window_z_order());
     window->AddListener(this);
+    pointer_window.store(window);
   }
 }
 
@@ -619,6 +662,21 @@ void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
 void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
   if (!IsEnabled() || !has_focus_)
     return;
+  if (!IsMouseLookActive() && attached_window_) {
+    // A menu's pointer: a click, not a key bind.
+    rex::input::NoteInputMode(rex::input::InputMode::kKeyboardMouse);
+    PointerEvent event{PointerEvent::Type::kLeft, 0, 0, 0};
+    if (e.button() == rex::ui::MouseEvent::Button::kRight) {
+      event.type = PointerEvent::Type::kRight;
+    } else if (e.button() == rex::ui::MouseEvent::Button::kMiddle) {
+      event.type = PointerEvent::Type::kMiddle;
+    } else if (e.button() != rex::ui::MouseEvent::Button::kLeft) {
+      return;
+    }
+    NotePointer(attached_window_, e.x(), e.y(), event.x, event.y);
+    PushPointerEvent(event);
+    return;
+  }
   std::lock_guard lock(state_mutex_);
   switch (e.button()) {
     case rex::ui::MouseEvent::Button::kLeft:
@@ -654,9 +712,22 @@ void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
   }
 }
 
+void MnkInputDriver::OnMouseWheel(rex::ui::MouseEvent& e) {
+  if (!IsEnabled() || !has_focus_ || IsMouseLookActive() || !attached_window_ || !e.scroll_y())
+    return;
+  PointerEvent event{PointerEvent::Type::kWheel, 0, 0,
+                     e.scroll_y() > 0 ? 1 : -1};
+  NotePointer(attached_window_, e.x(), e.y(), event.x, event.y);
+  PushPointerEvent(event);
+}
+
 void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
   if (!IsEnabled() || !has_focus_)
     return;
+  if (!IsMouseLookActive() && attached_window_) {
+    float nx, ny;
+    NotePointer(attached_window_, e.x(), e.y(), nx, ny);
+  }
   int32_t x = e.x();
   int32_t y = e.y();
   {

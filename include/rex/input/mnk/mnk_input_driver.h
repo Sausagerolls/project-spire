@@ -35,6 +35,19 @@ bool IsKeyCaptureWaiting();
 // idle.
 bool TakeCapturedKey(std::string& name_out);
 
+// The pointer while mouse look is off (SetMouseLookActive(false)), for menus:
+// position in the window, 0..1, and clicks and wheel steps, which then don't act as
+// their key binds. Safe from any thread.
+struct PointerEvent {
+  enum class Type { kLeft, kRight, kMiddle, kWheel } type;
+  float x, y;
+  int32_t wheel;  // detents, up positive
+};
+bool GetPointerPosition(float& x, float& y);
+bool TakePointerEvent(PointerEvent& event_out);
+// The window, for SetCursorImage from the UI thread.
+rex::ui::Window* GetPointerWindow();
+
 class MnkInputDriver final : public InputDriver,
                              public rex::ui::WindowInputListener,
                              public rex::ui::WindowListener {
@@ -60,6 +73,7 @@ class MnkInputDriver final : public InputDriver,
   void OnMouseDown(rex::ui::MouseEvent& e) override;
   void OnMouseUp(rex::ui::MouseEvent& e) override;
   void OnMouseMove(rex::ui::MouseEvent& e) override;
+  void OnMouseWheel(rex::ui::MouseEvent& e) override;
 
   // WindowListener
   void OnClosing(rex::ui::UIEvent& e) override;

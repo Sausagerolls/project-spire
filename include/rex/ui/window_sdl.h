@@ -33,6 +33,8 @@ class WindowSDL final : public Window {
 
   void* GetNativeWindowHandle() const override;
   bool SetRelativeMouseMode(bool enable) override;
+  void SetCursorImage(const uint8_t* rgba, uint32_t width, uint32_t height, int32_t hot_x,
+                      int32_t hot_y) override;
   bool WarpMouseToCenter(int32_t& x_out, int32_t& y_out) override;
 
   // Called by SDLWindowedAppContext on the UI thread.
@@ -84,6 +86,7 @@ class WindowSDL final : public Window {
   std::atomic<bool> paint_pending_{false};
   // Auto-hide cursor bookkeeping (CursorVisibility::kAutoHidden).
   SDL_TimerID cursor_hide_timer_ = 0;
+  SDL_Cursor* custom_cursor_ = nullptr;
 };
 
 }  // namespace rex::ui
