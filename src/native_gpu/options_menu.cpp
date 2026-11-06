@@ -26,6 +26,7 @@
 
 #include "core/fable2_config.h"
 #include "input/mac_controls.h"
+#include "input/mac_menu_mouse.h"
 #ifndef _WIN32
 #include <rex/input/mnk/mnk_input_driver.h>
 #endif
@@ -464,6 +465,14 @@ extern "C" void ProcessAndVcallAndProcess16_823F8908(PPCContext& ctx, uint8_t* b
                 std::string(reinterpret_cast<const char*>(REX_RAW_ADDR(code))).substr(0, 100));
   }
   uint32_t element = ctx.r4.u32;
+  if (code) {
+    const char* text = reinterpret_cast<const char*>(REX_RAW_ADDR(code));
+    if (!std::strncmp(text, "g_Menu:", 7)) {
+      fable2::menumouse::NoteMenuActivity();
+    } else if (!std::strcmp(text, "GUI:OnExit()")) {
+      fable2::menumouse::NoteMenuClosed();
+    }
+  }
   if (code && !std::strcmp(reinterpret_cast<const char*>(REX_RAW_ADDR(code)),
                            "g_Menu:GetHighlightedMenuItemData()")) {
     last_highlight_element = element;

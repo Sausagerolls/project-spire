@@ -81,6 +81,7 @@ set(FABLE2_SOURCES
     src/native_gpu/draw_capture.cpp
     src/native_gpu/options_menu.cpp
     src/input/mac_prompts.cpp
+    src/input/mac_menu_mouse.cpp
     ${HOTFUNC_SOURCES}
 )
 

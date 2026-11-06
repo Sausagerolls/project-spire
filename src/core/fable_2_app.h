@@ -15,6 +15,7 @@
 
 #include "input/mac_controls.h"
 #include "input/mac_prompts.h"
+#include "input/mac_menu_mouse.h"
 
 #include <algorithm>
 #include <atomic>
@@ -131,6 +132,10 @@ class Fable2App : public rex::ReXApp {
       auto system = rex::input::CreateDefaultInputSystem(tool_mode);
       system->AddDriver(
           std::make_unique<fable2::KeyboardGamepadDriver>(system->window(), 0));
+#ifdef __APPLE__
+      // The mouse in menus (src/input/mac_menu_mouse.h).
+      system->AddDriver(fable2::menumouse::CreateDriver(system->window()));
+#endif
 #ifdef FABLE2_REMOTE_CONTROL
       // Remote (AI) pad: driven over localhost TCP by an external harness
       // (src/input/remote_control_server.h). OR-merges with the pads above; not
