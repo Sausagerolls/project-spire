@@ -139,7 +139,7 @@ class Driver final : public rex::input::InputDriver {
       presses_.pop_front();
       if (!presses_.empty()) {
         // Each press starts after a gap, so the menu sees separate presses.
-        presses_.front().start_us = std::max(presses_.front().start_us, now + kGapUs);
+        presses_.front().start_us = now + kGapUs;
         presses_.front().end_us = presses_.front().start_us + kHoldUs;
       }
     }
