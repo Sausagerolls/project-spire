@@ -4,18 +4,31 @@
 // that ignores names it doesn't know. So the entries are added with the game's own
 // functions and look like any other. A label that isn't a text tag is shown as is.
 // To add a setting, add its items in AddOptionsItems and handle them in OnSelect.
-// Keep settings directly under Options: a third level of this menu opens to a blank
-// row that can't be selected, so each value is one item .
+// Keep settings directly under a top level entry: a third level of this menu opens
+// to a blank row that can't be selected. A setting with several values is one item
+// that steps to the next value when selected, and is relabelled in place with the
+// menu's own RefreshButtonText event (scripts/gameface/expandablemenu, spawning).
+//
+// Controls (macOS) lists each keyboard and mouse action with its keys. Selecting
+// one waits for a key (Esc cancels) through the MnK driver's key capture, polled
+// from FrontMenu_PollEventQueue, then saves it (src/input/mac_controls.h).
 
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <cstdio>
+#include <cstdlib>
+#include <iterator>
 #include <unordered_map>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
 
 #include "core/fable2_config.h"
+#include "input/mac_controls.h"
+#ifndef _WIN32
+#include <rex/input/mnk/mnk_input_driver.h>
+#endif
 #include "fable_2_pch.h"
 
 extern "C" {
@@ -28,6 +41,8 @@ void sub_826CBA78(PPCContext& ctx, uint8_t* base);                  // SetItemSe
 void Allocate_OrDbgBreak_8221F388(PPCContext& ctx, uint8_t* base);  // Allocate(size).
 void __imp__sub_826CA6E0(PPCContext& __restrict ctx, uint8_t* base);
 void __imp__ProcessAndProcessAndProcess2446_826C81A0(PPCContext& __restrict ctx, uint8_t* base);
+void ProcessAndProcessAndProcess26_8259D6C8(PPCContext& ctx, uint8_t* base);  // SetString(lua, key, value, element).
+void ProcessAndVcallAndProcess16_823F8908(PPCContext& ctx, uint8_t* base);   // Run(lua, element).
 }
 
 namespace {
@@ -39,12 +54,17 @@ struct FrameRateItem {
   int32_t limit;  // 0 for no limit.
 };
 const FrameRateItem kFrameRates[] = {
-    {"MacFrameRate30", "Frame Rate: 30 FPS", 30},
-    {"MacFrameRate40", "Frame Rate: 40 FPS", 40},
-    {"MacFrameRate60", "Frame Rate: 60 FPS", 60},
-    {"MacFrameRate90", "Frame Rate: 90 FPS", 90},
-    {"MacFrameRateUncapped", "Frame Rate: Uncapped", 0},
+    {"30", "Frame Rate: 30 FPS", 30},
+    {"40", "Frame Rate: 40 FPS", 40},
+    {"60", "Frame Rate: 60 FPS", 60},
+    {"90", "Frame Rate: 90 FPS", 90},
+    {"0", "Frame Rate: Uncapped", 0},
 };
+const char kFrameRate[] = "MacFrameRate";
+const char kSensitivity[] = "MacMouseSensitivity";
+const char kControls[] = "MacControls";
+const char kBindPrefix[] = "MacBind_";
+const char kControlsReset[] = "MacControlsReset";
 // The limit of this run, as last chosen.
 int32_t current_frame_rate_limit = -1;
 const char kOptionsIcon[] = "Art\\GUI\\icon_options.tga";
@@ -111,55 +131,159 @@ void AddItem(PPCContext& ctx, uint8_t* base, uint32_t menu, const char* name, co
   DestructString(ctx, base, frame + kName);
 }
 
-void SetSelected(PPCContext& ctx, uint8_t* base, uint32_t menu, const char* name, bool selected) {
+// The Lua engine the menu's events go to, as the game's menu functions find it.
+uint32_t MenuEngine(uint8_t* base) {
+  uint32_t root = REX_LOAD_U32(0x83496928);
+  return REX_LOAD_U32(REX_LOAD_U32(REX_LOAD_U32(root + 8) + 80) + 40);
+}
+
+void SetElementString(PPCContext& ctx, uint8_t* base, uint32_t element, const char* key,
+                      const std::string& value) {
   uint32_t frame = ctx.r1.u32;
-  ConstructString(ctx, base, frame + kName, name);
-  ctx.r3.u64 = menu;
+  ConstructString(ctx, base, frame + kName, key);
+  ConstructString(ctx, base, frame + kText, value.c_str());
+  ctx.r3.u64 = MenuEngine(base);
   ctx.r4.u64 = frame + kName;
-  ctx.r5.u64 = selected ? 1 : 0;
-  ctx.r6.u64 = REX_LOAD_U32(menu + 20);
-  sub_826CBA78(ctx, base);
+  ctx.r5.u64 = frame + kText;
+  ctx.r6.u64 = element;
+  ProcessAndProcessAndProcess26_8259D6C8(ctx, base);
+  DestructString(ctx, base, frame + kText);
   DestructString(ctx, base, frame + kName);
 }
+
+// Changes an item's label (RefreshButtonText reads String1 and String2).
+void Relabel(PPCContext& ctx, uint8_t* base, uint32_t element, const char* name,
+             const std::string& label) {
+  SetElementString(ctx, base, element, "String1", name);
+  SetElementString(ctx, base, element, "String2", label);
+  uint32_t frame = ctx.r1.u32;
+  ConstructString(ctx, base, frame + kName, "g_Menu:RefreshButtonText()");
+  ctx.r3.u64 = frame + kName;
+  ctx.r4.u64 = element;
+  ProcessAndVcallAndProcess16_823F8908(ctx, base);
+  DestructString(ctx, base, frame + kName);
+  // Run what was queued, like the game's own Subtitles items.
+  ctx.r3.u64 = element;
+  ctx.ctr.u64 = REX_LOAD_U32(REX_LOAD_U32(ctx.r3.u32) + 12);
+  REX_CALL_INDIRECT_FUNC(ctx.ctr.u32);
+  // On the object the first call returns.
+  ctx.ctr.u64 = REX_LOAD_U32(REX_LOAD_U32(ctx.r3.u32) + 16);
+  REX_CALL_INDIRECT_FUNC(ctx.ctr.u32);
+}
+
+const FrameRateItem& CurrentFrameRate() {
+  for (const FrameRateItem& item : kFrameRates) {
+    if (item.limit == current_frame_rate_limit) {
+      return item;
+    }
+  }
+  return kFrameRates[0];
+}
+
+std::string SensitivityLabel(double sensitivity) {
+  char text[64];
+  std::snprintf(text, sizeof(text), "Mouse Sensitivity: %.2gx", sensitivity);
+  return text;
+}
+
+std::string BindName(size_t index) { return kBindPrefix + std::to_string(index); }
+
+std::string BindLabel(const fable2::controls::Action& action) {
+  return std::string(action.label) + ": " +
+         fable2::controls::KeysDisplay(fable2::controls::CurrentKeys(action.cvar));
+}
+
+// A rebind waiting for its key, finished from the menu's per-frame poll.
+struct PendingCapture {
+  bool active = false;
+  size_t action = 0;
+  uint32_t element = 0;
+} pending_capture;
 
 void AddOptionsItems(PPCContext& ctx, uint8_t* base, uint32_t menu) {
   if (current_frame_rate_limit < 0) {
     current_frame_rate_limit = fable2::config::Get().frame_rate_limit;
   }
   AddItem(ctx, base, menu, kOptions, "Options", "Root");
-  for (const FrameRateItem& item : kFrameRates) {
-    AddItem(ctx, base, menu, item.name, item.label, kOptions);
-    if (item.limit == current_frame_rate_limit) {
-      SetSelected(ctx, base, menu, item.name, true);
-    }
+  AddItem(ctx, base, menu, kFrameRate, CurrentFrameRate().label, kOptions);
+#ifndef _WIN32
+  AddItem(ctx, base, menu, kSensitivity,
+          SensitivityLabel(fable2::controls::CurrentSensitivity()).c_str(), kOptions);
+  AddItem(ctx, base, menu, kControls, "Controls", "Root");
+  for (size_t i = 0; i < std::size(fable2::controls::kActions); ++i) {
+    AddItem(ctx, base, menu, BindName(i).c_str(),
+            BindLabel(fable2::controls::kActions[i]).c_str(), kControls);
   }
+  AddItem(ctx, base, menu, kControlsReset, "Reset to Defaults", kControls);
+#endif
 }
+
+#ifndef _WIN32
+void RelabelAllBinds(PPCContext& ctx, uint8_t* base, uint32_t element) {
+  for (size_t i = 0; i < std::size(fable2::controls::kActions); ++i) {
+    Relabel(ctx, base, element, BindName(i).c_str(), BindLabel(fable2::controls::kActions[i]));
+  }
+  Relabel(ctx, base, element, kSensitivity,
+          SensitivityLabel(fable2::controls::CurrentSensitivity()));
+}
+#endif
 
 // Returns whether the name was one of the added items.
 bool OnSelect(PPCContext& ctx, uint8_t* base, uint32_t menu, const char* name) {
-  const FrameRateItem* chosen = nullptr;
-  for (const FrameRateItem& item : kFrameRates) {
-    if (!std::strcmp(name, item.name)) {
-      chosen = &item;
+  uint32_t element = REX_LOAD_U32(menu + 20);
+  if (!std::strcmp(name, kFrameRate)) {
+    const FrameRateItem* next = &kFrameRates[0];
+    for (size_t i = 0; i < std::size(kFrameRates); ++i) {
+      if (kFrameRates[i].limit == CurrentFrameRate().limit) {
+        next = &kFrameRates[(i + 1) % std::size(kFrameRates)];
+      }
     }
+    current_frame_rate_limit = next->limit;
+    fable2::config::ApplyFrameRateLimit(next->limit);
+    fable2::config::SaveFrameRateLimit(next->limit);
+    REXSYS_INFO("[options] frame rate limit {}", next->limit);
+    Relabel(ctx, base, element, kFrameRate, next->label);
+    return true;
   }
-  if (!chosen) {
-    return false;
+#ifndef _WIN32
+  if (!std::strcmp(name, kSensitivity)) {
+    double current = fable2::controls::CurrentSensitivity();
+    double next = fable2::controls::kSensitivities[0];
+    for (size_t i = 0; i < std::size(fable2::controls::kSensitivities); ++i) {
+      if (fable2::controls::kSensitivities[i] > current + 1e-6) {
+        next = fable2::controls::kSensitivities[i];
+        break;
+      }
+    }
+    fable2::controls::SetSensitivity(next);
+    Relabel(ctx, base, element, kSensitivity, SensitivityLabel(next));
+    return true;
   }
-  current_frame_rate_limit = chosen->limit;
-  fable2::config::ApplyFrameRateLimit(chosen->limit);
-  fable2::config::SaveFrameRateLimit(chosen->limit);
-  REXSYS_INFO("[options] frame rate limit {}", chosen->limit);
-  for (const FrameRateItem& item : kFrameRates) {
-    SetSelected(ctx, base, menu, item.name, &item == chosen);
+  if (!std::strcmp(name, kControlsReset)) {
+    rex::input::mnk::CancelKeyCapture();
+    pending_capture.active = false;
+    fable2::controls::ResetToDefaults();
+    RelabelAllBinds(ctx, base, element);
+    return true;
   }
-  // Refresh the menu, like the game's Subtitles items.
-  ctx.r3.u64 = REX_LOAD_U32(menu + 20);
-  ctx.ctr.u64 = REX_LOAD_U32(REX_LOAD_U32(ctx.r3.u32) + 12);
-  REX_CALL_INDIRECT_FUNC(ctx.ctr.u32);
-  ctx.ctr.u64 = REX_LOAD_U32(REX_LOAD_U32(ctx.r3.u32) + 16);
-  REX_CALL_INDIRECT_FUNC(ctx.ctr.u32);
-  return true;
+  if (!std::strncmp(name, kBindPrefix, sizeof(kBindPrefix) - 1)) {
+    size_t index = std::strtoul(name + sizeof(kBindPrefix) - 1, nullptr, 10);
+    if (index >= std::size(fable2::controls::kActions)) {
+      return true;
+    }
+    if (pending_capture.active) {
+      // Another item was selected while waiting: put the old label back.
+      Relabel(ctx, base, pending_capture.element, BindName(pending_capture.action).c_str(),
+              BindLabel(fable2::controls::kActions[pending_capture.action]));
+    }
+    pending_capture = {true, index, element};
+    rex::input::mnk::BeginKeyCapture();
+    Relabel(ctx, base, element, name,
+            std::string(fable2::controls::kActions[index].label) + ": Press a key");
+    return true;
+  }
+#endif
+  return false;
 }
 
 }  // namespace
@@ -198,4 +322,35 @@ extern "C" void ProcessAndProcessAndProcess2446_826C81A0(PPCContext& __restrict 
     }
   }
   __imp__ProcessAndProcessAndProcess2446_826C81A0(ctx, base);
+}
+
+// Called each frame the front end menu polls its input (src/diagnostics/fable2_menu_probe.h).
+void fable2_options_menu_poll(PPCContext& ctx, uint8_t* base) {
+#ifndef _WIN32
+  if (!pending_capture.active) {
+    return;
+  }
+  // Esc, or a capture that timed out, keeps the old keys.
+  std::string key = "Escape";
+  if (!rex::input::mnk::TakeCapturedKey(key) && rex::input::mnk::IsKeyCaptureWaiting()) {
+    return;
+  }
+  pending_capture.active = false;
+  const fable2::controls::Action& action = fable2::controls::kActions[pending_capture.action];
+  if (key != "Escape") {
+    fable2::controls::SetKeys(action.cvar, key);
+    REXSYS_INFO("[options] {} bound to {}", action.cvar, key);
+  }
+  PPCRegister saved_r3 = ctx.r3;
+  uint64_t saved_lr = ctx.lr;
+  ctx.r1.u32 -= kFrameSize;
+  Relabel(ctx, base, pending_capture.element, BindName(pending_capture.action).c_str(),
+          BindLabel(action));
+  ctx.r1.u32 += kFrameSize;
+  ctx.lr = saved_lr;
+  ctx.r3 = saved_r3;
+#else
+  (void)ctx;
+  (void)base;
+#endif
 }

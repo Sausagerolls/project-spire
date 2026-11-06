@@ -30,9 +30,11 @@ extern "C" void FrontMenu_InputEvent(PPCContext& ctx, uint8_t* base) {
 
 extern "C" void __imp__FrontMenu_PollEventQueue(PPCContext& ctx,
                                                 uint8_t* base);
+void fable2_options_menu_poll(PPCContext& ctx, uint8_t* base);  // native_gpu/options_menu.cpp
 extern "C" void FrontMenu_PollEventQueue(PPCContext& ctx, uint8_t* base) {
   if (fable2::uir::hook("FrontMenu_PollEventQueue", ctx, base)) return;
   __imp__FrontMenu_PollEventQueue(ctx, base);
+  fable2_options_menu_poll(ctx, base);
 }
 
 extern "C" void __imp__FrontMenu_EnsureElement(PPCContext& ctx,

@@ -13,6 +13,8 @@
 #include <rex/system.h>
 #include <rex/system/gpu_plugin.h>
 
+#include "input/mac_controls.h"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -370,6 +372,11 @@ class Fable2App : public rex::ReXApp {
     seed_cvar("keyboard_gamepad_map", cfg.keyboard_gamepad_map);
     seed_cvar("mouse_look", cfg.mouse_look ? "true" : "false");
     seed_cvar("mouse_look_scale", std::to_string(cfg.mouse_look_scale));
+#ifndef _WIN32
+    // Keyboard and mouse through the SDK's MnK driver (the keyboard_gamepad driver
+    // above is Win32 only), set from the Controls menu (src/input/mac_controls.h).
+    fable2::controls::Load(HomeFolder() / "controls.toml", seed_cvar);
+#endif
     // NOTE: the hero/dog readback fix (readback_resolve_force_addresses) is a
     // GPU-PLUGIN cvar, so it is seeded in OnPostSetup() (after the plugin is
     // loaded) rather than here - see plans/hero-dog-texture-readback.md.
