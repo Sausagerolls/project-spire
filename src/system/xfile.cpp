@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/graphics/texture_replacement.h>
 #include <rex/filesystem/vfs.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -109,6 +110,17 @@ X_STATUS XFile::Read(uint32_t buffer_guest_address, uint32_t buffer_length, uint
                       notify_completion);
 }
 
+XFileReadHook g_xfile_read_hook = nullptr;
+
+}  // namespace rex::system
+
+// In the runtime library, which both the game and the GPU plugin link.
+namespace rex::graphics {
+TextureReplacementHook g_texture_replacement_hook = nullptr;
+}  // namespace rex::graphics
+
+namespace rex::system {
+
 X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_length,
                              uint64_t byte_offset, uint32_t* out_bytes_read, uint32_t apc_context,
                              bool notify_completion) {
@@ -155,14 +167,16 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
                                         memory::PageAccess::kReadWrite) {
           result = X_STATUS_ACCESS_VIOLATION;
         } else {
-          result = file_->ReadSync(
-              std::span<uint8_t>(
-                  buffer_physical_heap
-                      ? memory()->TranslatePhysical(
-                            buffer_physical_heap->GetPhysicalAddress(buffer_guest_address))
-                      : memory()->TranslateVirtual(buffer_guest_address),
-                  buffer_length),
-              size_t(byte_offset), &bytes_read);
+          uint8_t* host_buffer =
+              buffer_physical_heap
+                  ? memory()->TranslatePhysical(
+                        buffer_physical_heap->GetPhysicalAddress(buffer_guest_address))
+                  : memory()->TranslateVirtual(buffer_guest_address);
+          result = file_->ReadSync(std::span<uint8_t>(host_buffer, buffer_length),
+                                   size_t(byte_offset), &bytes_read);
+          if (XSUCCEEDED(result) && g_xfile_read_hook && bytes_read) {
+            g_xfile_read_hook(path(), host_buffer, bytes_read, byte_offset);
+          }
           if (XSUCCEEDED(result)) {
             if (buffer_physical_heap) {
               buffer_physical_heap->TriggerCallbacks(

@@ -9,6 +9,11 @@
 #include <rex/graphics/metal/texture_cache.h>
 
 #include <algorithm>
+#include <cstring>
+#include <fstream>
+#include <unordered_set>
+#include <xxhash.h>
+#include <rex/graphics/texture_replacement.h>
 
 #include <rex/cvar.h>
 #include <rex/graphics/flags.h>
@@ -19,6 +24,11 @@
 #include <rex/logging.h>
 
 REXCVAR_DECLARE(bool, metal_reorder_texture_loads);
+REXCVAR_DEFINE_BOOL(metal_log_texture_hashes, false, "GPU/Metal",
+                    "Log the hash of each small 2D texture loaded, and write its guest data to "
+                    "metal_capture_path (for texture replacement)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DECLARE(std::string, metal_capture_path);
 
 namespace rex::graphics::metal {
 
@@ -491,6 +501,7 @@ MetalTextureCache::MetalTexture::MetalTexture(MetalTextureCache& texture_cache,
 void MetalTextureCache::MetalTexture::ReplaceTexture(id<MTLTexture> texture) {
   texture_ = texture;
   views_.clear();
+  own_format_ = false;
 }
 
 id<MTLTexture> MetalTextureCache::MetalTexture::GetView(bool is_signed, uint32_t host_swizzle) {
@@ -501,6 +512,11 @@ id<MTLTexture> MetalTextureCache::MetalTexture::GetView(bool is_signed, uint32_t
   }
   HostFormat host_format = GetHostFormat(key());
   MTLPixelFormat format = is_signed ? host_format.format_signed : host_format.format;
+  if (own_format_) {
+    format = texture_.pixelFormat;
+    // The guest swizzle is for the guest format; the image is plain RGBA.
+    host_swizzle = xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
+  }
   id<MTLTexture> view = nil;
   if (format != MTLPixelFormatInvalid) {
     MTLTextureSwizzleChannels swizzle = MTLTextureSwizzleChannelsMake(
@@ -586,6 +602,74 @@ id<MTLBuffer> MetalTextureCache::AcquireScratchBuffer(size_t size) {
   return buffer;
 }
 
+bool MetalTextureCache::TryReplaceTexture(MetalTexture& texture) {
+  bool log = REXCVAR_GET(metal_log_texture_hashes);
+  if (!rex::graphics::g_texture_replacement_hook && !log) {
+    return false;
+  }
+  TextureKey key = texture.key();
+  uint32_t width = key.GetWidth(), height = key.GetHeight();
+  if (key.dimension != xenos::DataDimension::k2DOrStacked || key.GetDepthOrArraySize() != 1 ||
+      width > 512 || height > 512) {
+    return false;
+  }
+  uint32_t start = key.base_page << 12;
+  uint32_t length = texture.GetGuestBaseSize();
+  auto& metal_shared_memory = static_cast<MetalSharedMemory&>(shared_memory());
+  id<MTLBuffer> memory = metal_shared_memory.buffer();
+  if (!length || size_t(start) + length > memory.length ||
+      command_processor_.IsGpuWrittenInSubmission(start, length)) {
+    return false;
+  }
+  const uint8_t* data = static_cast<const uint8_t*>(memory.contents) + start;
+  uint64_t hash = XXH3_64bits(data, length);
+  if (log) {
+    static std::unordered_set<uint64_t> seen;
+    if (seen.insert(hash).second) {
+      REXGPU_INFO("Texture {:016X}: {}x{} format {} tiled {} endian {} size {:X} at {:08X}", hash,
+                  width, height, uint32_t(key.format), uint32_t(key.tiled),
+                  uint32_t(key.endianness), length, start);
+      std::ofstream(fmt::format("{}/tex_{:016X}_{}x{}_f{}_t{}_e{}.bin",
+                                REXCVAR_GET(metal_capture_path), hash, width, height,
+                                uint32_t(key.format), uint32_t(key.tiled),
+                                uint32_t(key.endianness)),
+                    std::ios::binary)
+          .write(reinterpret_cast<const char*>(data), length);
+    }
+  }
+  rex::graphics::TextureReplacement replacement;
+  if (!rex::graphics::g_texture_replacement_hook ||
+      !rex::graphics::g_texture_replacement_hook(
+          {hash, width, height, uint32_t(key.format), bool(key.tiled), uint32_t(key.endianness),
+           data, length},
+          replacement) ||
+      !replacement.width || !replacement.height ||
+      replacement.rgba.size() < size_t(replacement.width) * replacement.height * 4) {
+    return false;
+  }
+  MTLTextureDescriptor* descriptor = [[MTLTextureDescriptor alloc] init];
+  descriptor.textureType = MTLTextureType2DArray;
+  descriptor.pixelFormat = MTLPixelFormatRGBA8Unorm;
+  descriptor.width = replacement.width;
+  descriptor.height = replacement.height;
+  descriptor.arrayLength = 1;
+  descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+  descriptor.storageMode = MTLStorageModeShared;
+  id<MTLTexture> image = [command_processor_.device() newTextureWithDescriptor:descriptor];
+  if (!image) {
+    return false;
+  }
+  image.label = @"replacement";
+  [image replaceRegion:MTLRegionMake2D(0, 0, replacement.width, replacement.height)
+           mipmapLevel:0
+                 slice:0
+             withBytes:replacement.rgba.data()
+           bytesPerRow:replacement.width * 4
+         bytesPerImage:0];
+  texture.ReplaceWithImage(image);
+  return true;
+}
+
 bool MetalTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                               bool load_mips) {
   // Follows the Vulkan backend: decode the guest data with a compute shader
@@ -603,6 +687,9 @@ bool MetalTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
                   FormatInfo::Get(texture_key.format)->name, uint32_t(load_shader));
     }
     return false;
+  }
+  if (load_base && TryReplaceTexture(metal_texture)) {
+    return true;
   }
   // A whole texture just resolved by the GPU: copy from the resolve snapshot.
   if (load_base && (!load_mips || !texture_key.mip_max_level) &&

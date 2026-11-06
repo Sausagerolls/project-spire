@@ -25,6 +25,13 @@
 
 namespace rex::system {
 
+// Called after each successful guest file read, with the file's path, the host copy
+// of the bytes read and their offset in the file. Lets a game patch data as it
+// loads (for example, replacing controller button icons). Set before the game runs.
+using XFileReadHook = void (*)(const std::string& path, uint8_t* data, size_t length,
+                               uint64_t file_offset);
+extern XFileReadHook g_xfile_read_hook;
+
 // https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_directory_information
 class X_FILE_DIRECTORY_INFORMATION {
  public:

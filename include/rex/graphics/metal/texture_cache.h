@@ -87,6 +87,12 @@ class MetalTextureCache final : public TextureCache {
     id<MTLTexture> texture() const { return texture_; }
     // Swaps in another texture of the same layout (from a resolve snapshot).
     void ReplaceTexture(id<MTLTexture> texture);
+    // Swaps in an RGBA8 texture from a game's texture replacement hook. Views then
+    // use its format instead of the guest format's.
+    void ReplaceWithImage(id<MTLTexture> texture) {
+      ReplaceTexture(texture);
+      own_format_ = true;
+    }
     // A view with the host swizzle (12 bits, 3 per component) and signedness.
     id<MTLTexture> GetView(bool is_signed, uint32_t host_swizzle);
     // The last submission that bound the texture for drawing.
@@ -95,6 +101,7 @@ class MetalTextureCache final : public TextureCache {
    private:
     id<MTLTexture> texture_;
     std::unordered_map<uint32_t, id<MTLTexture>> views_;
+    bool own_format_ = false;
   };
 
   MetalTextureCache(const RegisterFile& register_file, MetalSharedMemory& shared_memory,
@@ -116,6 +123,8 @@ class MetalTextureCache final : public TextureCache {
   std::vector<ScratchBuffer> scratch_buffers_;
   size_t scratch_pool_bytes_ = 0;
   id<MTLBuffer> AcquireScratchBuffer(size_t size);
+  // Through rex::graphics::g_texture_replacement_hook.
+  bool TryReplaceTexture(MetalTexture& texture);
 
   id<MTLTexture> null_texture_2d_array_ = nil;
   id<MTLTexture> null_texture_3d_ = nil;
