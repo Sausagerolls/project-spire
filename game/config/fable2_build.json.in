@@ -1,0 +1,4 @@
+{
+  "profiles": @FABLE2_SUPPORTED_PROFILES@,
+  "guest_code_compatibility": "@FABLE2_CATALOG_CODE_GROUP@"
+}

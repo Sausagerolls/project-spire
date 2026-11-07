@@ -1,0 +1,17 @@
+# Game files from the player's disc, and everything made from them. Never commit.
+/game/default.xex
+/game/data
+/game/generated/default/
+*.iso
+*.xex
+
+# Builds
+out/
+/sdk-install/
+/dist/
+__pycache__/
+
+# Local logs and settings
+*.log
+.DS_Store
+/.claude/settings.local.json

@@ -1,0 +1,66 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+    "configurePresets": [
+        {
+            "name": "base",
+            "hidden": true,
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "cacheVariables": {
+                "CMAKE_C_COMPILER": "clang",
+                "CMAKE_CXX_COMPILER": "clang++"
+            }
+        },
+        {
+            "name": "mac-base",
+            "hidden": true,
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_OSX_ARCHITECTURES": "arm64",
+                "CMAKE_C_FLAGS": "-march=armv8-a",
+                "CMAKE_CXX_FLAGS": "-march=armv8-a"
+            },
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" }
+        },
+        {
+            "name": "linux-base",
+            "hidden": true,
+            "inherits": "base",
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" }
+        },
+        {
+            "name": "mac-release",
+            "inherits": "mac-base",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+        },
+        {
+            "name": "mac-debug",
+            "inherits": "mac-base",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+        },
+        {
+            "name": "deck-release",
+            "displayName": "Steam Deck (Zen 2) release",
+            "inherits": "linux-base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_C_FLAGS": "-march=znver2",
+                "CMAKE_CXX_FLAGS": "-march=znver2",
+                "CMAKE_EXE_LINKER_FLAGS": "-fuse-ld=lld",
+                "CMAKE_SHARED_LINKER_FLAGS": "-fuse-ld=lld"
+            }
+        },
+        {
+            "name": "deck-debug",
+            "inherits": "deck-release",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+        }
+    ],
+    "buildPresets": [
+        { "name": "mac-release", "configurePreset": "mac-release", "targets": ["fable_2"] },
+        { "name": "mac-debug", "configurePreset": "mac-debug", "targets": ["fable_2"] },
+        { "name": "deck-release", "configurePreset": "deck-release", "targets": ["fable_2"] },
+        { "name": "deck-debug", "configurePreset": "deck-debug", "targets": ["fable_2"] }
+    ]
+}

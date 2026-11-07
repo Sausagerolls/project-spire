@@ -1,0 +1,4 @@
+[submodule "sdk"]
+	path = sdk
+	url = https://github.com/Sausagerolls/project-spire.git
+	branch = rexglue-sdk-metal
