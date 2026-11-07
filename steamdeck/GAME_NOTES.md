@@ -84,3 +84,23 @@ function can be overridden by defining it `extern "C"` in the game project and c
   registers on the first unhandled guest access fault.
 - Some textures' hashes may differ by build or run if they load before the game
   finishes writing them; log `[prompts] icon-sized texture` lines to check.
+
+## Golden objective trail flicker (fixed on Metal, SDK commit 562e853)
+
+The trail is CPU-built billboard particles (vertex shader 29B6506FBACEB93A, gold
+tint in c116), not the 4096-point draws (snow). The game draws it either into the
+main target or into a half-resolution 8888 buffer (EDRAM 09000230, resolved to
+12BEF000) that the composite adds; the camera angle picks the path, so a broken path
+flickers. On the half-res path it failed depth everywhere:
+
+1. With native surfaces, the runtime's clears (utility draws, prerecorded lists) set
+   the RB_* registers directly and hit the last hook-reported surface. Choose render
+   targets from the registers at every draw (GetRegisterNativeSurface).
+2. The runtime clears 352 of 360 rows through a 4x layout at half the pitch
+   (RB_SURFACE_INFO 04820118), the same EDRAM as the 1x surface: apply such clears to
+   the 1x textures (ClearAliasedSurfaces, metal_aliased_clears).
+3. oDepth on D24FS8 surfaces must be scaled like interpolated depth (0.5): use
+   DepthStencilMode::kFloat24Rounding when the shader writes depth.
+
+Also: memexport-only draws must run (else no trail), and point sprites must be
+emulated as quads (native points gave dotted trails and upward snow).
