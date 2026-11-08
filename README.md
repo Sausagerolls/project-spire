@@ -27,7 +27,7 @@ Needs: a Mac with Apple silicon, macOS 14 or later, and Apple's Command Line Too
 
 ## What it adds
 
-- A native Metal renderer, with frame rate options (30 to 120 fps or uncapped).
+- A native Metal renderer, with frame rate options (30, 40, 60, 90 fps or uncapped).
 - Keyboard and mouse: mouse look, rebindable keys in the game's own Options menu and
   pause menu, a menu pointer, and on-screen prompts that switch between keycaps and
   controller buttons depending on what you're using.
